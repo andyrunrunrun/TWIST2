@@ -2,23 +2,10 @@ import os, pickle, yaml
 import torch
 from pose.utils.torch_utils import quat_diff, quat_to_exp_map, slerp, euler_from_quaternion
 from tqdm import tqdm
-from rich import print
 from pose.utils.isaacgym_torch_utils import quat_rotate_inverse, quat_mul, quat_conjugate
-import sys
-from types import ModuleType
 import numpy as np
-
-# Patch sys.modules to fake missing modules from numpy 2.x
-class FakeModule(ModuleType):
-    def __init__(self, name, real=None):
-        super().__init__(name)
-        if real:
-            self.__dict__.update(real.__dict__)
-
-# Patch potentially missing modules
-sys.modules['numpy._core'] = FakeModule('numpy._core', np.core if hasattr(np, 'core') else np)
-sys.modules['numpy._core.multiarray'] = FakeModule('numpy._core.multiarray', getattr(np.core, 'multiarray', None))
-
+from collections import OrderedDict
+from typing import Dict, List, Optional, Tuple
 
 def smooth(x, box_pts, device):
     box = torch.ones(box_pts, device=device) / box_pts
@@ -38,9 +25,14 @@ class MotionLib:
                  motion_decompose=False, 
                  motion_smooth=True, 
                  motion_height_adjust=False,
-                 sample_ratio=1.0 # only sample a portion of the motion
+                 sample_ratio=1.0, # only sample a portion of the motion
+                 store_on_cpu: bool = True, # keep dataset tensors on CPU, move slices to GPU on demand
+                 gpu_cache_gib: float = 4.0, # cache active motions on GPU up to this budget (GiB); 0 disables
                  ):
-        self._device = device
+        self._device = torch.device(device)
+        self._store_on_cpu = bool(store_on_cpu)
+        self._storage_device = torch.device("cpu") if self._store_on_cpu else self._device
+        self._gpu_cache_gib = float(gpu_cache_gib)
 
         # motion augmentation by decomposing long motion into short motions
         self._motion_decompose = motion_decompose
@@ -53,6 +45,8 @@ class MotionLib:
         
         # load motions
         self._load_motions(motion_file)
+        
+        self._init_gpu_cache()
         
         
     def _load_motions(self, motion_file):
@@ -91,17 +85,30 @@ class MotionLib:
                 continue
 
             try:
-                with open(curr_file, "rb") as f:
-                    motion_data = pickle.load(f)
+                motion_data = self._load_motion_data(curr_file)
+                if motion_data is None:
+                    continue
+                fps = motion_data["fps"]
             except Exception as e:
-                print(f"Error loading motion file {curr_file}: {e}")
+                # NumPy 2.x pickles are not compatible with NumPy 1.x (e.g. py38 IsaacGym env).
+                # Avoid attempting module hacks here as they can hard-crash the interpreter.
+                if isinstance(e, ModuleNotFoundError) and "numpy._core" in str(e):
+                    print(
+                        "Error loading motion file (NumPy 2.x pickle detected). "
+                        "Please convert motions to .npz first and re-run.\n"
+                        f"  file: {curr_file}\n"
+                        f"  error: {e}"
+                    )
+                else:
+                    print(f"Error loading motion file {curr_file}: {e}")
                 continue
-            fps = motion_data["fps"]
             curr_weight = motion_weights[i]
-            root_pos = torch.tensor(motion_data["root_pos"], dtype=torch.float, device=self._device)
-            root_rot = torch.tensor(motion_data["root_rot"], dtype=torch.float, device=self._device)
-            dof_pos = torch.tensor(motion_data["dof_pos"], dtype=torch.float, device=self._device)
-            local_body_pos = torch.tensor(motion_data["local_body_pos"], dtype=torch.float, device=self._device)
+            # Create tensors on CPU first then move to target device.
+            # This avoids some CUDA-side conversion paths that may hard-crash (segfault) in certain setups.
+            root_pos = self._to_storage_tensor(motion_data["root_pos"], dtype=torch.float)
+            root_rot = self._to_storage_tensor(motion_data["root_rot"], dtype=torch.float)
+            dof_pos = self._to_storage_tensor(motion_data["dof_pos"], dtype=torch.float)
+            local_body_pos = self._to_storage_tensor(motion_data["local_body_pos"], dtype=torch.float)
             if self._body_link_list is None or len(self._body_link_list) == 0:
                 self._body_link_list = motion_data["link_body_list"]
             num_frames = root_pos.shape[0]
@@ -154,6 +161,12 @@ class MotionLib:
         assert len(self._motion_weights) == len(self._motion_names), f"len(self._motion_weights) = {len(self._motion_weights)}, len(self._motion_names) = {len(self._motion_names)}"
         assert len(self._motion_weights) == len(self._motion_files), f"len(self._motion_weights) = {len(self._motion_weights)}, len(self._motion_files) = {len(self._motion_files)}"
         assert len(self._motion_weights) == len(self._motion_fps), f"len(self._motion_weights) = {len(self._motion_weights)}, len(self._motion_fps) = {len(self._motion_fps)}"
+
+        if len(self._motion_weights) == 0:
+            raise RuntimeError(
+                f"No valid motions loaded from {motion_file}. "
+                "If you are using a dataset generated with NumPy 2.x, convert all *.pkl to *.npz first."
+            )
         
         self._motion_weights = torch.tensor(self._motion_weights, dtype=torch.float, device=self._device)
         self._motion_weights /= torch.sum(self._motion_weights)
@@ -163,21 +176,25 @@ class MotionLib:
         self._motion_num_frames = torch.tensor(self._motion_num_frames, dtype=torch.long, device=self._device)
         self._motion_lengths = torch.tensor(self._motion_lengths, dtype=torch.float, device=self._device)
 
-        self._motion_root_pos_delta = torch.stack(self._motion_root_pos_delta, dim=0)
+        # Per-motion deltas are small; keep them on compute device.
+        self._motion_root_pos_delta = torch.stack(self._motion_root_pos_delta, dim=0).to(self._device)
         
-        self._motion_root_pos = torch.cat(self._motion_root_pos, dim=0)
-        self._motion_root_rot = torch.cat(self._motion_root_rot, dim=0)
-        self._motion_root_vel = torch.cat(self._motion_root_vel, dim=0)
-        self._motion_root_ang_vel = torch.cat(self._motion_root_ang_vel, dim=0)
-        self._motion_dof_pos = torch.cat(self._motion_dof_pos, dim=0)
-        self._motion_dof_vel = torch.cat(self._motion_dof_vel, dim=0)
-        self._motion_local_body_pos = torch.cat(self._motion_local_body_pos, dim=0)
-        self._motion_root_pos_delta_local = torch.cat(self._motion_root_pos_delta_local, dim=0)
-        self._motion_root_rot_delta_local = torch.cat(self._motion_root_rot_delta_local, dim=0)
+        # Large per-frame tensors stay on storage device (CPU by default).
+        self._motion_root_pos = torch.cat(self._motion_root_pos, dim=0).to(self._storage_device)
+        self._motion_root_rot = torch.cat(self._motion_root_rot, dim=0).to(self._storage_device)
+        self._motion_root_vel = torch.cat(self._motion_root_vel, dim=0).to(self._storage_device)
+        self._motion_root_ang_vel = torch.cat(self._motion_root_ang_vel, dim=0).to(self._storage_device)
+        self._motion_dof_pos = torch.cat(self._motion_dof_pos, dim=0).to(self._storage_device)
+        self._motion_dof_vel = torch.cat(self._motion_dof_vel, dim=0).to(self._storage_device)
+        self._motion_local_body_pos = torch.cat(self._motion_local_body_pos, dim=0).to(self._storage_device)
+        self._motion_root_pos_delta_local = torch.cat(self._motion_root_pos_delta_local, dim=0).to(self._storage_device)
+        self._motion_root_rot_delta_local = torch.cat(self._motion_root_rot_delta_local, dim=0).to(self._storage_device)
         
         lengths_shifted = self._motion_num_frames.roll(1)
         lengths_shifted[0] = 0
         self._motion_start_idx = lengths_shifted.cumsum(0)
+        self._motion_start_idx_cpu = self._motion_start_idx.to("cpu")
+        self._motion_num_frames_cpu = self._motion_num_frames.to("cpu")
         
         num_motions = self.num_motions()
         self._motion_ids = torch.arange(num_motions, dtype=torch.long, device=self._device)
@@ -193,7 +210,7 @@ class MotionLib:
         root_pos_delta = root_pos[-1] - root_pos[0]
         root_pos_delta[..., -1] = 0.0
         
-        root_vel = torch.gradient(root_pos, spacing=dt, dim=0)[0]
+        root_vel = self._finite_difference(root_pos, dt)
         
         # compute the delta pos per frame
         root_pos_delta_local = torch.zeros_like(root_pos)
@@ -209,7 +226,7 @@ class MotionLib:
         
         root_ang_vel = self._compute_so3_derivative(root_rot, dt)
         
-        dof_vel = torch.gradient(dof_pos, spacing=dt, dim=0)[0]
+        dof_vel = self._finite_difference(dof_pos, dt)
         
         self._motion_weights.append(curr_weight)
         self._motion_fps.append(fps)
@@ -229,6 +246,291 @@ class MotionLib:
         self._motion_dof_vel.append(dof_vel)
         self._motion_local_body_pos.append(local_body_pos)
         self._motion_names.append(os.path.basename(curr_file))
+
+    def _to_storage_tensor(self, x, dtype: torch.dtype) -> torch.Tensor:
+        if isinstance(x, torch.Tensor):
+            return x.to(device=self._storage_device, dtype=dtype)
+        return torch.as_tensor(x, dtype=dtype, device=self._storage_device)
+
+    def _cache_bytes_per_frame(self) -> int:
+        D = int(self._motion_dof_pos.shape[-1])
+        B = int(self._motion_local_body_pos.shape[1])
+        floats_per_frame = 19 + 2 * D + 3 * B
+        return int(floats_per_frame * 4)
+
+    def _init_gpu_cache(self) -> None:
+        self._gpu_cache_enabled = (
+            self._device.type == "cuda"
+            and self._store_on_cpu
+            and self._gpu_cache_gib > 0.0
+        )
+        if not self._gpu_cache_enabled:
+            self._cache_capacity_frames = 0
+            return
+
+        max_bytes = int(self._gpu_cache_gib * (1024 ** 3))
+        bytes_per_frame = self._cache_bytes_per_frame()
+        self._cache_max_frames = max(1, max_bytes // bytes_per_frame)
+        self._cache_bytes_per_frame_val = bytes_per_frame
+
+        self._cache_capacity_frames = 0
+        self._cache_free: List[Tuple[int, int]] = []
+        self._cache_meta: Dict[int, Tuple[int, int]] = {}
+        self._cache_lru: "OrderedDict[int, None]" = OrderedDict()
+        self._cache_frames_used = 0
+
+        self._cache_offset = torch.full(
+            (self.num_motions(),), -1, device=self._device, dtype=torch.int32
+        )
+        self._cache_len = torch.zeros(
+            (self.num_motions(),), device=self._device, dtype=torch.int32
+        )
+
+        self._cache_root_pos = None
+        self._cache_root_rot = None
+        self._cache_root_vel = None
+        self._cache_root_ang_vel = None
+        self._cache_dof_pos = None
+        self._cache_dof_vel = None
+        self._cache_local_body_pos = None
+        self._cache_root_pos_delta_local = None
+        self._cache_root_rot_delta_local = None
+
+    def _cache_is_initialized(self) -> bool:
+        return self._cache_capacity_frames > 0
+
+    def _cache_grow_to(self, new_capacity_frames: int) -> None:
+        new_capacity_frames = int(min(new_capacity_frames, self._cache_max_frames))
+        if new_capacity_frames <= self._cache_capacity_frames:
+            return
+        old_cap = int(self._cache_capacity_frames)
+
+        D = int(self._motion_dof_pos.shape[-1])
+        B = int(self._motion_local_body_pos.shape[1])
+
+        def alloc(shape_tail):
+            return torch.empty((new_capacity_frames, *shape_tail), device=self._device, dtype=torch.float32)
+
+        new_root_pos = alloc((3,))
+        new_root_rot = alloc((4,))
+        new_root_vel = alloc((3,))
+        new_root_ang_vel = alloc((3,))
+        new_dof_pos = alloc((D,))
+        new_dof_vel = alloc((D,))
+        new_local_body_pos = alloc((B, 3))
+        new_root_pos_delta_local = alloc((3,))
+        new_root_rot_delta_local = alloc((3,))
+
+        if old_cap > 0:
+            new_root_pos[:old_cap].copy_(self._cache_root_pos)
+            new_root_rot[:old_cap].copy_(self._cache_root_rot)
+            new_root_vel[:old_cap].copy_(self._cache_root_vel)
+            new_root_ang_vel[:old_cap].copy_(self._cache_root_ang_vel)
+            new_dof_pos[:old_cap].copy_(self._cache_dof_pos)
+            new_dof_vel[:old_cap].copy_(self._cache_dof_vel)
+            new_local_body_pos[:old_cap].copy_(self._cache_local_body_pos)
+            new_root_pos_delta_local[:old_cap].copy_(self._cache_root_pos_delta_local)
+            new_root_rot_delta_local[:old_cap].copy_(self._cache_root_rot_delta_local)
+
+        self._cache_root_pos = new_root_pos
+        self._cache_root_rot = new_root_rot
+        self._cache_root_vel = new_root_vel
+        self._cache_root_ang_vel = new_root_ang_vel
+        self._cache_dof_pos = new_dof_pos
+        self._cache_dof_vel = new_dof_vel
+        self._cache_local_body_pos = new_local_body_pos
+        self._cache_root_pos_delta_local = new_root_pos_delta_local
+        self._cache_root_rot_delta_local = new_root_rot_delta_local
+
+        self._cache_capacity_frames = new_capacity_frames
+        self._cache_free_segment_add(old_cap, new_capacity_frames - old_cap)
+
+    def _cache_free_segment_add(self, start: int, length: int) -> None:
+        if length <= 0:
+            return
+        start = int(start)
+        length = int(length)
+        end = start + length
+        free = self._cache_free
+        free.append((start, length))
+        free.sort(key=lambda x: x[0])
+
+        merged: List[Tuple[int, int]] = []
+        for s, l in free:
+            if not merged:
+                merged.append((s, l))
+                continue
+            ps, pl = merged[-1]
+            pe = ps + pl
+            if s <= pe:
+                ne = max(pe, s + l)
+                merged[-1] = (ps, ne - ps)
+            else:
+                merged.append((s, l))
+        self._cache_free = merged
+
+    def _cache_alloc_segment(self, length: int) -> Optional[int]:
+        length = int(length)
+        for i, (s, l) in enumerate(self._cache_free):
+            if l >= length:
+                off = s
+                if l == length:
+                    del self._cache_free[i]
+                else:
+                    self._cache_free[i] = (s + length, l - length)
+                return off
+        return None
+
+    def _cache_evict_one(self) -> bool:
+        if not self._cache_lru:
+            return False
+        motion_id, _ = self._cache_lru.popitem(last=False)
+        seg = self._cache_meta.pop(motion_id, None)
+        if seg is None:
+            return True
+        off, length = seg
+        self._cache_frames_used -= int(length)
+        self._cache_free_segment_add(int(off), int(length))
+        self._cache_offset[motion_id] = -1
+        self._cache_len[motion_id] = 0
+        return True
+
+    def _cache_motion_to_gpu(self, motion_id: int) -> bool:
+        if motion_id in self._cache_meta:
+            return True
+        length = int(self._motion_num_frames_cpu[motion_id].item())
+        if length <= 0:
+            return False
+        if length > self._cache_max_frames:
+            return False
+
+        while (self._cache_frames_used + length) > self._cache_max_frames:
+            if not self._cache_evict_one():
+                return False
+
+        off = self._cache_alloc_segment(length)
+        while off is None:
+            if self._cache_capacity_frames < self._cache_max_frames:
+                if self._cache_capacity_frames == 0:
+                    # Avoid a large one-time allocation spike during warmup.
+                    grow_step = 250_000
+                    grow_to = min(self._cache_max_frames, max(int(length), grow_step))
+                else:
+                    # Grow by at least `length`, but avoid doubling to prevent large temporary spikes
+                    # from (old buffers + new buffers) during reallocation.
+                    grow_step = 250_000
+                    grow_to = min(
+                        self._cache_max_frames,
+                        max(
+                            int(self._cache_capacity_frames + length),
+                            int(self._cache_capacity_frames + grow_step),
+                        ),
+                    )
+                self._cache_grow_to(grow_to)
+            else:
+                if not self._cache_evict_one():
+                    return False
+            off = self._cache_alloc_segment(length)
+
+        start = int(self._motion_start_idx_cpu[motion_id].item())
+        end = start + length
+
+        end_off = off + length
+        # Direct CPU->GPU copy into cache slices.
+        # This avoids allocating a temporary GPU tensor for each field (which can cause peak VRAM spikes).
+        self._cache_root_pos[off:end_off].copy_(self._motion_root_pos[start:end], non_blocking=True)
+        self._cache_root_rot[off:end_off].copy_(self._motion_root_rot[start:end], non_blocking=True)
+        self._cache_root_vel[off:end_off].copy_(self._motion_root_vel[start:end], non_blocking=True)
+        self._cache_root_ang_vel[off:end_off].copy_(self._motion_root_ang_vel[start:end], non_blocking=True)
+        self._cache_dof_pos[off:end_off].copy_(self._motion_dof_pos[start:end], non_blocking=True)
+        self._cache_dof_vel[off:end_off].copy_(self._motion_dof_vel[start:end], non_blocking=True)
+        self._cache_local_body_pos[off:end_off].copy_(self._motion_local_body_pos[start:end], non_blocking=True)
+        self._cache_root_pos_delta_local[off:end_off].copy_(self._motion_root_pos_delta_local[start:end], non_blocking=True)
+        self._cache_root_rot_delta_local[off:end_off].copy_(self._motion_root_rot_delta_local[start:end], non_blocking=True)
+
+        self._cache_meta[motion_id] = (off, length)
+        self._cache_lru[motion_id] = None
+        self._cache_lru.move_to_end(motion_id, last=True)
+        self._cache_frames_used += length
+        self._cache_offset[motion_id] = int(off)
+        self._cache_len[motion_id] = int(length)
+        return True
+
+    def prefetch(self, motion_ids: torch.Tensor) -> None:
+        if not self._gpu_cache_enabled:
+            return
+        if motion_ids.numel() == 0:
+            return
+
+        motion_ids_dev = motion_ids.detach().to(self._device) if motion_ids.device != self._device else motion_ids.detach()
+        # Fast path: if everything is already cached, avoid any GPU->CPU sync.
+        off = self._cache_offset[motion_ids_dev]
+        missing = motion_ids_dev[off < 0]
+        if missing.numel() == 0:
+            return
+
+        # Only synchronize the missing subset.
+        missing_list = missing.to("cpu").tolist()
+        seen = set()
+        uniq_missing = []
+        for mid in missing_list:
+            if mid in seen:
+                continue
+            seen.add(mid)
+            uniq_missing.append(int(mid))
+
+        for mid in uniq_missing:
+            if mid in self._cache_meta:
+                self._cache_lru.move_to_end(mid, last=True)
+                continue
+            self._cache_motion_to_gpu(mid)
+
+    def _gather_frames(self, tensor: torch.Tensor, frame_idx: torch.Tensor) -> torch.Tensor:
+        if tensor.device.type == "cuda":
+            return tensor[frame_idx]
+        frame_idx_cpu = frame_idx if frame_idx.device.type == "cpu" else frame_idx.to("cpu")
+        out = tensor[frame_idx_cpu]
+        if self._device.type == "cuda":
+            out = out.to(self._device, non_blocking=False)
+        return out
+
+    @staticmethod
+    def _load_motion_npz(path: str):
+        with np.load(path, allow_pickle=False) as z:
+            return {
+                "fps": float(z["fps"]),
+                "root_pos": z["root_pos"],
+                "root_rot": z["root_rot"],
+                "dof_pos": z["dof_pos"],
+                "local_body_pos": z["local_body_pos"],
+                "link_body_list": z["link_body_list"].tolist(),
+            }
+
+    def _load_motion_data(self, path: str):
+        if path.endswith(".npz"):
+            return self._load_motion_npz(path)
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    @staticmethod
+    def _finite_difference(x: torch.Tensor, dt: float) -> torch.Tensor:
+        """Compute per-timestep derivative using central differences.
+
+        torch.gradient on CUDA has been observed to segfault in some environments;
+        this implementation avoids that code path while preserving similar behavior.
+        """
+        T = int(x.shape[0])
+        if T <= 1:
+            return torch.zeros_like(x)
+        if T == 2:
+            v = (x[1:2] - x[0:1]) / dt
+            return torch.cat([v, v], dim=0)
+
+        out = torch.empty_like(x)
+        out[1:-1] = (x[2:] - x[:-2]) / (2.0 * dt)
+        out[0] = (x[1] - x[0]) / dt
+        out[-1] = (x[-1] - x[-2]) / dt
+        return out
     
     def _compute_so3_derivative(self, rotations: torch.Tensor, dt: float) -> torch.Tensor:
         """Computes the derivative of a sequence of SO3 rotations using central differences.
@@ -317,13 +619,22 @@ class MotionLib:
             motion_list = motion_config["motions"]
             for motion_entry in motion_list:
                 curr_file = os.path.join(motion_root_path, motion_entry['file'])
+                if curr_file.endswith(".pkl"):
+                    npz_file = curr_file[:-4] + ".npz"
+                    if os.path.exists(npz_file):
+                        curr_file = npz_file
                 curr_weight = motion_entry['weight']
                 assert(curr_weight >= 0)
 
                 motion_weights.append(curr_weight)
                 motion_files.append(curr_file)
         else:
-            motion_files = [motion_file]
+            curr_file = motion_file
+            if curr_file.endswith(".pkl"):
+                npz_file = curr_file[:-4] + ".npz"
+                if os.path.exists(npz_file):
+                    curr_file = npz_file
+            motion_files = [curr_file]
             motion_weights = [1.0]
         
         return motion_files, motion_weights
@@ -334,37 +645,88 @@ class MotionLib:
         phase = times / self._motion_lengths[motion_ids]
         phase = torch.clip(phase, 0.0, 1.0)
         
-        frame_idx0 = (phase * (num_frames - 1)).long()
-        frame_idx1 = torch.min(frame_idx0 + 1, num_frames - 1)
-        blend = phase * (num_frames - 1) - frame_idx0.float()
+        frame_idx0_local = (phase * (num_frames - 1)).long()
+        frame_idx1_local = torch.min(frame_idx0_local + 1, num_frames - 1)
+        blend = phase * (num_frames - 1) - frame_idx0_local.float()
         
         frame_start_idx = self._motion_start_idx[motion_ids]
-        frame_idx0 += frame_start_idx
-        frame_idx1 += frame_start_idx
+        frame_idx0 = frame_idx0_local + frame_start_idx
+        frame_idx1 = frame_idx1_local + frame_start_idx
         
-        return frame_idx0, frame_idx1, blend
+        return frame_idx0, frame_idx1, frame_idx0_local, frame_idx1_local, blend
         
     def calc_motion_frame(self, motion_ids, motion_times):
+        motion_ids = motion_ids.to(self._device)
+        motion_times = motion_times.to(self._device)
+
         motion_loop_num = torch.floor(motion_times / self._motion_lengths[motion_ids])
         motion_times -= motion_loop_num * self._motion_lengths[motion_ids]
-        frame_idx0, frame_idx1, blend = self._calc_frame_blend(motion_ids, motion_times)
-        
-        root_pos0 = self._motion_root_pos[frame_idx0]
-        root_pos1 = self._motion_root_pos[frame_idx1]
-        
-        root_rot0 = self._motion_root_rot[frame_idx0]
-        root_rot1 = self._motion_root_rot[frame_idx1]
-        
-        root_vel = self._motion_root_vel[frame_idx0]
-        root_ang_vel = self._motion_root_ang_vel[frame_idx0]
-        
-        dof_pos0 = self._motion_dof_pos[frame_idx0]
-        dof_pos1 = self._motion_dof_pos[frame_idx1]
-        
-        local_key_body_pos0 = self._motion_local_body_pos[frame_idx0]
-        local_key_body_pos1 = self._motion_local_body_pos[frame_idx1]
-        
-        dof_vel = self._motion_dof_vel[frame_idx0]
+
+        frame_idx0, frame_idx1, frame_idx0_local, frame_idx1_local, blend = self._calc_frame_blend(motion_ids, motion_times)
+
+        use_cache = self._gpu_cache_enabled
+        cache_off = None
+        cached_mask = None
+        if use_cache:
+            cache_off = self._cache_offset[motion_ids].to(torch.int64)
+            cached_mask = cache_off >= 0
+            if not bool(cached_mask.all()):
+                # Only synchronize if there are true misses.
+                self.prefetch(motion_ids[cached_mask.logical_not()])
+                cache_off = self._cache_offset[motion_ids].to(torch.int64)
+                cached_mask = cache_off >= 0
+
+        # Allocate outputs once and fill from cache/CPU as available (avoid all-or-nothing fallback).
+        n = int(motion_ids.shape[0])
+        D = int(self._motion_dof_pos.shape[-1])
+        B = int(self._motion_local_body_pos.shape[1])
+
+        root_pos0 = torch.empty((n, 3), device=self._device, dtype=torch.float32)
+        root_pos1 = torch.empty((n, 3), device=self._device, dtype=torch.float32)
+        root_rot0 = torch.empty((n, 4), device=self._device, dtype=torch.float32)
+        root_rot1 = torch.empty((n, 4), device=self._device, dtype=torch.float32)
+        root_vel = torch.empty((n, 3), device=self._device, dtype=torch.float32)
+        root_ang_vel = torch.empty((n, 3), device=self._device, dtype=torch.float32)
+        dof_pos0 = torch.empty((n, D), device=self._device, dtype=torch.float32)
+        dof_pos1 = torch.empty((n, D), device=self._device, dtype=torch.float32)
+        local_key_body_pos0 = torch.empty((n, B, 3), device=self._device, dtype=torch.float32)
+        local_key_body_pos1 = torch.empty((n, B, 3), device=self._device, dtype=torch.float32)
+        dof_vel = torch.empty((n, D), device=self._device, dtype=torch.float32)
+
+        if use_cache and bool(cached_mask.any()):
+            idx = cached_mask.nonzero(as_tuple=False).flatten()
+            cache_off_c = cache_off[idx]
+            cache_idx0 = cache_off_c + frame_idx0_local[idx].to(torch.int64)
+            cache_idx1 = cache_off_c + frame_idx1_local[idx].to(torch.int64)
+
+            root_pos0[idx] = self._cache_root_pos[cache_idx0]
+            root_pos1[idx] = self._cache_root_pos[cache_idx1]
+            root_rot0[idx] = self._cache_root_rot[cache_idx0]
+            root_rot1[idx] = self._cache_root_rot[cache_idx1]
+            root_vel[idx] = self._cache_root_vel[cache_idx0]
+            root_ang_vel[idx] = self._cache_root_ang_vel[cache_idx0]
+            dof_pos0[idx] = self._cache_dof_pos[cache_idx0]
+            dof_pos1[idx] = self._cache_dof_pos[cache_idx1]
+            local_key_body_pos0[idx] = self._cache_local_body_pos[cache_idx0]
+            local_key_body_pos1[idx] = self._cache_local_body_pos[cache_idx1]
+            dof_vel[idx] = self._cache_dof_vel[cache_idx0]
+
+        if (not use_cache) or bool(cached_mask.logical_not().any()):
+            idx = torch.arange(n, device=self._device) if (not use_cache) else cached_mask.logical_not().nonzero(as_tuple=False).flatten()
+            fi0 = frame_idx0[idx]
+            fi1 = frame_idx1[idx]
+
+            root_pos0[idx] = self._gather_frames(self._motion_root_pos, fi0)
+            root_pos1[idx] = self._gather_frames(self._motion_root_pos, fi1)
+            root_rot0[idx] = self._gather_frames(self._motion_root_rot, fi0)
+            root_rot1[idx] = self._gather_frames(self._motion_root_rot, fi1)
+            root_vel[idx] = self._gather_frames(self._motion_root_vel, fi0)
+            root_ang_vel[idx] = self._gather_frames(self._motion_root_ang_vel, fi0)
+            dof_pos0[idx] = self._gather_frames(self._motion_dof_pos, fi0)
+            dof_pos1[idx] = self._gather_frames(self._motion_dof_pos, fi1)
+            local_key_body_pos0[idx] = self._gather_frames(self._motion_local_body_pos, fi0)
+            local_key_body_pos1[idx] = self._gather_frames(self._motion_local_body_pos, fi1)
+            dof_vel[idx] = self._gather_frames(self._motion_dof_vel, fi0)
         
         blend_unsqueeze = blend.unsqueeze(-1)
         root_pos = (1.0 - blend_unsqueeze) * root_pos0 + blend_unsqueeze * root_pos1
@@ -376,13 +738,35 @@ class MotionLib:
         local_key_body_pos = (1.0 - blend_unsqueeze.unsqueeze(1)) * local_key_body_pos0 + blend_unsqueeze.unsqueeze(1) * local_key_body_pos1
         
         # compute the root pos delta compared to last frame
-        root_pos_delta_local0 = self._motion_root_pos_delta_local[frame_idx0]
-        root_pos_delta_local1 = self._motion_root_pos_delta_local[frame_idx1]
+        root_pos_delta_local0 = torch.empty((n, 3), device=self._device, dtype=torch.float32)
+        root_pos_delta_local1 = torch.empty((n, 3), device=self._device, dtype=torch.float32)
+        if use_cache and bool(cached_mask.any()):
+            idx = cached_mask.nonzero(as_tuple=False).flatten()
+            cache_off_c = cache_off[idx]
+            cache_idx0 = cache_off_c + frame_idx0_local[idx].to(torch.int64)
+            cache_idx1 = cache_off_c + frame_idx1_local[idx].to(torch.int64)
+            root_pos_delta_local0[idx] = self._cache_root_pos_delta_local[cache_idx0]
+            root_pos_delta_local1[idx] = self._cache_root_pos_delta_local[cache_idx1]
+        if (not use_cache) or bool(cached_mask.logical_not().any()):
+            idx = torch.arange(n, device=self._device) if (not use_cache) else cached_mask.logical_not().nonzero(as_tuple=False).flatten()
+            root_pos_delta_local0[idx] = self._gather_frames(self._motion_root_pos_delta_local, frame_idx0[idx])
+            root_pos_delta_local1[idx] = self._gather_frames(self._motion_root_pos_delta_local, frame_idx1[idx])
         root_pos_delta_local = (1.0 - blend_unsqueeze) * root_pos_delta_local0 + blend_unsqueeze * root_pos_delta_local1
 
         # compute the root rot delta compared to last frame 
-        root_rot_delta_local0 = self._motion_root_rot_delta_local[frame_idx0]
-        root_rot_delta_local1 = self._motion_root_rot_delta_local[frame_idx1]
+        root_rot_delta_local0 = torch.empty((n, 3), device=self._device, dtype=torch.float32)
+        root_rot_delta_local1 = torch.empty((n, 3), device=self._device, dtype=torch.float32)
+        if use_cache and bool(cached_mask.any()):
+            idx = cached_mask.nonzero(as_tuple=False).flatten()
+            cache_off_c = cache_off[idx]
+            cache_idx0 = cache_off_c + frame_idx0_local[idx].to(torch.int64)
+            cache_idx1 = cache_off_c + frame_idx1_local[idx].to(torch.int64)
+            root_rot_delta_local0[idx] = self._cache_root_rot_delta_local[cache_idx0]
+            root_rot_delta_local1[idx] = self._cache_root_rot_delta_local[cache_idx1]
+        if (not use_cache) or bool(cached_mask.logical_not().any()):
+            idx = torch.arange(n, device=self._device) if (not use_cache) else cached_mask.logical_not().nonzero(as_tuple=False).flatten()
+            root_rot_delta_local0[idx] = self._gather_frames(self._motion_root_rot_delta_local, frame_idx0[idx])
+            root_rot_delta_local1[idx] = self._gather_frames(self._motion_root_rot_delta_local, frame_idx1[idx])
         # we use linear interpolation for root rot delta, as it is euler angle
         root_rot_delta_local = (1.0 - blend_unsqueeze) * root_rot_delta_local0 + blend_unsqueeze * root_rot_delta_local1
 

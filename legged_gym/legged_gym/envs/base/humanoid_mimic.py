@@ -148,6 +148,9 @@ class HumanoidMimic(HumanoidChar):
         self._motion_ids[env_ids] = motion_ids
         self._motion_time_offsets[env_ids] = motion_times
         
+        if hasattr(self._motion_lib, "prefetch"):
+            self._motion_lib.prefetch(motion_ids)
+
         root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, body_pos, root_pos_delta_local, root_rot_delta_local = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
         root_pos[:, 2] += self.cfg.motion.height_offset
         
@@ -171,6 +174,8 @@ class HumanoidMimic(HumanoidChar):
     def _update_ref_motion(self):
         motion_ids = self._motion_ids
         motion_times = self._get_motion_times()
+        if hasattr(self._motion_lib, "prefetch"):
+            self._motion_lib.prefetch(motion_ids)
         root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, body_pos, root_pos_delta_local, root_rot_delta_local = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
         root_pos[:, 2] += self.cfg.motion.height_offset
         root_pos[:, :2] += self.episode_init_origin[:, :2]
@@ -289,7 +294,7 @@ class HumanoidMimic(HumanoidChar):
         hard_sync_env_ids = hard_sync_envs.nonzero(as_tuple=False).flatten()
         if len(hard_sync_env_ids) == 0:
             return
-        root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, body_pos = self._motion_lib.calc_motion_frame(self._motion_ids, motion_times*0)
+        root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, body_pos, _, _ = self._motion_lib.calc_motion_frame(self._motion_ids, motion_times*0)
         self._reset_dofs(hard_sync_env_ids, dof_pos, dof_vel*0.8)
         self._reset_root_states(env_ids=hard_sync_env_ids, root_vel=root_vel*0.8, root_quat=root_rot, root_pos=root_pos, root_ang_vel=root_ang_vel*0.8)
         self.gym.simulate(self.sim)
@@ -512,7 +517,7 @@ class HumanoidMimic(HumanoidChar):
         motion_ids_tiled = torch.broadcast_to(self._motion_ids.unsqueeze(-1), obs_motion_times.shape)
         motion_ids_tiled = motion_ids_tiled.flatten()
         obs_motion_times = obs_motion_times.flatten()
-        root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, body_pos = self._motion_lib.calc_motion_frame(motion_ids_tiled, obs_motion_times)
+        root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, body_pos, _, _ = self._motion_lib.calc_motion_frame(motion_ids_tiled, obs_motion_times)
         
         # Apply motion domain randomization noise
         root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel = self._apply_motion_domain_randomization(
