@@ -84,22 +84,39 @@ def set_nested_attr(obj, attr_path, value):
         raise AttributeError(f"'{type(obj).__name__}' object has no attribute '{final_attr}'")
 
 def parse_dot_notation_args(unknown_args):
-    """Parse unknown arguments in dot notation format (--config.param value)"""
+    """Parse unknown arguments in dot notation format.
+
+    Supported forms:
+      - --a.b value
+      - --a.b=value
+      - a.b=value
+      - --a.b   (treated as boolean true)
+    """
     config_overrides = {}
     i = 0
     while i < len(unknown_args):
         arg = unknown_args[i]
         if arg.startswith('--') and '.' in arg:
-            # Remove -- prefix and get the config path
             config_path = arg[2:]
+            # Support --a.b=value
+            if '=' in config_path:
+                key, value = config_path.split('=', 1)
+                config_overrides[key] = value
+                i += 1
+                continue
+
+            # Support --a.b value or --a.b (boolean)
             if i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith('--'):
-                # Next argument is the value
                 config_overrides[config_path] = unknown_args[i + 1]
                 i += 2
             else:
-                # No value provided, treat as boolean flag
                 config_overrides[config_path] = 'true'
                 i += 1
+        elif (not arg.startswith('--')) and ('.' in arg) and ('=' in arg):
+            # Support a.b=value
+            key, value = arg.split('=', 1)
+            config_overrides[key] = value
+            i += 1
         else:
             i += 1
     return config_overrides
