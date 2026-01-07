@@ -60,16 +60,44 @@ def quat_rotate_inverse_torch(q, v, scalar_first=True):
 def quat_rotate_inverse_np(q, v, scalar_first=True):
     q = np.asarray(q)
     v = np.asarray(v)
+
+    v_was_vector = False
+    if q.ndim == 1:
+        if q.shape[0] != 4:
+            raise ValueError(f"Expected quaternion shape (4,), got {q.shape}")
+        q = q.reshape(1, 4)
+    if v.ndim == 1:
+        if v.shape[0] != 3:
+            raise ValueError(f"Expected vector shape (3,), got {v.shape}")
+        v = v.reshape(1, 3)
+        v_was_vector = True
+    if q.ndim != 2 or q.shape[1] != 4:
+        raise ValueError(f"Expected quaternion shape (N,4), got {q.shape}")
+    if v.ndim != 2 or v.shape[1] != 3:
+        raise ValueError(f"Expected vector shape (N,3), got {v.shape}")
+
     if scalar_first:
-        q = q[..., [1, 2, 3, 0]]
+        q = q[:, [1, 2, 3, 0]]
     else:
-        q = q[..., [0, 1, 2, 3]]
-    q_w = q[..., -1]
-    q_vec = q[..., :3]
-    a = v * (2.0 * q_w ** 2 - 1.0)
+        q = q[:, [0, 1, 2, 3]]
+
+    q_w = q[:, 3:4]   # (N,1)
+    q_vec = q[:, :3]  # (N,3)
+
+    if q_vec.shape[0] != v.shape[0]:
+        if q_vec.shape[0] == 1:
+            q_w = np.repeat(q_w, v.shape[0], axis=0)
+            q_vec = np.repeat(q_vec, v.shape[0], axis=0)
+        elif v.shape[0] == 1:
+            v = np.repeat(v, q_vec.shape[0], axis=0)
+        else:
+            raise ValueError(f"Batch size mismatch: q={q_vec.shape[0]} v={v.shape[0]}")
+
+    a = v * (2.0 * q_w**2 - 1.0)
     b = np.cross(q_vec, v) * (2.0 * q_w)
-    c = q_vec * np.sum(q_vec * v, axis=-1, keepdims=True) * 2.0
-    return a - b + c
+    c = q_vec * (2.0 * np.sum(q_vec * v, axis=1, keepdims=True))
+    out = a - b + c
+    return out[0] if (v_was_vector and out.shape[0] == 1) else out
 
 def euler_from_quaternion_torch(quat_angle, scalar_first=True):
     """

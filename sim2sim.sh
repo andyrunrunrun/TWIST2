@@ -9,5 +9,6 @@ python server_low_level_g1_sim.py \
     --device cuda \
     --measure_fps 1 \
     --policy_frequency 100 \
+    --viewer_decimation 100 \
     --limit_fps 1 \
     # --record_proprio \

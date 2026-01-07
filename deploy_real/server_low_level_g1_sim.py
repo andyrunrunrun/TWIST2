@@ -51,8 +51,34 @@ def load_onnx_policy(policy_path: str, device: str) -> OnnxPolicyWrapper:
     providers.append('CPUExecutionProvider')
     session = ort.InferenceSession(policy_path, providers=providers)
     input_name = session.get_inputs()[0].name
-    print(f"ONNX policy loaded from {policy_path} using providers: {session.get_providers()}")
+    session_providers = session.get_providers()
+    primary_provider = session_providers[0] if session_providers else "Unknown"
+    inferred_device = "cuda" if primary_provider == "CUDAExecutionProvider" else "cpu"
+    print(f"ONNX policy loaded from {policy_path} using providers: {session_providers}")
+    print(f"ONNX policy inference device: {inferred_device} (primary provider: {primary_provider})")
     return OnnxPolicyWrapper(session, input_name)
+
+
+class EMASmoother:
+    """Exponential Moving Average smoother for body actions."""
+
+    def __init__(self, alpha=0.1, initial_value=None):
+        self.alpha = alpha
+        self.initialized = False
+        self.smoothed_value = initial_value
+
+    def smooth(self, new_value):
+        if not self.initialized:
+            self.smoothed_value = new_value.copy() if hasattr(new_value, 'copy') else new_value
+            self.initialized = True
+            return self.smoothed_value
+
+        self.smoothed_value = self.alpha * new_value + (1 - self.alpha) * self.smoothed_value
+        return self.smoothed_value
+
+    def reset(self):
+        self.initialized = False
+        self.smoothed_value = None
 
 
 class RealTimePolicyController:
@@ -65,6 +91,8 @@ class RealTimePolicyController:
                  measure_fps=False,
                  limit_fps=True,
                  policy_frequency=50,
+                 viewer_decimation=0,
+                 smooth_body=0.0,
                  ):
         self.measure_fps = measure_fps
         self.limit_fps = limit_fps
@@ -97,6 +125,8 @@ class RealTimePolicyController:
         # ==> decimation = 1 / (real frequency * sim_dt)
         self.sim_decimation = 1 / (policy_frequency * self.sim_dt)
         print(f"sim_decimation: {self.sim_decimation}")
+        self.viewer_decimation = max(1, int(viewer_decimation)) if int(viewer_decimation) > 0 else max(1, int(round(self.sim_decimation)))
+        print(f"viewer_decimation: {self.viewer_decimation}")
 
         self.last_action = np.zeros(self.num_actions, dtype=np.float32)
 
@@ -177,6 +207,14 @@ class RealTimePolicyController:
         self.record_video = record_video
         self.record_proprio = record_proprio
         self.proprio_recordings = [] if record_proprio else None
+
+        # Optional smoothing for the mimic target coming from Redis (sim2sim parity with real controller).
+        self.smooth_body = smooth_body
+        if smooth_body > 0.0:
+            self.body_smoother = EMASmoother(alpha=smooth_body)
+            print(f"Body action smoothing enabled with alpha={smooth_body}")
+        else:
+            self.body_smoother = None
         
 
     def reset_sim(self):
@@ -277,6 +315,11 @@ class RealTimePolicyController:
                     action_right_hand = json.loads(redis_results[2])
                     action_neck = json.loads(redis_results[3])
 
+                    # Apply smoothing to body actions if enabled.
+                    if self.body_smoother is not None:
+                        action_mimic = self.body_smoother.smooth(np.array(action_mimic, dtype=np.float32))
+                        action_mimic = action_mimic.tolist()
+
                     # Construct observation for TWIST2 controller
                     obs_full = np.concatenate([action_mimic, obs_proprio])
                     # Update history
@@ -340,15 +383,6 @@ class RealTimePolicyController:
                     pd_target = scaled_actions + self.default_dof_pos
 
                     # self.redis_client.set("action_low_level_unitree_g1", json.dumps(raw_action.tolist()))
-                    
-                    # Update camera to follow pelvis
-                    pelvis_pos = self.data.xpos[self.model.body("pelvis").id]
-                    self.viewer.cam.lookat = pelvis_pos
-                    self.viewer.sync()
-                    
-                    if mp4_writer is not None:
-                        img = self.viewer.read_pixels()
-                        mp4_writer.append_data(img)
 
                     # Record proprio if enabled
                     if self.record_proprio:
@@ -369,6 +403,15 @@ class RealTimePolicyController:
                 
                 self.data.ctrl[:] = torque
                 mujoco.mj_step(self.model, self.data)
+
+                if self.viewer is not None and (i % self.viewer_decimation == 0):
+                    # Update camera to follow pelvis
+                    pelvis_pos = self.data.xpos[self.model.body("pelvis").id]
+                    self.viewer.cam.lookat = pelvis_pos
+                    self.viewer.sync()
+                    if mp4_writer is not None:
+                        img = self.viewer.read_pixels()
+                        mp4_writer.append_data(img)
                 
                 # Sleep to maintain real-time pace
                 if self.limit_fps:
@@ -414,6 +457,18 @@ def main():
     parser.add_argument("--measure_fps", help="Measure FPS", default=0, type=int)
     parser.add_argument("--limit_fps", help="Limit FPS with sleep", default=1, type=int)
     parser.add_argument("--policy_frequency", help="Policy frequency", default=100, type=int)
+    parser.add_argument(
+        "--viewer_decimation",
+        help="Call viewer.sync every N sim steps (0 uses policy decimation).",
+        default=0,
+        type=int,
+    )
+    parser.add_argument(
+        "--smooth_body",
+        type=float,
+        default=0.0,
+        help="EMA smoothing factor for action_mimic from Redis (0 disables; recommended 0.05~0.2)",
+    )
     args = parser.parse_args()
     
     # Verify policy file exists
@@ -443,6 +498,8 @@ def main():
         measure_fps=args.measure_fps,
         limit_fps=args.limit_fps,
         policy_frequency=args.policy_frequency,
+        viewer_decimation=args.viewer_decimation,
+        smooth_body=args.smooth_body,
     )
     controller.run()
 
