@@ -220,6 +220,10 @@ class DAggerRunner:
             
             ep_infos.clear()
         
+        # Save the final checkpoint even if it doesn't land on a save interval.
+        # Iterations are zero-based, so the last iteration is tot_iter - 1.
+        if tot_iter > self.current_learning_iteration:
+            self.current_learning_iteration = tot_iter - 1
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
     
     def log(self, locs, width=80, pad=35):
