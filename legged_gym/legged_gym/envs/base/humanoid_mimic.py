@@ -95,7 +95,11 @@ class HumanoidMimic(HumanoidChar):
         self._motion_lib = MotionLib(motion_file=self.cfg.motion.motion_file, device=self.device,
                                      sample_ratio=self.cfg.motion.sample_ratio,
                                     motion_decompose=self.cfg.motion.motion_decompose,
-                                    motion_smooth=self.cfg.motion.motion_smooth)
+                                    motion_smooth=self.cfg.motion.motion_smooth,
+                                    max_motions=getattr(self.cfg.motion, "max_motions", -1),
+                                    motion_ids=getattr(self.cfg.motion, "motion_ids", ""),
+                                    shuffle_motions=getattr(self.cfg.motion, "shuffle_motions", False),
+                                    shuffle_seed=getattr(self.cfg.motion, "shuffle_seed", 0))
         return
     
     def _init_motion_buffers(self):
@@ -681,6 +685,91 @@ class HumanoidMimic(HumanoidChar):
         noise_scale_vec[:, noise_start_dim+(ang_vel_dim+imu_dim):noise_start_dim+(ang_vel_dim+imu_dim)+self.num_dof] = self.cfg.noise.noise_scales.dof_pos
         noise_scale_vec[:, noise_start_dim+(ang_vel_dim+imu_dim)+self.num_dof:noise_start_dim+(ang_vel_dim+imu_dim)+2*self.num_dof] = self.cfg.noise.noise_scales.dof_vel
         return noise_scale_vec
+
+    def get_episode_log(self, env_ids=0):
+        log = super().get_episode_log(env_ids=env_ids)
+
+        try:
+            env_id_int = int(env_ids) if not torch.is_tensor(env_ids) else int(env_ids.item())
+        except Exception:
+            env_id_int = 0
+
+        # Basic time/motion context
+        log["env_id"] = env_id_int
+        log["step"] = int(self.episode_length_buf[env_id_int].item())
+        log["time_s"] = float(self.episode_length_buf[env_id_int].item() * self.dt)
+        if hasattr(self, "_motion_ids"):
+            log["motion_id"] = int(self._motion_ids[env_id_int].item())
+        try:
+            log["motion_time_s"] = float(self._get_motion_times()[env_id_int].item())
+        except Exception:
+            pass
+
+        # Root tracking errors (pose and velocity)
+        try:
+            root_pos_err = self._ref_root_pos[env_id_int] - self.root_states[env_id_int, 0:3]
+            log["err_root_pos_l2"] = float(torch.norm(root_pos_err).item())
+            root_rot_err = torch_utils.quat_diff_angle(
+                self.root_states[env_id_int, 3:7].unsqueeze(0),
+                self._ref_root_rot[env_id_int].unsqueeze(0),
+            )
+            log["err_root_rot_rad"] = float(root_rot_err.squeeze(0).item())
+
+            local_ref_root_vel = quat_rotate_inverse(
+                self._ref_root_rot[env_id_int].unsqueeze(0),
+                self._ref_root_vel[env_id_int].unsqueeze(0),
+            ).squeeze(0)
+            root_vel_err = local_ref_root_vel - self.base_lin_vel[env_id_int]
+            log["err_root_lin_vel_l2"] = float(torch.norm(root_vel_err).item())
+
+            local_ref_root_ang_vel = quat_rotate_inverse(
+                self._ref_root_rot[env_id_int].unsqueeze(0),
+                self._ref_root_ang_vel[env_id_int].unsqueeze(0),
+            ).squeeze(0)
+            root_ang_vel_err = local_ref_root_ang_vel - self.base_ang_vel[env_id_int]
+            log["err_root_ang_vel_l2"] = float(torch.norm(root_ang_vel_err).item())
+        except Exception:
+            pass
+
+        # Joint tracking errors
+        try:
+            dof_pos_err = self._ref_dof_pos[env_id_int] - self.dof_pos[env_id_int]
+            dof_vel_err = self._ref_dof_vel[env_id_int] - self.dof_vel[env_id_int]
+            log["err_dof_pos_l2"] = float(torch.norm(dof_pos_err).item())
+            log["err_dof_vel_l2"] = float(torch.norm(dof_vel_err).item())
+        except Exception:
+            pass
+
+        # Key body position error (L1 mean), consistent with _error_tracking_keybody_pos
+        try:
+            key_body_pos = self.rigid_body_states[env_id_int, self._key_body_ids, 0:3]
+            key_body_pos = key_body_pos - self.root_states[env_id_int, 0:3].unsqueeze(0)
+            if not self.global_obs:
+                yaw = self.yaw[env_id_int:env_id_int + 1]
+                base_yaw_quat = quat_from_euler_xyz(0 * yaw, 0 * yaw, yaw)
+                key_body_pos = convert_to_local_root_body_pos(base_yaw_quat, key_body_pos.unsqueeze(0)).squeeze(0)
+
+            tar_key_body_pos = self._ref_body_pos[env_id_int, self._key_body_ids, :]
+            tar_key_body_pos = tar_key_body_pos - self._ref_root_pos[env_id_int].unsqueeze(0)
+            if not self.global_obs:
+                _, _, ref_yaw = euler_from_quaternion(self._ref_root_rot[env_id_int:env_id_int + 1])
+                ref_yaw_quat = quat_from_euler_xyz(0 * ref_yaw, 0 * ref_yaw, ref_yaw)
+                tar_key_body_pos = convert_to_local_root_body_pos(ref_yaw_quat, tar_key_body_pos.unsqueeze(0)).squeeze(0)
+
+            key_body_pos_err = torch.mean(torch.abs(key_body_pos - tar_key_body_pos))
+            log["err_keybody_pos_l1"] = float(key_body_pos_err.item())
+        except Exception:
+            pass
+
+        # Contacts (feet)
+        try:
+            feet_contact = (self.contact_forces[env_id_int, self.feet_indices, 2] > 5.0)
+            log["feet_contact"] = feet_contact.cpu().numpy().astype(int).tolist()
+            log["feet_contact_forces_z"] = self.contact_forces[env_id_int, self.feet_indices, 2].cpu().numpy().tolist()
+        except Exception:
+            pass
+
+        return log
     
     
     # ================== rewards ==================

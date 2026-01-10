@@ -30,6 +30,7 @@
 
 import os
 import copy
+import sys
 import torch
 import numpy as np
 import random
@@ -313,12 +314,22 @@ def get_args():
         {"name": "--no_wandb", "action": "store_true", "default": False, "help": "no wandb"},
 
         {"name": "--record_video", "action": "store_true", "default": False, "help": "record video"},
+        {"name": "--record_num_motions", "type": int, "default": 1, "help": "When --record_video is set: record this many motion clips (each clip records the full motion length)."},
+        {"name": "--record_motion_ids", "type": str, "default": "", "help": "When --record_video is set: motion indices to record, e.g. '0,3,10-20'. Overrides --record_num_motions."},
+        {"name": "--record_shuffle", "action": "store_true", "default": False, "help": "When selecting motions to record, shuffle the available motions first."},
+        {"name": "--record_seed", "type": int, "default": 0, "help": "Seed used by --record_shuffle."},
+        {"name": "--record_split_videos", "action": "store_true", "default": False, "help": "When --record_video is set: save one mp4 per motion (legacy behavior). Default is a single concatenated video."},
+        {"name": "--record_video_name", "type": str, "default": "", "help": "Optional output mp4 name for concatenated recording (e.g. 'demo.mp4')."},
+        {"name": "--record_no_overlay", "action": "store_true", "default": False, "help": "Disable overlay text on recorded frames."},
         
         {"name": "--fix_action_std", "action": "store_true", "default": False, "help": "fix std"},
         {"name": "--no_rand", "action": "store_true", "default": False, "help": "no domain randomization"},
         
         {"name": "--teleop_mode", "action": "store_true", "default": False, "help": "teleop mode"},
         {"name": "--record_log", "action": "store_true", "default": False, "help": "record log"},
+        {"name": "--record_log_dir", "type": str, "default": "", "help": "When --record_log is set: output directory for the json log (e.g. '/tmp/twist2_logs'). Empty uses the default logs/env_logs/<run>."},
+        {"name": "--record_log_stride", "type": int, "default": 1, "help": "When --record_log is set: log every N env steps (>=1)."},
+        {"name": "--record_log_env_id", "type": int, "default": -1, "help": "When --record_log is set: which env index to log. -1 uses env.lookat_id if available, else 0."},
         
         {"name": "--use_transformer", "action": "store_true", "default": False, "help": "use transformer"},
 
@@ -449,6 +460,12 @@ def parse_arguments(description="Isaac Gym Example", headless=False, no_graphics
         args.sim_device = args.device
         args.rl_device = args.device
     args.sim_device_type, args.compute_device_id = parse_device_str(args.sim_device)
+
+    # If user didn't explicitly set graphics device, default it to the sim GPU.
+    # This avoids camera sensor creation failures when sim runs on a non-zero GPU.
+    if args.sim_device_type == 'cuda' and '--graphics_device_id' not in sys.argv:
+        args.graphics_device_id = args.compute_device_id
+
     pipeline = args.pipeline.lower()
 
     assert (pipeline == 'cpu' or pipeline in ('gpu', 'cuda')), f"Invalid pipeline '{args.pipeline}'. Should be either cpu or gpu."

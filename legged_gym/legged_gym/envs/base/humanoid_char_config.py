@@ -297,6 +297,15 @@ class HumanoidCharCfg(BaseConfig):
         key_bodies = []
         upper_key_bodies = []
         motion_file = ""
+        # For visualization/debug: limit how many motions to load from a big YAML.
+        # -1 means load all.
+        max_motions = -1
+        # Optional subset selector for YAML-based motion lists. Examples: "0", "0,3,7", "10-20".
+        # Empty string means no filtering.
+        motion_ids = ""
+        # If True, shuffle the YAML motion list before applying max_motions/motion_ids.
+        shuffle_motions = False
+        shuffle_seed = 0
         height_offset = 0.0
         reset_consec_frames = 50
         sample_ratio = 1.0

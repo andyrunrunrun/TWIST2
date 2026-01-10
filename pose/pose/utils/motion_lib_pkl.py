@@ -26,6 +26,10 @@ class MotionLib:
                  motion_smooth=True, 
                  motion_height_adjust=False,
                  sample_ratio=1.0, # only sample a portion of the motion
+                 max_motions: int = -1, # for YAML configs: only load first N after filtering
+                 motion_ids: str = "", # for YAML configs: select a subset by indices, e.g. "0,3,10-20"
+                 shuffle_motions: bool = False, # for YAML configs: shuffle before applying max_motions (ignored if motion_ids given)
+                 shuffle_seed: int = 0,
                  store_on_cpu: bool = True, # keep dataset tensors on CPU, move slices to GPU on demand
                  gpu_cache_gib: float = 4.0, # cache active motions on GPU up to this budget (GiB); 0 disables
                  ):
@@ -42,6 +46,11 @@ class MotionLib:
         self._motion_height_adjust = motion_height_adjust
         # sample a portion of the motion
         self._sample_ratio = sample_ratio
+
+        self._max_motions = int(max_motions) if max_motions is not None else -1
+        self._motion_ids_spec = str(motion_ids) if motion_ids is not None else ""
+        self._shuffle_motions = bool(shuffle_motions)
+        self._shuffle_seed = int(shuffle_seed) if shuffle_seed is not None else 0
         
         # load motions
         self._load_motions(motion_file)
@@ -617,6 +626,25 @@ class MotionLib:
             
             motion_root_path = motion_config["root_path"]
             motion_list = motion_config["motions"]
+
+            # Optional subset selection for faster visualization/debug.
+            if self._motion_ids_spec.strip():
+                indices = self._parse_index_spec(self._motion_ids_spec, len(motion_list))
+                motion_list = [motion_list[i] for i in indices]
+            elif self._shuffle_motions:
+                rng = np.random.RandomState(self._shuffle_seed)
+                order = rng.permutation(len(motion_list)).tolist()
+                motion_list = [motion_list[i] for i in order]
+
+            if self._max_motions > 0:
+                motion_list = motion_list[: self._max_motions]
+
+            if len(motion_list) == 0:
+                raise ValueError(
+                    f"No motions selected from YAML. motion_file={motion_file}, "
+                    f"motion_ids='{self._motion_ids_spec}', max_motions={self._max_motions}"
+                )
+
             for motion_entry in motion_list:
                 curr_file = os.path.join(motion_root_path, motion_entry['file'])
                 if curr_file.endswith(".pkl"):
@@ -638,6 +666,48 @@ class MotionLib:
             motion_weights = [1.0]
         
         return motion_files, motion_weights
+
+    @staticmethod
+    def _parse_index_spec(spec: str, n: int) -> List[int]:
+        spec = (spec or "").strip()
+        if not spec:
+            return list(range(n))
+
+        indices: List[int] = []
+        parts = [p.strip() for p in spec.replace(" ", "").split(",") if p.strip()]
+        for part in parts:
+            if "-" in part:
+                a_s, b_s = part.split("-", 1)
+                if a_s == "" or b_s == "":
+                    raise ValueError(f"Invalid range token '{part}' in motion_ids='{spec}'")
+                a = int(a_s)
+                b = int(b_s)
+                if a < 0:
+                    a = n + a
+                if b < 0:
+                    b = n + b
+                if a > b:
+                    a, b = b, a
+                for i in range(a, b + 1):
+                    if i < 0 or i >= n:
+                        raise IndexError(f"motion_ids index {i} out of range [0, {n-1}]")
+                    indices.append(i)
+            else:
+                i = int(part)
+                if i < 0:
+                    i = n + i
+                if i < 0 or i >= n:
+                    raise IndexError(f"motion_ids index {i} out of range [0, {n-1}]")
+                indices.append(i)
+
+        # Deduplicate while preserving order
+        seen = set()
+        out: List[int] = []
+        for i in indices:
+            if i not in seen:
+                seen.add(i)
+                out.append(i)
+        return out
     
     def _calc_frame_blend(self, motion_ids, times):
         num_frames = self._motion_num_frames[motion_ids]
