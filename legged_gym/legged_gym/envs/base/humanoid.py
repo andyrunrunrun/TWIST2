@@ -119,17 +119,41 @@ class Humanoid(LeggedRobot):
         self.gym.step_graphics(self.sim)
         if getattr(self, "viewer", None) is not None:
             self.gym.clear_lines(self.viewer)
-        self.gym.render_all_camera_sensors(self.sim)
-        imgs = []
+        # Update camera poses to follow the robot before rendering.
         for i in range(self.num_envs):
             cam = handles[i]
             root_pos = self.root_states[i, :3].cpu().numpy()
             cam_pos = root_pos + np.array([0, -2, 0.3])
             self.gym.set_camera_location(cam, self.envs[i], gymapi.Vec3(*cam_pos), gymapi.Vec3(*root_pos))
+
+        self.gym.render_all_camera_sensors(self.sim)
+
+        imgs = []
+        view_mats = []
+        proj_mats = []
+        for i in range(self.num_envs):
+            cam = handles[i]
+            try:
+                view = self.gym.get_camera_view_matrix(self.sim, self.envs[i], cam)
+                proj = self.gym.get_camera_proj_matrix(self.sim, self.envs[i], cam)
+                view = np.array(view, dtype=np.float32)
+                proj = np.array(proj, dtype=np.float32)
+                if view.size == 16:
+                    view = view.reshape(4, 4)
+                if proj.size == 16:
+                    proj = proj.reshape(4, 4)
+            except Exception:
+                view = None
+                proj = None
+            view_mats.append(view)
+            proj_mats.append(proj)
+
             img = self.gym.get_camera_image(self.sim, self.envs[i], cam, gymapi.IMAGE_COLOR)
             w, h = img.shape
             imgs.append(img.reshape([w, h // 4, 4]))
-                
+
+        self._rendering_camera_last_view_mats = view_mats
+        self._rendering_camera_last_proj_mats = proj_mats
         return imgs
     
                               
