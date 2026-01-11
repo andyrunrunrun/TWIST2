@@ -96,6 +96,9 @@ def play(args):
 
     env_cfg.env.record_video = args.record_video
     env_cfg.env.rand_reset = False
+    # When recording, visualize GT vs policy keypoints as colored spheres in the same frame.
+    if args.record_video:
+        env_cfg.env.viz_keypoints = True
 
     # Recording usually wants a single env unless the user explicitly overrides it.
     if args.record_video and args.num_envs is None:
@@ -210,6 +213,134 @@ def play(args):
         y1 = min(h - 1, y0 + baseline + pad)
         cv2.rectangle(bgr, (x0 - pad, y0 - th - pad), (x1, y1), (0, 0, 0), -1)
         cv2.putText(bgr, text, (x0, y0), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+        rgb = bgr[..., ::-1]
+        return rgb
+
+    def _overlay_keypoints(img, env, env_i: int):
+        if not getattr(getattr(env, "cfg", None), "env", None):
+            return img
+        if not bool(getattr(env.cfg.env, "viz_keypoints", False)):
+            return img
+        if getattr(args, "record_no_overlay", False):
+            return img
+        try:
+            import cv2
+            import numpy as np
+        except Exception:
+            return img
+
+        if img is None:
+            return img
+
+        frame = img
+        if hasattr(frame, "dtype") and frame.dtype != "uint8":
+            frame = frame.astype("uint8")
+        if len(frame.shape) == 3 and frame.shape[-1] == 4:
+            frame = frame[..., :3]
+        if len(frame.shape) != 3 or frame.shape[-1] != 3:
+            return img
+
+        view_mats = getattr(env, "_rendering_camera_last_view_mats", None)
+        proj_mats = getattr(env, "_rendering_camera_last_proj_mats", None)
+        if view_mats is None or proj_mats is None:
+            return frame
+        if env_i < 0 or env_i >= len(view_mats) or env_i >= len(proj_mats):
+            return frame
+        view = view_mats[env_i]
+        proj = proj_mats[env_i]
+        if view is None or proj is None:
+            return frame
+        view = np.array(view, dtype=np.float32)
+        proj = np.array(proj, dtype=np.float32)
+        if view.size == 16:
+            view = view.reshape(4, 4)
+        if proj.size == 16:
+            proj = proj.reshape(4, 4)
+        if view.shape != (4, 4) or proj.shape != (4, 4):
+            return frame
+
+        key_body_ids = getattr(env, "_key_body_ids", None)
+        if key_body_ids is None:
+            return frame
+
+        # Colors are stored as RGB tuples in config.
+        gt_rgb = tuple(getattr(env.cfg.env, "viz_keypoints_gt_color", (1.0, 0.0, 0.0)))
+        pol_rgb = tuple(getattr(env.cfg.env, "viz_keypoints_policy_color", (0.0, 1.0, 0.0)))
+        gt_bgr = (int(255 * gt_rgb[2]), int(255 * gt_rgb[1]), int(255 * gt_rgb[0]))
+        pol_bgr = (int(255 * pol_rgb[2]), int(255 * pol_rgb[1]), int(255 * pol_rgb[0]))
+        world_radius = float(getattr(env.cfg.env, "viz_keypoints_radius", 0.05))
+
+        try:
+            pol_pts = env.rigid_body_states[env_i, key_body_ids, :3].detach().cpu().numpy().astype(np.float32)
+        except Exception:
+            return frame
+        gt_pts = None
+        if hasattr(env, "_ref_body_pos"):
+            try:
+                gt_pts = env._ref_body_pos[env_i, key_body_ids, :3].detach().cpu().numpy().astype(np.float32)
+            except Exception:
+                gt_pts = None
+
+        h, w = frame.shape[:2]
+
+        def _project(world_pts: "np.ndarray"):
+            if world_pts is None or world_pts.ndim != 2 or world_pts.shape[1] != 3:
+                return None, None, None
+            n = world_pts.shape[0]
+            pts_h = np.concatenate([world_pts, np.ones((n, 1), dtype=np.float32)], axis=1)
+
+            def _proj_variant(use_transpose: bool):
+                cam = pts_h @ (view.T if use_transpose else view)
+                clip = cam @ (proj.T if use_transpose else proj)
+                wclip = clip[:, 3:4]
+                ok = np.isfinite(wclip).squeeze(-1) & (np.abs(wclip).squeeze(-1) > 1e-6)
+                ndc = np.zeros((n, 3), dtype=np.float32)
+                ndc[ok] = clip[ok, :3] / wclip[ok]
+                u = (ndc[:, 0] * 0.5 + 0.5) * float(w)
+                v = (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * float(h)
+                inside = ok & np.isfinite(u) & np.isfinite(v) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+                return cam, u, v, inside
+
+            cam_a, u_a, v_a, in_a = _proj_variant(True)
+            cam_b, u_b, v_b, in_b = _proj_variant(False)
+            if int(in_b.sum()) > int(in_a.sum()):
+                return cam_b, u_b, v_b, in_b
+            return cam_a, u_a, v_a, in_a
+
+        def _pixel_radii(cam_xyz: "np.ndarray"):
+            if cam_xyz is None or cam_xyz.ndim != 2 or cam_xyz.shape[1] < 3:
+                return None
+            # Isaac Gym camera uses an OpenGL-like convention; depth is often -Z in camera space.
+            depth = np.abs(cam_xyz[:, 2]).astype(np.float32)
+            depth = np.maximum(depth, 1e-3)
+            m00 = float(proj[0, 0])
+            fx = abs(m00) * float(w) / 2.0
+            r = fx * float(world_radius) / depth
+            r = np.clip(r, 2.0, 30.0)
+            return r
+
+        bgr = frame[..., ::-1].copy()
+
+        cam_pol, u_pol, v_pol, in_pol = _project(pol_pts)
+        r_pol = _pixel_radii(cam_pol) if cam_pol is not None else None
+        if u_pol is not None:
+            for k in range(u_pol.shape[0]):
+                if not bool(in_pol[k]):
+                    continue
+                rad = int(r_pol[k]) if r_pol is not None else 6
+                cv2.circle(bgr, (int(u_pol[k]), int(v_pol[k])), rad, pol_bgr, -1, lineType=cv2.LINE_AA)
+
+        if gt_pts is not None:
+            cam_gt, u_gt, v_gt, in_gt = _project(gt_pts)
+            r_gt = _pixel_radii(cam_gt) if cam_gt is not None else None
+            if u_gt is not None:
+                for k in range(u_gt.shape[0]):
+                    if not bool(in_gt[k]):
+                        continue
+                    rad = int(r_gt[k]) if r_gt is not None else 6
+                    # Draw GT as a ring to keep it visible when overlapping policy dots.
+                    cv2.circle(bgr, (int(u_gt[k]), int(v_gt[k])), rad, gt_bgr, 2, lineType=cv2.LINE_AA)
 
         rgb = bgr[..., ::-1]
         return rgb
@@ -391,9 +522,11 @@ def play(args):
                     if split_videos:
                         for env_i in range(env.num_envs):
                             frame = _overlay_text(imgs[env_i], overlay)
+                            frame = _overlay_keypoints(frame, env, env_i)
                             mp4_writers[env_i].append_data(frame)
                     else:
                         frame = _overlay_text(imgs[0], overlay)
+                        frame = _overlay_keypoints(frame, env, 0)
                         single_writer.append_data(frame)
 
                 if env.button_pressed:
