@@ -59,6 +59,15 @@ class HumanoidCharCfg(BaseConfig):
         teleop_mode = False
         normalize_obs = True
 
+        # Keypoint marker visualization (rendered geometry, visible in camera sensors).
+        # When enabled, the env spawns two sets of spheres for `cfg.motion.key_bodies`:
+        # - GT/reference keypoints (red)
+        # - policy/current keypoints (green)
+        viz_keypoints = False
+        viz_keypoints_radius = 0.05
+        viz_keypoints_gt_color = (1.0, 0.0, 0.0)
+        viz_keypoints_policy_color = (0.0, 1.0, 0.0)
+
     class terrain:
         mesh_type = 'trimesh' # "heightfield" # none, plane, heightfield or trimesh
         hf2mesh_method = "grid"  # grid or fast
