@@ -8,6 +8,15 @@ CUDA_VISIBLE_DEVICES=4 python legged_gym/legged_gym/scripts/train.py \
     --device cuda:0 \
     --num_envs 4096 --max_iterations 30000 \
     --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml
+
+# 续训
+
+CUDA_VISIBLE_DEVICES=5 python legged_gym/legged_gym/scripts/train.py \
+    --task g1_priv_mimic --proj_name g1_priv_mimic --exptid 0106_teacher \
+    --resumeid 0106_teacher --checkpoint 27500 \
+    --device cuda:0 \
+    --num_envs 4096 --max_iterations 80000 \
+    --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml
 ```
 
 防抖续训
@@ -30,7 +39,7 @@ CUDA_VISIBLE_DEVICES=4 python legged_gym/legged_gym/scripts/train.py \
 ```bash
 cd legged_gym/legged_gym/scripts
 python play.py \
-  --task g1_priv_mimic --proj_name g1_priv_mimic --exptid 0106_teacher_smooth_strict \
+  --task g1_priv_mimic --proj_name g1_priv_mimic --exptid 0106_teacher \
   --device cuda:2 --num_envs 1 \
   --headless --record_video \
   --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml \
