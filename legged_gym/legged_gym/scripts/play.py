@@ -39,7 +39,7 @@ from termcolor import cprint
 import random
 import re
 import math
-from isaacgym.torch_utils import quat_rotate_inverse
+from isaacgym.torch_utils import quat_rotate, quat_rotate_inverse
 from legged_gym.envs.base.legged_robot import euler_from_quaternion
 
 def get_load_path(root, load_run=-1, checkpoint=-1, model_name_include="jit"):
@@ -99,6 +99,7 @@ def play(args):
     # When recording, visualize GT vs policy keypoints as colored spheres in the same frame.
     if args.record_video:
         env_cfg.env.viz_keypoints = True
+        env_cfg.env.viz_keypoints_gt_local = True
 
     # Recording usually wants a single env unless the user explicitly overrides it.
     if args.record_video and args.num_envs is None:
@@ -267,8 +268,11 @@ def play(args):
         # Colors are stored as RGB tuples in config.
         gt_rgb = tuple(getattr(env.cfg.env, "viz_keypoints_gt_color", (1.0, 0.0, 0.0)))
         pol_rgb = tuple(getattr(env.cfg.env, "viz_keypoints_policy_color", (0.0, 1.0, 0.0)))
+        gt_local_rgb = tuple(getattr(env.cfg.env, "viz_keypoints_gt_local_color", (0.0, 0.0, 1.0)))
+        draw_gt_local = bool(getattr(env.cfg.env, "viz_keypoints_gt_local", False))
         gt_bgr = (int(255 * gt_rgb[2]), int(255 * gt_rgb[1]), int(255 * gt_rgb[0]))
         pol_bgr = (int(255 * pol_rgb[2]), int(255 * pol_rgb[1]), int(255 * pol_rgb[0]))
+        gt_local_bgr = (int(255 * gt_local_rgb[2]), int(255 * gt_local_rgb[1]), int(255 * gt_local_rgb[0]))
         world_radius = float(getattr(env.cfg.env, "viz_keypoints_radius", 0.05))
 
         try:
@@ -276,11 +280,35 @@ def play(args):
         except Exception:
             return frame
         gt_pts = None
+        gt_local_pts = None
         if hasattr(env, "_ref_body_pos"):
             try:
                 gt_pts = env._ref_body_pos[env_i, key_body_ids, :3].detach().cpu().numpy().astype(np.float32)
             except Exception:
                 gt_pts = None
+        if draw_gt_local and hasattr(env, "_ref_body_pos") and hasattr(env, "_ref_root_pos") and hasattr(env, "_ref_root_rot"):
+            try:
+                ref_body_pos = env._ref_body_pos[env_i, key_body_ids, :3]
+                ref_root_pos = env._ref_root_pos[env_i, :3]
+                ref_root_rot_src = env._ref_root_rot[env_i]
+                if ref_root_rot_src.shape[-1] == 4:
+                    ref_root_rot = ref_root_rot_src
+                elif ref_root_rot_src.shape[-1] >= 7:
+                    ref_root_rot = ref_root_rot_src[3:7]
+                else:
+                    raise ValueError(f"Unexpected _ref_root_rot shape: {tuple(ref_root_rot_src.shape)}")
+
+                cur_root_pos = env.root_states[env_i, 0:3]
+                cur_root_rot = env.root_states[env_i, 3:7]
+
+                delta = ref_body_pos - ref_root_pos.unsqueeze(0)
+                ref_root_rot_expand = ref_root_rot.unsqueeze(0).expand(delta.shape[0], 4)
+                cur_root_rot_expand = cur_root_rot.unsqueeze(0).expand(delta.shape[0], 4)
+                local = quat_rotate_inverse(ref_root_rot_expand, delta)
+                gt_local_world = quat_rotate(cur_root_rot_expand, local) + cur_root_pos.unsqueeze(0)
+                gt_local_pts = gt_local_world.detach().cpu().numpy().astype(np.float32)
+            except Exception:
+                gt_local_pts = None
 
         h, w = frame.shape[:2]
 
@@ -341,6 +369,16 @@ def play(args):
                     rad = int(r_gt[k]) if r_gt is not None else 6
                     # Draw GT as a ring to keep it visible when overlapping policy dots.
                     cv2.circle(bgr, (int(u_gt[k]), int(v_gt[k])), rad, gt_bgr, 2, lineType=cv2.LINE_AA)
+
+        if gt_local_pts is not None:
+            cam_l, u_l, v_l, in_l = _project(gt_local_pts)
+            r_l = _pixel_radii(cam_l) if cam_l is not None else None
+            if u_l is not None:
+                for k in range(u_l.shape[0]):
+                    if not bool(in_l[k]):
+                        continue
+                    rad = int(r_l[k]) if r_l is not None else 6
+                    cv2.circle(bgr, (int(u_l[k]), int(v_l[k])), rad, gt_local_bgr, -1, lineType=cv2.LINE_AA)
 
         rgb = bgr[..., ::-1]
         return rgb

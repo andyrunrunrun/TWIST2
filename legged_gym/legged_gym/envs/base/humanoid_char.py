@@ -496,6 +496,25 @@ class HumanoidChar(LeggedRobot):
             for i in range(ref_key_body_pos.shape[1]):
                 pose = gymapi.Transform(gymapi.Vec3(ref_key_body_pos_global[id, i, 0], ref_key_body_pos_global[id, i, 1], ref_key_body_pos_global[id, i, 2]), r=None)
                 gymutil.draw_lines(geom, self.gym, self.viewer, self.envs[id], pose)
+
+        if bool(getattr(self.cfg.env, "viz_keypoints_gt_local", False)):
+            geom_local = gymutil.WireframeSphereGeometry(sphere_size, 32, 32, None, color=(0, 0, 1))
+            ref_key_body_pos_local_global = convert_to_global_root_body_pos(
+                root_pos=self.root_states[:, 0:3],
+                root_rot=self.root_states[:, 3:7],
+                body_pos=ref_key_body_pos_local,
+            )
+            for id in range(self.num_envs):
+                for i in range(ref_key_body_pos_local_global.shape[1]):
+                    pose = gymapi.Transform(
+                        gymapi.Vec3(
+                            ref_key_body_pos_local_global[id, i, 0],
+                            ref_key_body_pos_local_global[id, i, 1],
+                            ref_key_body_pos_local_global[id, i, 2],
+                        ),
+                        r=None,
+                    )
+                    gymutil.draw_lines(geom_local, self.gym, self.viewer, self.envs[id], pose)
         
         # # draw local upper key bodies
         # geom = gymutil.WireframeSphereGeometry(0.04, 32, 32, None, color=(0, 0, 1))
