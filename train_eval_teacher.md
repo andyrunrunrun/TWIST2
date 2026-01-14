@@ -17,6 +17,17 @@ CUDA_VISIBLE_DEVICES=5 python legged_gym/legged_gym/scripts/train.py \
     --device cuda:0 \
     --num_envs 4096 --max_iterations 80000 \
     --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml
+
+
+# 加上delta_local
+
+CUDA_VISIBLE_DEVICES=4 python legged_gym/legged_gym/scripts/train.py \
+    --task g1_priv_mimic --proj_name g1_priv_mimic --exptid 0106_teacher_deltalocal \
+    --resumeid 0106_teacher --checkpoint 77500 \
+    --rewards.scales.tracking_root_pose_delta_local 1.5 \
+    --device cuda:0 \
+    --num_envs 4096 --max_iterations 50000 \
+    --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml
 ```
 
 防抖续训
