@@ -8,8 +8,8 @@ per-frame mimic targets, and writes per-motion metrics to a CSV.
 This is inspired by HY-Humanoid/evaluation/exec_vs_gmr but adapted to TWIST2's training motion YAMLs.
 
 CUDA_VISIBLE_DEVICES=1 python tools/mujoco_exec_eval.py --motion_yaml legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml \
-    --out_csv /tmp/twist2_exec_metrics.csv --policy_path assets/ckpts/twist2_1017_20k.onnx \
-    --xml_path assets/g1/g1_sim2sim_29dof.xml --disable_termination --body_set joint_bodies29
+    --out_csv ./outputs/twist2_exec_metrics.csv --policy_path assets/ckpts/twist2_1017_20k.onnx \
+    --xml_path assets/g1/g1_sim2sim_29dof.xml --disable_termination --body_set joint_bodies29  --workers 16
 
 """
 
@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
 import numpy as np
+import multiprocessing as mp
 
 try:
     import yaml
@@ -1059,6 +1060,7 @@ class Twist2SimRunner:
         pitch = np.empty((T,), dtype=np.float32)
 
         terminated = False
+        fail_detected = False
         fail_reason = ""
         fail_step = -1
 
@@ -1094,20 +1096,26 @@ class Twist2SimRunner:
 
             if not np.all(np.isfinite(qpos[t + 1])) or not np.all(np.isfinite(qvel[t + 1])) or not np.all(np.isfinite(torque[t + 1])):
                 terminated = True
+                fail_detected = True
                 fail_reason = "nan_or_inf"
                 fail_step = t + 1
                 break
 
-            if not bool(disable_termination):
-                if pelvis_z[t + 1] < z_min:
-                    terminated = True
-                    fail_reason = "fell_pelvis_z"
+            # Detect failure conditions. If disable_termination=True, do not stop the rollout;
+            # only record the first failure time/reason.
+            reason = ""
+            if pelvis_z[t + 1] < z_min:
+                reason = "fell_pelvis_z"
+            elif abs(roll[t + 1]) > angle_max or abs(pitch[t + 1]) > angle_max:
+                reason = "fell_angle"
+
+            if reason:
+                if not fail_detected:
+                    fail_detected = True
+                    fail_reason = reason
                     fail_step = t + 1
-                    break
-                if abs(roll[t + 1]) > angle_max or abs(pitch[t + 1]) > angle_max:
+                if not bool(disable_termination):
                     terminated = True
-                    fail_reason = "fell_angle"
-                    fail_step = t + 1
                     break
 
         if terminated and fail_step >= 0:
@@ -1125,6 +1133,7 @@ class Twist2SimRunner:
             "torque": torque,
             "mimic_target": mimic_target,
             "terminated": bool(terminated),
+            "fail_detected": bool(fail_detected),
             "fail_reason": str(fail_reason),
             "fail_step": int(fail_step),
             "pelvis_z": pelvis_z,
@@ -1207,8 +1216,10 @@ class EvalResult:
     T_mimic_full: int
     T_exec: int
     terminated: bool
+    fail_detected: bool
     fail_reason: str
     fail_step: int
+    fail_time_s: float
     crop_start_full: int
     crop_end_full: int
     crop_start_used: int
@@ -1216,6 +1227,7 @@ class EvalResult:
     core_expected_len: int
     core_used_len: int
     core_coverage: float
+    core_progress_to_fail: float
     root_pos_mean_l2_m: float
     root_pos_mean_l1_m: float
     root_rot_mean_deg: float
@@ -1235,8 +1247,10 @@ class EvalResult:
             "T_mimic_full": int(self.T_mimic_full),
             "T_exec": int(self.T_exec),
             "terminated": bool(self.terminated),
+            "fail_detected": bool(self.fail_detected),
             "fail_reason": str(self.fail_reason),
             "fail_step": int(self.fail_step),
+            "fail_time_s": float(self.fail_time_s),
             "crop_start_full": int(self.crop_start_full),
             "crop_end_full": int(self.crop_end_full),
             "crop_start_used": int(self.crop_start_used),
@@ -1244,6 +1258,7 @@ class EvalResult:
             "core_expected_len": int(self.core_expected_len),
             "core_used_len": int(self.core_used_len),
             "core_coverage": float(self.core_coverage),
+            "core_progress_to_fail": float(self.core_progress_to_fail),
             "root_pos_mean_l2_m": float(self.root_pos_mean_l2_m),
             "root_pos_mean_l1_m": float(self.root_pos_mean_l1_m),
             "root_rot_mean_deg": float(self.root_rot_mean_deg),
@@ -1345,6 +1360,7 @@ class MotionEvaluator:
             qpos_exec = np.asarray(sim_out["qpos"], dtype=np.float32)
             qvel_exec = np.asarray(sim_out["qvel"], dtype=np.float32)
             terminated = bool(sim_out.get("terminated", False))
+            fail_detected = bool(sim_out.get("fail_detected", False))
             fail_reason = str(sim_out.get("fail_reason", ""))
             fail_step = int(sim_out.get("fail_step", -1))
 
@@ -1365,6 +1381,20 @@ class MotionEvaluator:
             core_used_len = int(max(0, end_used - start_used))
             core_coverage = float(core_used_len / core_expected_len) if core_expected_len > 0 else float("nan")
 
+            if fail_step >= 0:
+                fail_time_s = float(fail_step / publish_hz)
+            else:
+                fail_time_s = float("nan")
+
+            if core_expected_len > 0:
+                if fail_step < 0:
+                    core_progress_to_fail = 1.0
+                else:
+                    clamped = int(min(max(fail_step, start_full), end_full))
+                    core_progress_to_fail = float((clamped - start_full) / core_expected_len)
+            else:
+                core_progress_to_fail = float("nan")
+
             if core_used_len < 2:
                 return EvalResult(
                     status="too_short",
@@ -1376,8 +1406,10 @@ class MotionEvaluator:
                     T_mimic_full=int(T_full),
                     T_exec=int(T_exec),
                     terminated=bool(terminated),
+                    fail_detected=bool(fail_detected),
                     fail_reason=str(fail_reason),
                     fail_step=int(fail_step),
+                    fail_time_s=float(fail_time_s),
                     crop_start_full=int(start_full),
                     crop_end_full=int(end_full),
                     crop_start_used=int(start_used),
@@ -1385,6 +1417,7 @@ class MotionEvaluator:
                     core_expected_len=int(core_expected_len),
                     core_used_len=int(core_used_len),
                     core_coverage=float(core_coverage),
+                    core_progress_to_fail=float(core_progress_to_fail),
                     root_pos_mean_l2_m=float("nan"),
                     root_pos_mean_l1_m=float("nan"),
                     root_rot_mean_deg=float("nan"),
@@ -1434,8 +1467,10 @@ class MotionEvaluator:
                 T_mimic_full=int(T_full),
                 T_exec=int(T_exec),
                 terminated=bool(terminated),
+                fail_detected=bool(fail_detected),
                 fail_reason=str(fail_reason),
                 fail_step=int(fail_step),
+                fail_time_s=float(fail_time_s),
                 crop_start_full=int(start_full),
                 crop_end_full=int(end_full),
                 crop_start_used=int(start_used),
@@ -1443,6 +1478,7 @@ class MotionEvaluator:
                 core_expected_len=int(core_expected_len),
                 core_used_len=int(core_used_len),
                 core_coverage=float(core_coverage),
+                core_progress_to_fail=float(core_progress_to_fail),
                 root_pos_mean_l2_m=float(root_pos_mean_l2_m),
                 root_pos_mean_l1_m=float(root_pos_mean_l1_m),
                 root_rot_mean_deg=float(root_rot_mean_deg),
@@ -1462,8 +1498,10 @@ class MotionEvaluator:
                 T_mimic_full=int(T_full),
                 T_exec=0,
                 terminated=False,
+                fail_detected=False,
                 fail_reason="",
                 fail_step=-1,
+                fail_time_s=float("nan"),
                 crop_start_full=int(start_full),
                 crop_end_full=int(end_full),
                 crop_start_used=0,
@@ -1471,6 +1509,7 @@ class MotionEvaluator:
                 core_expected_len=int(core_expected_len),
                 core_used_len=0,
                 core_coverage=0.0,
+                core_progress_to_fail=float("nan"),
                 root_pos_mean_l2_m=float("nan"),
                 root_pos_mean_l1_m=float("nan"),
                 root_rot_mean_deg=float("nan"),
@@ -1479,6 +1518,94 @@ class MotionEvaluator:
                 fk_rel_mean_l2_m=float("nan"),
                 error=f"{type(e).__name__}: {e}",
             )
+
+
+_WORKER_SIM: Twist2SimRunner | None = None
+_WORKER_EVAL: MotionEvaluator | None = None
+_WORKER_ARGS: dict[str, Any] | None = None
+
+
+def _worker_init(cfg: dict[str, Any]) -> None:
+    global _WORKER_SIM, _WORKER_EVAL, _WORKER_ARGS
+    _WORKER_ARGS = cfg
+    _WORKER_SIM = Twist2SimRunner(
+        Twist2SimConfig(
+            xml_path=Path(cfg["xml_path"]).expanduser().resolve(),
+            policy_path=Path(cfg["policy_path"]).expanduser().resolve(),
+            device=str(cfg["device"]),
+            policy_frequency=float(cfg["policy_frequency"]),
+            sim_dt=float(cfg["sim_dt"]),
+            smooth_body=float(cfg["smooth_body"]),
+        )
+    )
+    _WORKER_EVAL = MotionEvaluator(sim=_WORKER_SIM, xml_path=Path(cfg["xml_path"]), body_set=str(cfg["body_set"]))
+
+
+def _worker_eval_entry(entry: MotionEntry) -> dict[str, Any]:
+    if _WORKER_EVAL is None or _WORKER_ARGS is None:
+        raise RuntimeError("Worker not initialized")
+    cfg = _WORKER_ARGS
+
+    try:
+        motion = load_motion_pkl_or_npz(Path(entry.file_abs), quat_order=str(cfg["quat_order"]))
+        mimic = _WORKER_EVAL.prepare_mimic_target_from_motion(
+            motion,
+            future_step=int(cfg["future_step"]),
+            idle_s=float(cfg["idle_s"]),
+            tail_s=float(cfg["tail_s"]),
+            transition_s=float(cfg["transition_s"]),
+            loop=bool(cfg["loop"]),
+        )
+        res = _WORKER_EVAL.run_and_eval(
+            mimic,
+            motion_relpath=str(entry.file_rel),
+            motion_idx=int(entry.idx),
+            fps_src=float(motion.fps),
+            T_src=int(motion.root_pos.shape[0]),
+            future_step=int(cfg["future_step"]),
+            idle_s=float(cfg["idle_s"]),
+            tail_s=float(cfg["tail_s"]),
+            transition_s=float(cfg["transition_s"]),
+            loop=bool(cfg["loop"]),
+            sim_seed=int(cfg["sim_seed"]),
+            z_min=float(cfg["z_min"]),
+            angle_max_deg=float(cfg["angle_max_deg"]),
+            disable_termination=bool(cfg["disable_termination"]),
+            fk_stride=int(cfg["fk_stride"]),
+        )
+    except Exception as e:
+        res = EvalResult(
+            status="error",
+            motion_relpath=str(entry.file_rel),
+            motion_idx=int(entry.idx),
+            fps_src=float("nan"),
+            T_src=-1,
+            policy_hz=float(cfg["policy_frequency"]),
+            T_mimic_full=0,
+            T_exec=0,
+            terminated=False,
+            fail_detected=False,
+            fail_reason="",
+            fail_step=-1,
+            fail_time_s=float("nan"),
+            crop_start_full=0,
+            crop_end_full=0,
+            crop_start_used=0,
+            crop_end_used=0,
+            core_expected_len=0,
+            core_used_len=0,
+            core_coverage=0.0,
+            core_progress_to_fail=float("nan"),
+            root_pos_mean_l2_m=float("nan"),
+            root_pos_mean_l1_m=float("nan"),
+            root_rot_mean_deg=float("nan"),
+            joint_dof_mean_l1=float("nan"),
+            joint_vel_mean_l1=float("nan"),
+            fk_rel_mean_l2_m=float("nan"),
+            error=f"{type(e).__name__}: {e}",
+        )
+
+    return res.to_flat_dict()
 
 
 def main() -> None:
@@ -1492,6 +1619,14 @@ def main() -> None:
     ap.add_argument("--device", type=str, default="cpu", help="cpu | cuda | cuda:<id>")
     ap.add_argument("--policy_frequency", type=float, default=100.0, choices=[50.0, 100.0])
     ap.add_argument("--smooth_body", type=float, default=0.0)
+    ap.add_argument("--workers", type=int, default=1, help="Number of worker processes for CPU evaluation")
+    ap.add_argument(
+        "--mp_start_method",
+        type=str,
+        default="spawn",
+        choices=["spawn", "fork", "forkserver"],
+        help="multiprocessing start method; 'spawn' is safest with MuJoCo/onnxruntime",
+    )
 
     ap.add_argument("--quat_order", type=str, default="auto", choices=["auto", "xyzw", "wxyz"], help="Quaternion order in motion files (root_rot)")
     ap.add_argument("--motion_ids", type=str, default="", help="Subset of YAML motions by indices (e.g. '0,3,10-20')")
@@ -1510,7 +1645,11 @@ def main() -> None:
     ap.add_argument("--sim_seed", type=int, default=0)
     ap.add_argument("--z_min", type=float, default=0.55)
     ap.add_argument("--angle_max_deg", type=float, default=60.0)
-    ap.add_argument("--disable_termination", action="store_true", help="Disable early termination checks (pelvis_z/angle); still stops on NaN/Inf.")
+    ap.add_argument(
+        "--disable_termination",
+        action="store_true",
+        help="Disable early termination on pelvis_z/angle (still records first failure time); always stops on NaN/Inf.",
+    )
 
     ap.add_argument("--body_set", type=str, default="joint_bodies29", choices=["keypoints14", "joint_bodies29"])
     ap.add_argument("--fk_stride", type=int, default=1)
@@ -1525,18 +1664,6 @@ def main() -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if bool(args.append) else "w"
 
-    sim = Twist2SimRunner(
-        Twist2SimConfig(
-            xml_path=Path(args.xml_path).expanduser().resolve(),
-            policy_path=Path(args.policy_path).expanduser().resolve(),
-            device=str(args.device),
-            policy_frequency=float(args.policy_frequency),
-            sim_dt=0.001,
-            smooth_body=float(args.smooth_body),
-        )
-    )
-    evaluator = MotionEvaluator(sim=sim, xml_path=Path(args.xml_path), body_set=str(args.body_set))
-
     fieldnames = [
         "motion_idx",
         "motion_relpath",
@@ -1547,11 +1674,14 @@ def main() -> None:
         "T_mimic_full",
         "T_exec",
         "terminated",
+        "fail_detected",
         "fail_reason",
         "fail_step",
+        "fail_time_s",
         "core_expected_len",
         "core_used_len",
         "core_coverage",
+        "core_progress_to_fail",
         "root_pos_mean_l2_m",
         "root_pos_mean_l1_m",
         "root_rot_mean_deg",
@@ -1571,82 +1701,141 @@ def main() -> None:
         n_ok = 0
         n_err = 0
 
-        for entry in iter_motion_config_files(
-            args.motion_yaml,
-            motion_ids=str(args.motion_ids),
-            max_motions=int(args.max_motions),
-            shuffle=bool(args.shuffle),
-            shuffle_seed=int(args.shuffle_seed),
-            shard_idx=int(args.shard_idx),
-            num_shards=int(args.num_shards),
-        ):
-            n_total += 1
-            try:
-                motion = load_motion_pkl_or_npz(entry.file_abs, quat_order=str(args.quat_order))
-                mimic = evaluator.prepare_mimic_target_from_motion(
-                    motion,
-                    future_step=int(args.future_step),
-                    idle_s=float(args.idle_s),
-                    tail_s=float(args.tail_s),
-                    transition_s=float(args.transition_s),
-                    loop=bool(args.loop),
-                )
-                res = evaluator.run_and_eval(
-                    mimic,
-                    motion_relpath=str(entry.file_rel),
-                    motion_idx=int(entry.idx),
-                    fps_src=float(motion.fps),
-                    T_src=int(motion.root_pos.shape[0]),
-                    future_step=int(args.future_step),
-                    idle_s=float(args.idle_s),
-                    tail_s=float(args.tail_s),
-                    transition_s=float(args.transition_s),
-                    loop=bool(args.loop),
-                    sim_seed=int(args.sim_seed),
-                    z_min=float(args.z_min),
-                    angle_max_deg=float(args.angle_max_deg),
-                    disable_termination=bool(args.disable_termination),
-                    fk_stride=int(args.fk_stride),
-                )
-            except Exception as e:
-                res = EvalResult(
-                    status="error",
-                    motion_relpath=str(entry.file_rel),
-                    motion_idx=int(entry.idx),
-                    fps_src=float("nan"),
-                    T_src=-1,
-                    policy_hz=float(args.policy_frequency),
-                    T_mimic_full=0,
-                    T_exec=0,
-                    terminated=False,
-                    fail_reason="",
-                    fail_step=-1,
-                    crop_start_full=0,
-                    crop_end_full=0,
-                    crop_start_used=0,
-                    crop_end_used=0,
-                    core_expected_len=0,
-                    core_used_len=0,
-                    core_coverage=0.0,
-                    root_pos_mean_l2_m=float("nan"),
-                    root_pos_mean_l1_m=float("nan"),
-                    root_rot_mean_deg=float("nan"),
-                    joint_dof_mean_l1=float("nan"),
-                    joint_vel_mean_l1=float("nan"),
-                    fk_rel_mean_l2_m=float("nan"),
-                    error=f"{type(e).__name__}: {e}",
-                )
+        entries = list(
+            iter_motion_config_files(
+                args.motion_yaml,
+                motion_ids=str(args.motion_ids),
+                max_motions=int(args.max_motions),
+                shuffle=bool(args.shuffle),
+                shuffle_seed=int(args.shuffle_seed),
+                shard_idx=int(args.shard_idx),
+                num_shards=int(args.num_shards),
+            )
+        )
 
-            row = {k: res.to_flat_dict().get(k) for k in fieldnames}
-            w.writerow(row)
+        workers = int(args.workers)
+        if workers < 1:
+            raise ValueError(f"--workers must be >= 1, got {workers}")
+        if str(args.device).startswith("cuda") and workers > 1:
+            print("[warn] --device is cuda*; forcing --workers=1 to avoid multi-process GPU contention.", file=sys.stderr)
+            workers = 1
 
-            if res.status == "ok":
-                n_ok += 1
-            else:
-                n_err += 1
+        worker_cfg: dict[str, Any] = {
+            "xml_path": str(Path(args.xml_path).expanduser().resolve()),
+            "policy_path": str(Path(args.policy_path).expanduser().resolve()),
+            "device": str(args.device),
+            "policy_frequency": float(args.policy_frequency),
+            "sim_dt": 0.001,
+            "smooth_body": float(args.smooth_body),
+            "body_set": str(args.body_set),
+            "quat_order": str(args.quat_order),
+            "future_step": int(args.future_step),
+            "idle_s": float(args.idle_s),
+            "tail_s": float(args.tail_s),
+            "transition_s": float(args.transition_s),
+            "loop": bool(args.loop),
+            "sim_seed": int(args.sim_seed),
+            "z_min": float(args.z_min),
+            "angle_max_deg": float(args.angle_max_deg),
+            "disable_termination": bool(args.disable_termination),
+            "fk_stride": int(args.fk_stride),
+        }
 
-            if (n_total % 20) == 0:
-                print(f"[{_now()}] processed={n_total} ok={n_ok} err={n_err}", flush=True)
+        if workers == 1:
+            sim = Twist2SimRunner(
+                Twist2SimConfig(
+                    xml_path=Path(args.xml_path).expanduser().resolve(),
+                    policy_path=Path(args.policy_path).expanduser().resolve(),
+                    device=str(args.device),
+                    policy_frequency=float(args.policy_frequency),
+                    sim_dt=0.001,
+                    smooth_body=float(args.smooth_body),
+                )
+            )
+            evaluator = MotionEvaluator(sim=sim, xml_path=Path(args.xml_path), body_set=str(args.body_set))
+            for entry in entries:
+                n_total += 1
+                try:
+                    motion = load_motion_pkl_or_npz(entry.file_abs, quat_order=str(args.quat_order))
+                    mimic = evaluator.prepare_mimic_target_from_motion(
+                        motion,
+                        future_step=int(args.future_step),
+                        idle_s=float(args.idle_s),
+                        tail_s=float(args.tail_s),
+                        transition_s=float(args.transition_s),
+                        loop=bool(args.loop),
+                    )
+                    res = evaluator.run_and_eval(
+                        mimic,
+                        motion_relpath=str(entry.file_rel),
+                        motion_idx=int(entry.idx),
+                        fps_src=float(motion.fps),
+                        T_src=int(motion.root_pos.shape[0]),
+                        future_step=int(args.future_step),
+                        idle_s=float(args.idle_s),
+                        tail_s=float(args.tail_s),
+                        transition_s=float(args.transition_s),
+                        loop=bool(args.loop),
+                        sim_seed=int(args.sim_seed),
+                        z_min=float(args.z_min),
+                        angle_max_deg=float(args.angle_max_deg),
+                        disable_termination=bool(args.disable_termination),
+                        fk_stride=int(args.fk_stride),
+                    )
+                except Exception as e:
+                    res = EvalResult(
+                        status="error",
+                        motion_relpath=str(entry.file_rel),
+                        motion_idx=int(entry.idx),
+                        fps_src=float("nan"),
+                        T_src=-1,
+                        policy_hz=float(args.policy_frequency),
+                        T_mimic_full=0,
+                        T_exec=0,
+                        terminated=False,
+                        fail_detected=False,
+                        fail_reason="",
+                        fail_step=-1,
+                        fail_time_s=float("nan"),
+                        crop_start_full=0,
+                        crop_end_full=0,
+                        crop_start_used=0,
+                        crop_end_used=0,
+                        core_expected_len=0,
+                        core_used_len=0,
+                        core_coverage=0.0,
+                        core_progress_to_fail=float("nan"),
+                        root_pos_mean_l2_m=float("nan"),
+                        root_pos_mean_l1_m=float("nan"),
+                        root_rot_mean_deg=float("nan"),
+                        joint_dof_mean_l1=float("nan"),
+                        joint_vel_mean_l1=float("nan"),
+                        fk_rel_mean_l2_m=float("nan"),
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                row = {k: res.to_flat_dict().get(k) for k in fieldnames}
+                w.writerow(row)
+
+                if res.status == "ok":
+                    n_ok += 1
+                else:
+                    n_err += 1
+
+                if (n_total % 20) == 0:
+                    print(f"[{_now()}] processed={n_total} ok={n_ok} err={n_err}", flush=True)
+        else:
+            ctx = mp.get_context(str(args.mp_start_method))
+            with ctx.Pool(processes=workers, initializer=_worker_init, initargs=(worker_cfg,)) as pool:
+                for row_dict in pool.imap_unordered(_worker_eval_entry, entries, chunksize=1):
+                    n_total += 1
+                    status = str(row_dict.get("status", "error"))
+                    if status == "ok":
+                        n_ok += 1
+                    else:
+                        n_err += 1
+                    w.writerow({k: row_dict.get(k) for k in fieldnames})
+                    if (n_total % 20) == 0:
+                        print(f"[{_now()}] processed={n_total} ok={n_ok} err={n_err}", flush=True)
 
     print(f"[done] out_csv={out_csv} processed={n_total} ok={n_ok} err={n_err}")
 
