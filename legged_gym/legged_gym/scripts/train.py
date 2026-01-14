@@ -46,6 +46,11 @@ def train(args):
         os.makedirs(log_pth)
     except:
         pass
+
+    # Make wandb local logs independent of the current working directory (CWD).
+    # This keeps logs consistent whether you launch from the TWIST2 root or from within `legged_gym/`.
+    wandb_dir = os.path.join(LEGGED_GYM_ROOT_DIR, "logs")
+    os.makedirs(wandb_dir, exist_ok=True)
     
     if args.debug:
         mode = "disabled"
@@ -63,9 +68,9 @@ def train(args):
     robot_type = args.task.split("_")[0]
     
     try:
-        wandb.init(entity="far-wandb", project="twist", name=args.exptid, mode=mode, dir="../../logs")
+        wandb.init(entity="far-wandb", project="twist", name=args.exptid, mode=mode, dir=wandb_dir)
     except:
-        wandb.init(project="g1_mimic", name=args.exptid, mode=mode, dir="../../logs")
+        wandb.init(project="g1_mimic", name=args.exptid, mode=mode, dir=wandb_dir)
     # wandb.save(LEGGED_GYM_ENVS_DIR + "/base/legged_robot_config.py", policy="now")
     # wandb.save(LEGGED_GYM_ENVS_DIR + "/base/legged_robot.py", policy="now")
     # wandb.save(LEGGED_GYM_ENVS_DIR + "/base/humanoid_config.py", policy="now")
