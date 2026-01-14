@@ -210,6 +210,8 @@ class G1MimicPrivCfg(HumanoidMimicCfg):
             # tracking_joint_dof = 0.6
             tracking_joint_dof = 2.0
             tracking_joint_vel = 0.2
+            # delta-local root translation (enable via CLI override)
+            tracking_root_pose_delta_local = 0.0
             # tracking_root_translation_xy = 1.0
             tracking_root_translation_z = 1.0
             tracking_root_rotation = 1.0
