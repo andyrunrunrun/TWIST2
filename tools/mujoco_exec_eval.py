@@ -7,10 +7,13 @@ per-frame mimic targets, and writes per-motion metrics to a CSV.
 
 This is inspired by HY-Humanoid/evaluation/exec_vs_gmr but adapted to TWIST2's training motion YAMLs.
 
-CUDA_VISIBLE_DEVICES=1 python tools/mujoco_exec_eval.py --motion_yaml legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml \
+python tools/mujoco_exec_eval.py --motion_yaml legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml \
     --out_csv ./outputs/twist2_exec_metrics.csv --policy_path assets/ckpts/twist2_1017_20k.onnx \
     --xml_path assets/g1/g1_sim2sim_29dof.xml --disable_termination --body_set joint_bodies29  --workers 16
 
+python tools/mujoco_exec_eval.py --motion_yaml legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml \
+    --out_csv ./outputs/twist2_exec_metrics_teacher_deltalocal.csv --policy_path legged_gym/logs/g1_priv_mimic/0106_teacher_deltalocal/model_85000.pt \
+    --xml_path assets/g1/g1_sim2sim_29dof.xml --disable_termination --body_set joint_bodies29  --workers 128
 """
 
 from __future__ import annotations
@@ -57,6 +60,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _POSE_ROOT = _REPO_ROOT / "pose"
 if _POSE_ROOT.exists() and str(_POSE_ROOT) not in sys.path:
     sys.path.insert(0, str(_POSE_ROOT))
+_RSL_RL_ROOT = _REPO_ROOT / "rsl_rl"
+if _RSL_RL_ROOT.exists() and str(_RSL_RL_ROOT) not in sys.path:
+    # Needed for unpickling `.pt` checkpoints that reference `rsl_rl.*`.
+    sys.path.insert(0, str(_RSL_RL_ROOT))
+_LEGGED_GYM_ROOT = _REPO_ROOT / "legged_gym"
+if _LEGGED_GYM_ROOT.exists() and str(_LEGGED_GYM_ROOT) not in sys.path:
+    sys.path.insert(0, str(_LEGGED_GYM_ROOT))
 
 from pose.utils.torch_utils import euler_from_quaternion as _euler_from_quat_xyzw
 from pose.utils.torch_utils import quat_to_exp_map as _quat_to_exp_map_xyzw
@@ -391,6 +401,8 @@ class Motion:
     root_pos: np.ndarray  # (T,3)
     root_rot_xyzw: np.ndarray  # (T,4)
     dof_pos: np.ndarray  # (T,29)
+    link_body_list: tuple[str, ...] | None = None
+    local_body_pos: np.ndarray | None = None  # (T,B,3)
 
 
 def load_motion_pkl_or_npz(path: str | Path, *, quat_order: str = "auto") -> Motion:
@@ -417,6 +429,15 @@ def load_motion_pkl_or_npz(path: str | Path, *, quat_order: str = "auto") -> Mot
     root_pos = np.asarray(obj["root_pos"], dtype=np.float32)
     root_rot = np.asarray(obj["root_rot"], dtype=np.float32)
     dof_pos = np.asarray(obj["dof_pos"], dtype=np.float32)
+    link_body_list: tuple[str, ...] | None = None
+    local_body_pos: np.ndarray | None = None
+    if "link_body_list" in obj and "local_body_pos" in obj:
+        try:
+            link_body_list = tuple(str(x) for x in obj["link_body_list"])
+            local_body_pos = np.asarray(obj["local_body_pos"], dtype=np.float32)
+        except Exception:
+            link_body_list = None
+            local_body_pos = None
 
     if root_pos.ndim != 2 or root_pos.shape[1] != 3:
         raise ValueError(f"root_pos must be (T,3), got {root_pos.shape} in {path}")
@@ -439,7 +460,14 @@ def load_motion_pkl_or_npz(path: str | Path, *, quat_order: str = "auto") -> Mot
     else:
         root_rot_xyzw = root_rot
 
-    return Motion(fps=float(fps), root_pos=root_pos, root_rot_xyzw=root_rot_xyzw, dof_pos=dof_pos)
+    return Motion(
+        fps=float(fps),
+        root_pos=root_pos,
+        root_rot_xyzw=root_rot_xyzw,
+        dof_pos=dof_pos,
+        link_body_list=link_body_list,
+        local_body_pos=local_body_pos,
+    )
 
 
 def _resample_xyzw_sequence(
@@ -663,13 +691,339 @@ class OnnxPolicy:
         self.session = ort.InferenceSession(str(policy_path), providers=providers)
         self.input_name = self.session.get_inputs()[0].name
         self.output_index = 0
+        self.expected_obs_dim: int | None = None
+        try:
+            shape = self.session.get_inputs()[0].shape
+            if isinstance(shape, (list, tuple)) and len(shape) >= 2 and isinstance(shape[1], int):
+                self.expected_obs_dim = int(shape[1])
+        except Exception:
+            self.expected_obs_dim = None
 
     def __call__(self, obs: np.ndarray) -> np.ndarray:
         obs = np.asarray(obs, dtype=np.float32)
         if obs.ndim == 1:
             obs = obs[None, :]
+        if self.expected_obs_dim is not None and int(obs.shape[1]) != int(self.expected_obs_dim):
+            raise ValueError(f"ONNX policy expected obs_dim={self.expected_obs_dim}, got {obs.shape}")
         out = self.session.run(None, {self.input_name: obs})[self.output_index]
         return np.asarray(out, dtype=np.float32)
+
+
+def _infer_actor_critic_mimic_init(sd: dict[str, Any]) -> dict[str, Any]:
+    """Infer ActorCriticMimic constructor args from a saved state_dict."""
+    if torch is None:
+        raise RuntimeError("torch is required for .pt policies")
+    if "std" not in sd:
+        raise ValueError("Not an RSL-RL actor_critic checkpoint (missing 'std')")
+
+    std = sd["std"]
+    num_actions = int(std.numel()) if hasattr(std, "numel") else int(len(std))
+
+    w_me = sd.get("actor.motion_encoder.encoder.0.weight", None)
+    if w_me is None or getattr(w_me, "ndim", 0) != 2:
+        raise ValueError("Unsupported .pt policy (missing actor.motion_encoder.encoder.0.weight)")
+    num_single_motion_obs = int(w_me.shape[1])
+
+    conv0 = sd.get("actor.motion_encoder.conv_layers.0.weight", None)
+    if conv0 is None or getattr(conv0, "ndim", 0) != 3:
+        tsteps = 1
+    else:
+        ks = int(conv0.shape[-1])
+        if ks == 8:
+            tsteps = 50
+        elif ks == 6:
+            tsteps = 20
+        elif ks == 4:
+            tsteps = 10
+        else:
+            tsteps = 1
+
+    w_lat = sd.get("actor.motion_encoder.linear_output.weight", None)
+    if w_lat is None or getattr(w_lat, "ndim", 0) != 2:
+        raise ValueError("Unsupported .pt policy (missing actor.motion_encoder.linear_output.weight)")
+    motion_latent_dim = int(w_lat.shape[0])
+
+    num_motion_observations = int(num_single_motion_obs * tsteps)
+
+    if "actor.actor_backbone.0.weight" not in sd or "critic.0.weight" not in sd:
+        raise ValueError("Unsupported .pt policy (missing actor/critic backbone weights)")
+
+    actor_in = int(sd["actor.actor_backbone.0.weight"].shape[1])
+    num_observations = int(actor_in + num_motion_observations - num_single_motion_obs - motion_latent_dim)
+
+    critic_in = int(sd["critic.0.weight"].shape[1])
+    num_critic_observations = int(critic_in + num_motion_observations - num_single_motion_obs - motion_latent_dim)
+
+    import re
+
+    actor_linears: list[tuple[int, Any]] = []
+    for k, v in sd.items():
+        m = re.match(r"^actor\.actor_backbone\.(\d+)\.weight$", str(k))
+        if not m:
+            continue
+        if getattr(v, "ndim", 0) != 2:
+            continue
+        actor_linears.append((int(m.group(1)), v))
+    actor_linears.sort(key=lambda x: x[0])
+    if not actor_linears:
+        raise ValueError("Failed to infer actor backbone linears from checkpoint")
+    if int(actor_linears[-1][1].shape[0]) != num_actions:
+        raise ValueError("Actor output layer not found in checkpoint (unexpected shapes)")
+    actor_hidden_dims = [int(v.shape[0]) for _, v in actor_linears[:-1]]
+    if not actor_hidden_dims:
+        raise ValueError("Failed to infer actor_hidden_dims from checkpoint")
+
+    critic_linears: list[tuple[int, Any]] = []
+    for k, v in sd.items():
+        m = re.match(r"^critic\.(\d+)\.weight$", str(k))
+        if not m:
+            continue
+        if getattr(v, "ndim", 0) != 2:
+            continue
+        critic_linears.append((int(m.group(1)), v))
+    critic_linears.sort(key=lambda x: x[0])
+    if not critic_linears:
+        raise ValueError("Failed to infer critic backbone linears from checkpoint")
+    if int(critic_linears[-1][1].shape[0]) != 1:
+        raise ValueError("Critic output layer not found in checkpoint (unexpected shapes)")
+    critic_hidden_dims = [int(v.shape[0]) for _, v in critic_linears[:-1]]
+    if not critic_hidden_dims:
+        raise ValueError("Failed to infer critic_hidden_dims from checkpoint")
+
+    layer_norm = any(
+        k.startswith("actor.actor_backbone.") and k.endswith(".weight") and getattr(v, "ndim", 0) == 1 for k, v in sd.items()
+    )
+
+    return {
+        "num_observations": int(num_observations),
+        "num_critic_observations": int(num_critic_observations),
+        "num_motion_observations": int(num_motion_observations),
+        "num_motion_steps": int(tsteps),
+        "num_actions": int(num_actions),
+        "actor_hidden_dims": actor_hidden_dims,
+        "critic_hidden_dims": critic_hidden_dims,
+        "motion_latent_dim": int(motion_latent_dim),
+        "layer_norm": bool(layer_norm),
+    }
+
+
+class TorchPolicy:
+    """Loads an RSL-RL `.pt` checkpoint (ActorCriticMimic) for inference."""
+
+    def __init__(self, policy_path: str | Path, *, device: str = "cpu") -> None:
+        if torch is None:
+            raise ImportError("torch is required for .pt policy inference but is not installed.")
+        policy_path = Path(policy_path).expanduser().resolve()
+        if not policy_path.exists():
+            raise FileNotFoundError(policy_path)
+
+        self.device = str(device)
+        self.torch_device = torch.device(self.device if (self.device.startswith("cuda") and torch.cuda.is_available()) else "cpu")
+
+        # NOTE: local training checkpoints include Normalizer objects; we load with weights_only=False.
+        ckpt = torch.load(policy_path, map_location="cpu", weights_only=False)
+        if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt:
+            raise ValueError(f"Unsupported .pt policy format: expected dict with model_state_dict, got {type(ckpt)}")
+        sd = ckpt["model_state_dict"]
+        if not isinstance(sd, dict):
+            raise ValueError("Unsupported .pt policy: model_state_dict is not a dict")
+
+        # Detect ActorCriticMimic by motion_encoder keys.
+        if not any(str(k).startswith("actor.motion_encoder.") for k in sd.keys()):
+            raise ValueError(
+                "Unsupported .pt policy (not ActorCriticMimic). "
+                "If this is a different policy, export to ONNX or extend TorchPolicy."
+            )
+
+        init = _infer_actor_critic_mimic_init(sd)
+        self.expected_obs_dim = int(init["num_observations"])
+        self.num_motion_steps = int(init["num_motion_steps"])
+        self.num_single_motion_obs = int(init["num_motion_observations"] // init["num_motion_steps"])
+
+        from rsl_rl.modules.actor_critic_mimic import ActorCriticMimic
+
+        self.model = ActorCriticMimic(
+            num_observations=init["num_observations"],
+            num_critic_observations=init["num_critic_observations"],
+            num_motion_observations=init["num_motion_observations"],
+            num_motion_steps=init["num_motion_steps"],
+            num_actions=init["num_actions"],
+            actor_hidden_dims=init["actor_hidden_dims"],
+            critic_hidden_dims=init["critic_hidden_dims"],
+            motion_latent_dim=init["motion_latent_dim"],
+            activation="elu",
+            init_noise_std=1.0,
+            fix_action_std=False,
+            layer_norm=bool(init["layer_norm"]),
+        )
+        self.model.load_state_dict(sd, strict=True)
+        self.model.to(self.torch_device)
+        self.model.eval()
+
+        self.normalizer = ckpt.get("normalizer", None)
+        if self.normalizer is not None:
+            try:
+                self.normalizer.to(self.torch_device)
+            except Exception:
+                pass
+
+    def __call__(self, obs: np.ndarray) -> np.ndarray:
+        obs = np.asarray(obs, dtype=np.float32)
+        if obs.ndim == 1:
+            obs = obs[None, :]
+        if int(obs.shape[1]) != int(self.expected_obs_dim):
+            raise ValueError(f"Torch policy expected obs_dim={self.expected_obs_dim}, got {obs.shape}")
+        x = torch.from_numpy(obs).to(self.torch_device)
+        if self.normalizer is not None:
+            x = self.normalizer.normalize(x)
+        with torch.inference_mode():
+            # Some repo variants have `act_inference(..., eval=True)` calling Actor with an unsupported kwarg.
+            # `act_inference()` already returns the deterministic mean action.
+            act = self.model.act_inference(x)
+        return act.detach().to("cpu").numpy().astype(np.float32, copy=False)
+
+
+def _default_pt_to_onnx_cache_dir() -> Path:
+    mmdd = time.strftime("%m%d", time.localtime())
+    return Path(f"/tmp/codex-{mmdd}-pt-to-onnx")
+
+
+def export_actor_critic_mimic_ckpt_to_onnx(
+    ckpt_path: str | Path,
+    *,
+    out_dir: str | Path | None = None,
+    opset: int = 11,
+) -> Path:
+    """
+    Export an RSL-RL ActorCriticMimic `.pt/.pth` checkpoint into an ONNX policy (action mean).
+
+    The exported graph includes the checkpoint Normalizer (if present), so ONNX inference matches
+    TorchPolicy behavior.
+    """
+    if torch is None:
+        raise RuntimeError("torch is required to export `.pt` checkpoints to ONNX")
+    ckpt_path = Path(ckpt_path).expanduser().resolve()
+    if not ckpt_path.exists():
+        raise FileNotFoundError(ckpt_path)
+    if ckpt_path.suffix.lower() not in (".pt", ".pth"):
+        raise ValueError(f"Expected a .pt/.pth checkpoint, got {ckpt_path}")
+
+    out_dir = _default_pt_to_onnx_cache_dir() if out_dir is None else Path(out_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    st = ckpt_path.stat()
+    cache_key = f"{ckpt_path}|{st.st_mtime_ns}|{st.st_size}|opset={int(opset)}"
+    h = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()[:12]
+    out_path = out_dir / f"{ckpt_path.stem}-{h}.onnx"
+    if out_path.exists():
+        return out_path
+
+    lock_path = out_path.with_suffix(out_path.suffix + ".lock")
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            # Another process is exporting; wait for completion.
+            t0 = time.time()
+            while time.time() - t0 < 120.0:
+                if out_path.exists():
+                    return out_path
+                time.sleep(0.1)
+            raise TimeoutError(f"Timed out waiting for ONNX export lock: {lock_path}")
+
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt:
+            raise ValueError(f"Unsupported .pt policy format: expected dict with model_state_dict, got {type(ckpt)}")
+        sd = ckpt["model_state_dict"]
+        if not isinstance(sd, dict):
+            raise ValueError("Unsupported .pt policy: model_state_dict is not a dict")
+
+        init = _infer_actor_critic_mimic_init(sd)
+        expected_obs_dim = int(init["num_observations"])
+
+        from rsl_rl.modules.actor_critic_mimic import ActorCriticMimic
+
+        model = ActorCriticMimic(
+            num_observations=init["num_observations"],
+            num_critic_observations=init["num_critic_observations"],
+            num_motion_observations=init["num_motion_observations"],
+            num_motion_steps=init["num_motion_steps"],
+            num_actions=init["num_actions"],
+            actor_hidden_dims=init["actor_hidden_dims"],
+            critic_hidden_dims=init["critic_hidden_dims"],
+            motion_latent_dim=init["motion_latent_dim"],
+            activation="elu",
+            init_noise_std=1.0,
+            fix_action_std=False,
+            layer_norm=bool(init["layer_norm"]),
+        )
+        model.load_state_dict(sd, strict=True)
+        model.eval()
+
+        normalizer = ckpt.get("normalizer", None)
+        if normalizer is not None:
+            try:
+                normalizer.eval()
+            except Exception:
+                pass
+
+        class _ExportWrapper(torch.nn.Module):
+            def __init__(self, m: torch.nn.Module, n: Any | None) -> None:
+                super().__init__()
+                self.m = m
+                self.n = n
+
+            def forward(self, obs: torch.Tensor) -> torch.Tensor:
+                if self.n is not None:
+                    obs = self.n.normalize(obs)
+                return self.m.actor(obs)
+
+        wrapper = _ExportWrapper(model, normalizer)
+        wrapper.eval()
+
+        dummy = torch.zeros((1, expected_obs_dim), dtype=torch.float32)
+        torch.onnx.export(
+            wrapper,
+            dummy,
+            str(tmp_path),
+            export_params=True,
+            opset_version=int(opset),
+            do_constant_folding=True,
+            input_names=["obs"],
+            output_names=["actions"],
+            dynamic_axes={"obs": {0: "batch"}, "actions": {0: "batch"}},
+        )
+        os.replace(str(tmp_path), str(out_path))
+        return out_path
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        try:
+            if lock_path.exists():
+                lock_path.unlink()
+        except Exception:
+            pass
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+
+def load_policy(policy_path: str | Path, *, device: str = "cpu") -> tuple[Any, str]:
+    policy_path = Path(policy_path).expanduser().resolve()
+    suf = policy_path.suffix.lower()
+    if suf == ".onnx":
+        return OnnxPolicy(policy_path, device=str(device)), "onnx"
+    if suf in (".pt", ".pth"):
+        return TorchPolicy(policy_path, device=str(device)), "torch"
+    raise ValueError(f"Unsupported policy file extension: {policy_path} (expected .onnx or .pt)")
 
 
 class _EmaSmoother:
@@ -701,6 +1055,7 @@ class Twist2SimConfig:
     policy_frequency: float = 100.0
     sim_dt: float = 0.001
     smooth_body: float = 0.0
+    obs_mode: str = "auto"  # auto|student_future|teacher_priv_mimic
 
 
 class Twist2SimRunner:
@@ -713,7 +1068,7 @@ class Twist2SimRunner:
         if mujoco is None:
             raise ImportError("mujoco is required but not installed.")
         self.cfg = cfg
-        self.policy = OnnxPolicy(cfg.policy_path, device=str(cfg.device))
+        self.policy, self.policy_backend = load_policy(cfg.policy_path, device=str(cfg.device))
 
         self.model = mujoco.MjModel.from_xml_path(str(Path(cfg.xml_path).expanduser().resolve()))
         self.model.opt.timestep = float(cfg.sim_dt)
@@ -959,6 +1314,71 @@ class Twist2SimRunner:
         except Exception:
             self._pelvis_body_id = None
 
+        # Observation mode selection.
+        self.obs_mode = str(getattr(cfg, "obs_mode", "auto") or "auto")
+        if self.obs_mode == "auto":
+            if hasattr(self.policy, "expected_obs_dim") and getattr(self.policy, "expected_obs_dim") is not None:
+                exp = int(getattr(self.policy, "expected_obs_dim"))
+                if exp == int(self.total_obs_size):
+                    self.obs_mode = "student_future"
+                elif exp == 1734:
+                    self.obs_mode = "teacher_priv_mimic"
+                else:
+                    raise ValueError(
+                        f"Unsupported policy obs_dim={exp}. "
+                        f"Supported: student_future({self.total_obs_size}) or teacher_priv_mimic(1734)."
+                    )
+            else:
+                self.obs_mode = "student_future"
+
+        # Teacher (priv mimic) constants (G1).
+        self._teacher_key_bodies = (
+            "left_rubber_hand",
+            "right_rubber_hand",
+            "left_ankle_roll_link",
+            "right_ankle_roll_link",
+            "left_knee_link",
+            "right_knee_link",
+            "left_elbow_link",
+            "right_elbow_link",
+            "head_mocap",
+        )
+        self._teacher_key_bodies_resolved: tuple[str, ...] = self._teacher_key_bodies
+        self._teacher_tar_steps = [1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95]
+        self._teacher_key_body_ids_sim: np.ndarray | None = None
+        self._teacher_feet_body_ids_sim: np.ndarray | None = None
+        if self.obs_mode == "teacher_priv_mimic":
+            if hasattr(self.policy, "expected_obs_dim") and getattr(self.policy, "expected_obs_dim") is not None:
+                exp = int(getattr(self.policy, "expected_obs_dim"))
+                if exp != 1734:
+                    raise ValueError(f"teacher_priv_mimic requires policy obs_dim=1734, got {exp}")
+            fallbacks = {"head_mocap": ("imu_in_torso", "torso_link")}
+            resolved_names: list[str] = []
+            sim_ids: list[int] = []
+            for name in self._teacher_key_bodies:
+                candidates = (name,) + tuple(fallbacks.get(name, ()))
+                found = None
+                for cand in candidates:
+                    try:
+                        bid = int(self.model.body(cand).id)
+                        found = (cand, bid)
+                        break
+                    except Exception:
+                        continue
+                if found is None:
+                    raise ValueError(f"MuJoCo XML missing required body for teacher obs: {name} (tried {candidates})")
+                resolved_names.append(found[0])
+                sim_ids.append(found[1])
+            self._teacher_key_bodies_resolved = tuple(resolved_names)
+            self._teacher_key_body_ids_sim = np.asarray(sim_ids, dtype=np.int32)
+            feet = []
+            for name in ("left_ankle_roll_link", "right_ankle_roll_link"):
+                try:
+                    feet.append(int(self.model.body(name).id))
+                except Exception as e:
+                    raise ValueError(f"MuJoCo XML missing foot body for contact: {name}") from e
+            self._teacher_feet_body_ids_sim = np.asarray(feet, dtype=np.int32)
+
     def reset(self, *, sim_seed: int = 0) -> None:
         if mujoco is None:
             raise RuntimeError("mujoco not available")
@@ -1021,6 +1441,265 @@ class Twist2SimRunner:
             raise RuntimeError(f"obs_buf wrong size: {obs_buf.shape[0]} (expected {self.total_obs_size})")
         return obs_buf
 
+    def _prepare_teacher_ref(
+        self,
+        motion: Motion,
+        *,
+        publish_hz: float,
+        future_step: int,
+        idle_s: float,
+        tail_s: float,
+        transition_s: float,
+        loop: bool,
+        idle_root_pos_z: float = 0.8,
+    ) -> dict[str, np.ndarray]:
+        if torch is None:
+            raise RuntimeError("torch is required for teacher_priv_mimic observation building")
+        if motion.local_body_pos is None or motion.link_body_list is None:
+            raise ValueError("teacher_priv_mimic requires motion files with local_body_pos + link_body_list (use .pkl stageii)")
+
+        root_pos = torch.from_numpy(motion.root_pos)
+        root_rot = torch.from_numpy(motion.root_rot_xyzw)
+        dof_pos = torch.from_numpy(motion.dof_pos)
+        root_rot = root_rot / torch.norm(root_rot, dim=-1, keepdim=True).clamp(min=1e-9)
+
+        root_pos_s, root_rot_s, dof_pos_s = _resample_xyzw_sequence(
+            root_pos, root_rot, dof_pos, src_fps=float(motion.fps), publish_hz=float(publish_hz)
+        )
+
+        # Resample local_body_pos linearly using the same time grid.
+        src_dt = 1.0 / float(motion.fps)
+        length = src_dt * float(int(root_pos.shape[0]) - 1)
+        pub_dt = 1.0 / float(publish_hz)
+        n = int(math.floor(length / pub_dt))
+        n = max(n, 2)
+        times = torch.arange(n, dtype=torch.float32) * float(pub_dt)
+        times = torch.clamp(times, 0.0, float(length) - 1e-6)
+        phase = torch.clamp(times / float(length), 0.0, 1.0)
+        t_float = phase * float(int(root_pos.shape[0]) - 1)
+        idx0 = torch.floor(t_float).to(torch.int64)
+        idx1 = torch.clamp(idx0 + 1, max=int(root_pos.shape[0]) - 1)
+        blend = (t_float - idx0.to(torch.float32)).to(torch.float32).unsqueeze(-1).unsqueeze(-1)
+
+        lb = torch.from_numpy(np.asarray(motion.local_body_pos, dtype=np.float32))  # (T,B,3)
+        lb0 = lb[idx0]
+        lb1 = lb[idx1]
+        local_body_pos_s = ((1.0 - blend) * lb0 + blend * lb1).detach().cpu().numpy().astype(np.float32, copy=False)
+
+        # Apply the same idle/transition logic as mimic_target generation so teacher ref aligns in time/length.
+        hz = float(publish_hz)
+        n_idle = int(round(float(idle_s) * hz))
+        n_tail = int(round(float(tail_s) * hz))
+
+        transition_s = float(transition_s)
+        if transition_s <= 0:
+            n_ramp = 0
+        else:
+            n_ramp = int(round(transition_s * hz)) + 1
+            n_ramp = max(n_ramp, int(future_step) + 2, 2)
+
+        # Base arrays (motion-only, already resampled to publish_hz).
+        root_pos_np_m = root_pos_s.detach().cpu().numpy().astype(np.float32, copy=False)
+        root_rot_xyzw_m = root_rot_s.detach().cpu().numpy().astype(np.float32, copy=False)
+        dof_pos_np_m = dof_pos_s.detach().cpu().numpy().astype(np.float32, copy=False)
+
+        # Idle frame (matches MotionEvaluator idle defaults).
+        idle_pos = np.array([0.0, 0.0, float(idle_root_pos_z)], dtype=np.float32)
+        idle_quat_xyzw = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        idle_dof = self.default_dof_pos.astype(np.float32, copy=False)
+        idle_local_body = local_body_pos_s[0].astype(np.float32, copy=False)
+
+        # Ramp in/out on the motion segment.
+        if n_ramp > 0 and root_pos_np_m.shape[0] >= 2:
+            ramp = np.linspace(0.0, 1.0, num=n_ramp, dtype=np.float32)[:, None]
+            nn = min(n_ramp, int(root_pos_np_m.shape[0]))
+            root_pos_np_m[:nn] = (1.0 - ramp[:nn]) * idle_pos[None, :] + ramp[:nn] * root_pos_np_m[:1]
+            dof_pos_np_m[:nn] = (1.0 - ramp[:nn]) * idle_dof[None, :] + ramp[:nn] * dof_pos_np_m[:1]
+            local_body_pos_s[:nn] = (1.0 - ramp[:nn, None]) * idle_local_body[None, :, :] + ramp[:nn, None] * local_body_pos_s[:1]
+
+            # slerp quats in xyzw
+            q0 = torch.from_numpy(np.repeat(idle_quat_xyzw[None, :], nn, axis=0))
+            q1 = torch.from_numpy(root_rot_xyzw_m[:1].repeat(nn, axis=0))
+            blend = torch.from_numpy(np.linspace(0.0, 1.0, num=nn, dtype=np.float32))
+            q_s = _slerp_xyzw(q0, q1, blend)
+            q_s = q_s / torch.norm(q_s, dim=-1, keepdim=True).clamp(min=1e-9)
+            root_rot_xyzw_m[:nn] = q_s.numpy().astype(np.float32, copy=False)
+
+            if not bool(loop):
+                nn = min(n_ramp, int(root_pos_np_m.shape[0]))
+                ramp2 = np.linspace(0.0, 1.0, num=nn, dtype=np.float32)[:, None]
+                root_pos_np_m[-nn:] = (1.0 - ramp2) * root_pos_np_m[-1:] + ramp2 * idle_pos[None, :]
+                dof_pos_np_m[-nn:] = (1.0 - ramp2) * dof_pos_np_m[-1:] + ramp2 * idle_dof[None, :]
+                local_body_pos_s[-nn:] = (1.0 - ramp2[:, None]) * local_body_pos_s[-1:] + ramp2[:, None] * idle_local_body[None, :, :]
+
+                q0 = torch.from_numpy(root_rot_xyzw_m[-1:].repeat(nn, axis=0))
+                q1 = torch.from_numpy(np.repeat(idle_quat_xyzw[None, :], nn, axis=0))
+                blend = torch.from_numpy(np.linspace(0.0, 1.0, num=nn, dtype=np.float32))
+                q_s = _slerp_xyzw(q0, q1, blend)
+                q_s = q_s / torch.norm(q_s, dim=-1, keepdim=True).clamp(min=1e-9)
+                root_rot_xyzw_m[-nn:] = q_s.numpy().astype(np.float32, copy=False)
+
+        # Prepend/append idle segments.
+        pre_pos = np.repeat(idle_pos[None, :], max(0, n_idle), axis=0)
+        pre_rot = np.repeat(idle_quat_xyzw[None, :], max(0, n_idle), axis=0)
+        pre_dof = np.repeat(idle_dof[None, :], max(0, n_idle), axis=0)
+        pre_lb = np.repeat(idle_local_body[None, :, :], max(0, n_idle), axis=0)
+        post_pos = np.repeat(idle_pos[None, :], max(0, n_tail), axis=0)
+        post_rot = np.repeat(idle_quat_xyzw[None, :], max(0, n_tail), axis=0)
+        post_dof = np.repeat(idle_dof[None, :], max(0, n_tail), axis=0)
+        post_lb = np.repeat(idle_local_body[None, :, :], max(0, n_tail), axis=0)
+
+        root_pos_np = np.concatenate([pre_pos, root_pos_np_m, post_pos], axis=0).astype(np.float32, copy=False)
+        root_rot_xyzw = np.concatenate([pre_rot, root_rot_xyzw_m, post_rot], axis=0).astype(np.float32, copy=False)
+        dof_pos_np = np.concatenate([pre_dof, dof_pos_np_m, post_dof], axis=0).astype(np.float32, copy=False)
+        local_body_pos_full = np.concatenate([pre_lb, local_body_pos_s, post_lb], axis=0).astype(np.float32, copy=False)
+
+        root_rot_wxyz = _quat_xyzw_to_wxyz(root_rot_xyzw).astype(np.float32, copy=False)
+
+        dt = 1.0 / float(publish_hz)
+        root_vel_world = _finite_difference_np(root_pos_np, dt).astype(np.float32, copy=False)
+
+        q_full = torch.from_numpy(root_rot_xyzw)
+        q_full = q_full / torch.norm(q_full, dim=-1, keepdim=True).clamp(min=1e-9)
+        q_prev = q_full[:-2]
+        q_next = q_full[2:]
+        q_rel = _quat_mul_xyzw(q_next, _quat_conj_xyzw(q_prev))
+        omega_mid = _quat_to_exp_map_xyzw(q_rel) / (2.0 * float(dt))
+        q_start_rel = _quat_mul_xyzw(q_full[1], _quat_conj_xyzw(q_full[0]))
+        omega_start = _quat_to_exp_map_xyzw(q_start_rel) / float(dt)
+        q_end_rel = _quat_mul_xyzw(q_full[-1], _quat_conj_xyzw(q_full[-2]))
+        omega_end = _quat_to_exp_map_xyzw(q_end_rel) / float(dt)
+        root_ang_vel_world = torch.cat([omega_start.unsqueeze(0), omega_mid, omega_end.unsqueeze(0)], dim=0).detach().cpu().numpy().astype(np.float32, copy=False)
+
+        root_pos_delta_local = np.zeros_like(root_pos_np, dtype=np.float32)
+        root_pos_delta_local[1:] = root_pos_np[1:] - root_pos_np[:-1]
+        root_pos_delta_local[1:] = _quat_rotate_inverse_wxyz(root_rot_wxyz[:-1], root_pos_delta_local[1:]).astype(np.float32, copy=False)
+
+        root_rot_delta_local = np.zeros_like(root_pos_np, dtype=np.float32)
+        if root_rot_wxyz.shape[0] >= 2:
+            q_prev_w = root_rot_wxyz[:-1]
+            q_next_w = root_rot_wxyz[1:]
+            q_rel_w = _quat_mul_wxyz(q_next_w, _quat_conjugate_wxyz(q_prev_w))
+            dr, dp, dy = _euler_from_quat_wxyz(q_rel_w)
+            de = np.stack([dr, dp, dy], axis=-1).astype(np.float32, copy=False)
+            root_rot_delta_local[1:] = _quat_rotate_inverse_wxyz(q_prev_w, de).astype(np.float32, copy=False)
+
+        link = list(motion.link_body_list)
+        idxs = []
+        for name in self._teacher_key_bodies_resolved:
+            if name not in link:
+                raise ValueError(f"Motion file missing key body '{name}' in link_body_list")
+            idxs.append(int(link.index(name)))
+        idxs_np = np.asarray(idxs, dtype=np.int32)
+        key_body_pos_local = local_body_pos_full[:, idxs_np, :].reshape(local_body_pos_full.shape[0], -1).astype(np.float32, copy=False)
+
+        return {
+            "loop": np.array(bool(loop), dtype=np.bool_),
+            "root_pos": root_pos_np,
+            "root_rot_wxyz": root_rot_wxyz,
+            "root_vel_world": root_vel_world,
+            "root_ang_vel_world": root_ang_vel_world,
+            "root_pos_delta_local": root_pos_delta_local,
+            "root_rot_delta_local": root_rot_delta_local,
+            "dof_pos": dof_pos_np,
+            "key_body_pos_local": key_body_pos_local,
+        }
+
+    def _build_obs_teacher_priv_mimic(self, ref: dict[str, np.ndarray], t: int) -> np.ndarray:
+        if self._teacher_key_body_ids_sim is None or self._teacher_feet_body_ids_sim is None:
+            raise RuntimeError("Teacher obs not initialized")
+        qpos = self.data.qpos
+        qvel = self.data.qvel
+        root_pos = qpos[0:3].astype(np.float32, copy=False)
+        quat_wxyz = qpos[3:7].astype(np.float32, copy=False)
+
+        T = int(ref["root_pos"].shape[0])
+        steps = self._teacher_tar_steps
+        if hasattr(self.policy, "num_motion_steps") and len(steps) != int(getattr(self.policy, "num_motion_steps")):
+            raise ValueError(f"teacher tar_steps length {len(steps)} != policy num_motion_steps {int(getattr(self.policy, 'num_motion_steps'))}")
+
+        rows: list[np.ndarray] = []
+        for s in steps:
+            idx = int(t + s)
+            if idx >= T:
+                idx = (idx % T) if bool(ref["loop"].item()) else (T - 1)
+
+            tar_root_pos = ref["root_pos"][idx]
+            tar_quat = ref["root_rot_wxyz"][idx]
+            tar_roll, tar_pitch, tar_yaw = _euler_from_quat_wxyz(tar_quat.reshape(1, 4))
+            tar_rpy = np.array([float(tar_roll[0]), float(tar_pitch[0]), float(tar_yaw[0])], dtype=np.float32)
+
+            tar_root_vel_local = _quat_rotate_inverse_wxyz(tar_quat.reshape(1, 4), ref["root_vel_world"][idx].reshape(1, 3)).reshape(-1).astype(np.float32, copy=False)
+            tar_root_ang_vel_local = _quat_rotate_inverse_wxyz(tar_quat.reshape(1, 4), ref["root_ang_vel_world"][idx].reshape(1, 3)).reshape(-1).astype(np.float32, copy=False)
+
+            row = np.concatenate(
+                [
+                    tar_root_pos.astype(np.float32, copy=False),
+                    (tar_root_pos - root_pos).astype(np.float32, copy=False),
+                    tar_rpy,
+                    tar_root_vel_local,
+                    tar_root_ang_vel_local,
+                    ref["root_pos_delta_local"][idx].astype(np.float32, copy=False),
+                    ref["root_rot_delta_local"][idx].astype(np.float32, copy=False),
+                    ref["dof_pos"][idx].astype(np.float32, copy=False),
+                    ref["key_body_pos_local"][idx].astype(np.float32, copy=False),
+                ],
+                axis=0,
+            )
+            rows.append(row)
+        motion_obs = np.concatenate(rows, axis=0).astype(np.float32, copy=False)
+
+        # proprio (matches g1_mimic_distill.py, but without reindex/noise)
+        dof_pos = qpos[7 : 7 + self.num_actions].astype(np.float32, copy=False)
+        dof_vel = qvel[6 : 6 + self.num_actions].astype(np.float32, copy=False)
+        ang_vel = qvel[3:6].astype(np.float32, copy=False)
+        roll, pitch, _yaw = _euler_from_quat_wxyz(quat_wxyz.reshape(1, 4))
+        imu_rp = np.array([float(roll[0]), float(pitch[0])], dtype=np.float32)
+
+        obs_dof_vel = dof_vel.copy()
+        obs_dof_vel[self.ankle_idx] = 0.0
+        proprio = np.concatenate(
+            [
+                ang_vel * 0.25,
+                imu_rp,
+                (dof_pos - self.default_dof_pos),
+                obs_dof_vel * 0.05,
+                self._last_action,
+            ],
+            axis=0,
+        ).astype(np.float32, copy=False)
+
+        # priv_info (matches g1_mimic_distill.py; domain-rand fields set to nominal)
+        lin_vel_world = qvel[0:3].astype(np.float32, copy=False)
+        base_lin_vel = _quat_rotate_inverse_wxyz(quat_wxyz.reshape(1, 4), lin_vel_world.reshape(1, 3)).reshape(-1).astype(np.float32, copy=False)
+
+        body_pos = np.asarray(self.data.xpos[self._teacher_key_body_ids_sim], dtype=np.float32)  # (9,3)
+        rel = body_pos - root_pos[None, :]
+        rel_local = _quat_rotate_inverse_wxyz(quat_wxyz.reshape(1, 4), rel).reshape(-1).astype(np.float32, copy=False)
+
+        cfrc = np.asarray(self.data.cfrc_ext[self._teacher_feet_body_ids_sim], dtype=np.float32)  # (2,6)
+        foot_contact = (cfrc[:, 2] > 5.0).astype(np.float32, copy=False)
+
+        mass_params = np.zeros((4,), dtype=np.float32)
+        friction = np.ones((1,), dtype=np.float32)
+        motor_strength = np.zeros((2 * self.num_actions,), dtype=np.float32)
+
+        priv_info = np.concatenate(
+            [
+                base_lin_vel,
+                root_pos.astype(np.float32, copy=False),
+                quat_wxyz.astype(np.float32, copy=False),
+                rel_local,
+                foot_contact,
+                mass_params,
+                friction,
+                motor_strength,
+            ],
+            axis=0,
+        ).astype(np.float32, copy=False)
+
+        return np.concatenate([motion_obs, proprio, priv_info], axis=0).astype(np.float32, copy=False)
+
     def _policy_to_pd_target(self, obs_buf: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         raw = self.policy(obs_buf).reshape(-1)
         if raw.shape[0] != self.num_actions:
@@ -1034,6 +1713,12 @@ class Twist2SimRunner:
         self,
         mimic_target: np.ndarray,
         *,
+        motion: Motion | None = None,
+        loop: bool = False,
+        future_step: int = 1,
+        idle_s: float = 0.5,
+        tail_s: float = 0.5,
+        transition_s: float = 0.4,
         sim_seed: int = 0,
         z_min: float = 0.55,
         angle_max_deg: float = 60.0,
@@ -1080,8 +1765,26 @@ class Twist2SimRunner:
         angle_max = float(angle_max_deg) * math.pi / 180.0
         z_min = float(z_min)
 
+        teacher_ref: dict[str, np.ndarray] | None = None
+        if self.obs_mode == "teacher_priv_mimic":
+            if motion is None:
+                raise ValueError("teacher_priv_mimic requires passing `motion` into Twist2SimRunner.run()")
+            teacher_ref = self._prepare_teacher_ref(
+                motion,
+                publish_hz=float(self.policy_frequency),
+                future_step=int(future_step),
+                idle_s=float(idle_s),
+                tail_s=float(tail_s),
+                transition_s=float(transition_s),
+                loop=bool(loop),
+            )
+
         for t in range(T - 1):
-            obs_buf = self._build_obs(mimic_target[t])
+            if self.obs_mode == "teacher_priv_mimic":
+                assert teacher_ref is not None
+                obs_buf = self._build_obs_teacher_priv_mimic(teacher_ref, t)
+            else:
+                obs_buf = self._build_obs(mimic_target[t])
             _raw, pd_target = self._policy_to_pd_target(obs_buf)
 
             for _ in range(self.sim_decimation):
@@ -1320,6 +2023,7 @@ class MotionEvaluator:
         self,
         mimic_target: np.ndarray,
         *,
+        motion: Motion,
         motion_relpath: str,
         motion_idx: int,
         fps_src: float,
@@ -1352,6 +2056,12 @@ class MotionEvaluator:
         try:
             sim_out = self.sim.run(
                 mimic_target,
+                motion=motion,
+                loop=bool(loop),
+                future_step=int(future_step),
+                idle_s=float(idle_s),
+                tail_s=float(tail_s),
+                transition_s=float(transition_s),
                 sim_seed=int(sim_seed),
                 z_min=float(z_min),
                 angle_max_deg=float(angle_max_deg),
@@ -1536,6 +2246,7 @@ def _worker_init(cfg: dict[str, Any]) -> None:
             policy_frequency=float(cfg["policy_frequency"]),
             sim_dt=float(cfg["sim_dt"]),
             smooth_body=float(cfg["smooth_body"]),
+            obs_mode=str(cfg.get("obs_mode", "auto")),
         )
     )
     _WORKER_EVAL = MotionEvaluator(sim=_WORKER_SIM, xml_path=Path(cfg["xml_path"]), body_set=str(cfg["body_set"]))
@@ -1558,6 +2269,7 @@ def _worker_eval_entry(entry: MotionEntry) -> dict[str, Any]:
         )
         res = _WORKER_EVAL.run_and_eval(
             mimic,
+            motion=motion,
             motion_relpath=str(entry.file_rel),
             motion_idx=int(entry.idx),
             fps_src=float(motion.fps),
@@ -1609,16 +2321,32 @@ def _worker_eval_entry(entry: MotionEntry) -> dict[str, Any]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Evaluate TWIST2 ONNX policy in MuJoCo for all motions in a training motion YAML; output per-motion CSV metrics.")
+    ap = argparse.ArgumentParser(
+        description="Evaluate a TWIST2 policy in MuJoCo for all motions in a training motion YAML; output per-motion CSV metrics. "
+        "Supports .onnx directly; for .pt/.pth checkpoints the script exports a cached ONNX first."
+    )
     ap.add_argument("--motion_yaml", type=str, required=True, help="Motion config YAML (root_path + motions[].file)")
     ap.add_argument("--out_csv", type=str, required=True, help="Output CSV path")
     ap.add_argument("--append", action="store_true", help="Append to existing CSV instead of overwriting")
 
     ap.add_argument("--policy_path", type=str, default="assets/ckpts/twist2_1017_20k.onnx")
+    ap.add_argument(
+        "--onnx_cache_dir",
+        type=str,
+        default="",
+        help="Where to cache exported ONNX when --policy_path is a .pt/.pth (default: /tmp/codex-<mmdd>-pt-to-onnx/)",
+    )
     ap.add_argument("--xml_path", type=str, default="assets/g1/g1_sim2sim_29dof.xml")
     ap.add_argument("--device", type=str, default="cpu", help="cpu | cuda | cuda:<id>")
     ap.add_argument("--policy_frequency", type=float, default=100.0, choices=[50.0, 100.0])
     ap.add_argument("--smooth_body", type=float, default=0.0)
+    ap.add_argument(
+        "--obs_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "student_future", "teacher_priv_mimic"],
+        help="Observation builder for the policy; auto selects based on policy type/obs_dim.",
+    )
     ap.add_argument("--workers", type=int, default=1, help="Number of worker processes for CPU evaluation")
     ap.add_argument(
         "--mp_start_method",
@@ -1659,6 +2387,13 @@ def main() -> None:
         raise RuntimeError("torch is required (pose utils dependency)")
     if mujoco is None:
         raise RuntimeError("mujoco is required")
+
+    policy_path = Path(args.policy_path).expanduser().resolve()
+    if policy_path.suffix.lower() in (".pt", ".pth"):
+        cache_dir = _default_pt_to_onnx_cache_dir() if not str(args.onnx_cache_dir).strip() else Path(args.onnx_cache_dir).expanduser().resolve()
+        exported = export_actor_critic_mimic_ckpt_to_onnx(policy_path, out_dir=cache_dir)
+        print(f"[info] exported ckpt -> onnx: {policy_path} -> {exported}", file=sys.stderr)
+        args.policy_path = str(exported)
 
     out_csv = Path(args.out_csv).expanduser().resolve()
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -1727,6 +2462,7 @@ def main() -> None:
             "policy_frequency": float(args.policy_frequency),
             "sim_dt": 0.001,
             "smooth_body": float(args.smooth_body),
+            "obs_mode": str(args.obs_mode),
             "body_set": str(args.body_set),
             "quat_order": str(args.quat_order),
             "future_step": int(args.future_step),
@@ -1750,6 +2486,7 @@ def main() -> None:
                     policy_frequency=float(args.policy_frequency),
                     sim_dt=0.001,
                     smooth_body=float(args.smooth_body),
+                    obs_mode=str(args.obs_mode),
                 )
             )
             evaluator = MotionEvaluator(sim=sim, xml_path=Path(args.xml_path), body_set=str(args.body_set))
@@ -1767,6 +2504,7 @@ def main() -> None:
                     )
                     res = evaluator.run_and_eval(
                         mimic,
+                        motion=motion,
                         motion_relpath=str(entry.file_rel),
                         motion_idx=int(entry.idx),
                         fps_src=float(motion.fps),
