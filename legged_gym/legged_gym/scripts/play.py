@@ -94,6 +94,24 @@ def play(args):
 
     set_play_cfg(env_cfg)
 
+    # Convenience flag for visualization: randomize which motions are loaded/recorded.
+    # - For YAML motion lists: shuffle before applying motion.max_motions.
+    # - For recording: shuffle selected motion ids before taking record_num_motions.
+    if getattr(args, "random", False):
+        seed = int(getattr(args, "record_seed", 0) or 0)
+        if seed == 0:
+            seed = int(getattr(args, "seed", 0) or 0)
+        if seed == 0:
+            seed = random.SystemRandom().randint(1, 2**31 - 1)
+        args.record_seed = seed
+
+        if hasattr(env_cfg, "motion"):
+            setattr(env_cfg.motion, "shuffle_motions", True)
+            if int(getattr(env_cfg.motion, "shuffle_seed", 0) or 0) == 0:
+                setattr(env_cfg.motion, "shuffle_seed", seed)
+
+        cprint(f"[play] --random enabled (seed={seed})", "green")
+
     env_cfg.env.record_video = args.record_video
     env_cfg.env.rand_reset = False
     # When recording, visualize GT vs policy keypoints as colored spheres in the same frame.
@@ -461,9 +479,12 @@ def play(args):
 
         if args.record_motion_ids:
             motion_ids_to_record = _parse_index_spec(args.record_motion_ids, num_motions)
+            if getattr(args, "random", False):
+                rng = random.Random(int(args.record_seed))
+                rng.shuffle(motion_ids_to_record)
         else:
             motion_ids_to_record = list(range(num_motions))
-            if args.record_shuffle:
+            if getattr(args, "random", False):
                 rng = random.Random(int(args.record_seed))
                 rng.shuffle(motion_ids_to_record)
             nrec = int(args.record_num_motions) if args.record_num_motions is not None else 1

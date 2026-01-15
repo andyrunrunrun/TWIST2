@@ -54,5 +54,5 @@ python play.py \
   --device cuda:2 --num_envs 1 \
   --headless --record_video \
   --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml \
-  --motion.max_motions 8 --record_num_motions 8
+  --motion.max_motions 8 --record_num_motions 8 --random
 ```
