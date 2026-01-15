@@ -39,9 +39,18 @@ class MotionLib:
                  motion_decompose=False, 
                  motion_smooth=True, 
                  motion_height_adjust=False,
-                 sample_ratio=1.0 # only sample a portion of the motion
+                 sample_ratio=1.0, # only sample a portion of the motion
+                 max_motions: int = -1, # for YAML configs: only load first N after filtering
+                 motion_ids: str = "", # for YAML configs: select a subset by indices, e.g. "0,3,10-20"
+                 shuffle_motions: bool = False, # for YAML configs: shuffle before applying max_motions (ignored if motion_ids given)
+                 shuffle_seed: int = 0,
+                 store_on_cpu: bool = True, # keep dataset tensors on CPU, move slices to GPU on demand
+                 gpu_cache_gib: float = 4.0, # cache active motions on GPU up to this budget (GiB); 0 disables
                  ):
-        self._device = device
+        self._device = torch.device(device)
+        self._store_on_cpu = bool(store_on_cpu)
+        self._storage_device = torch.device("cpu") if self._store_on_cpu else self._device
+        self._gpu_cache_gib = float(gpu_cache_gib)
 
         # motion augmentation by decomposing long motion into short motions
         self._motion_decompose = motion_decompose
@@ -51,9 +60,16 @@ class MotionLib:
         self._motion_height_adjust = motion_height_adjust
         # sample a portion of the motion
         self._sample_ratio = sample_ratio
+
+        self._max_motions = int(max_motions) if max_motions is not None else -1
+        self._motion_ids_spec = str(motion_ids) if motion_ids is not None else ""
+        self._shuffle_motions = bool(shuffle_motions)
+        self._shuffle_seed = int(shuffle_seed) if shuffle_seed is not None else 0
         
         # load motions
         self._load_motions(motion_file)
+        
+        self._init_gpu_cache()
         
         
     def _load_motions(self, motion_file):
@@ -92,17 +108,30 @@ class MotionLib:
                 continue
 
             try:
-                with open(curr_file, "rb") as f:
-                    motion_data = pickle.load(f)
+                motion_data = self._load_motion_data(curr_file)
+                if motion_data is None:
+                    continue
+                fps = motion_data["fps"]
             except Exception as e:
-                print(f"Error loading motion file {curr_file}: {e}")
+                # NumPy 2.x pickles are not compatible with NumPy 1.x (e.g. py38 IsaacGym env).
+                # Avoid attempting module hacks here as they can hard-crash the interpreter.
+                if isinstance(e, ModuleNotFoundError) and "numpy._core" in str(e):
+                    print(
+                        "Error loading motion file (NumPy 2.x pickle detected). "
+                        "Please convert motions to .npz first and re-run.\n"
+                        f"  file: {curr_file}\n"
+                        f"  error: {e}"
+                    )
+                else:
+                    print(f"Error loading motion file {curr_file}: {e}")
                 continue
-            fps = motion_data["fps"]
             curr_weight = motion_weights[i]
-            root_pos = torch.tensor(motion_data["root_pos"], dtype=torch.float, device=self._device)
-            root_rot = torch.tensor(motion_data["root_rot"], dtype=torch.float, device=self._device)
-            dof_pos = torch.tensor(motion_data["dof_pos"], dtype=torch.float, device=self._device)
-            local_body_pos = torch.tensor(motion_data["local_body_pos"], dtype=torch.float, device=self._device)
+            # Create tensors on CPU first then move to target device.
+            # This avoids some CUDA-side conversion paths that may hard-crash (segfault) in certain setups.
+            root_pos = self._to_storage_tensor(motion_data["root_pos"], dtype=torch.float)
+            root_rot = self._to_storage_tensor(motion_data["root_rot"], dtype=torch.float)
+            dof_pos = self._to_storage_tensor(motion_data["dof_pos"], dtype=torch.float)
+            local_body_pos = self._to_storage_tensor(motion_data["local_body_pos"], dtype=torch.float)
             if self._body_link_list is None or len(self._body_link_list) == 0:
                 self._body_link_list = motion_data["link_body_list"]
             num_frames = root_pos.shape[0]
