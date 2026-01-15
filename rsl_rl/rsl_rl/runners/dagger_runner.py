@@ -49,6 +49,7 @@ import sys
 from copy import copy, deepcopy
 import warnings
 from rsl_rl.utils.normalizer import Normalizer
+from rsl_rl.utils.utils import enable_mp, is_root_proc, maybe_wrap_ddp, unwrap_model
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
 
@@ -111,6 +112,8 @@ class DAggerRunner:
                                             num_actions=self.env.num_actions,
                                             num_hist=self.env.cfg.env.history_len,
                                             **self.policy_cfg).to(self.device)
+        # Wrap student actor for distributed training (torchrun + DDP).
+        student_actor = maybe_wrap_ddp(student_actor, self.device, find_unused_parameters=True)
         if self.normalize_obs:
             self.student_normalizer = Normalizer(shape=self.env.num_obs, device=self.device, dtype=env.obs_buf.dtype)
         else:
@@ -153,6 +156,7 @@ class DAggerRunner:
             obs = self.student_normalizer.normalize(obs)
         infos = {}
         self.alg.dagger_actor.train()
+        root_only = (not enable_mp()) or is_root_proc()
         
         ep_infos = []
         rewbuffer = deque(maxlen=100)
@@ -208,15 +212,16 @@ class DAggerRunner:
             
             stop = time.time()
             learn_time = stop - start
-            if self.log_dir is not None:
+            if root_only and self.log_dir is not None:
                 self.log(locals())
             
-            if it < 2500:
-                if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
-            else:
-                if it % (2*self.save_interval) == 0:
-                    self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+            if root_only and self.log_dir is not None:
+                if it < 2500:
+                    if it % self.save_interval == 0:
+                        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+                else:
+                    if it % (2*self.save_interval) == 0:
+                        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
             
             ep_infos.clear()
         
@@ -224,7 +229,8 @@ class DAggerRunner:
         # Iterations are zero-based, so the last iteration is tot_iter - 1.
         if tot_iter > self.current_learning_iteration:
             self.current_learning_iteration = tot_iter - 1
-        self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+        if root_only and self.log_dir is not None:
+            self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
     
     def log(self, locs, width=80, pad=35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -301,9 +307,10 @@ class DAggerRunner:
         print(log_string)
 
     def save(self, path, infos=None):
+        model = unwrap_model(self.alg.dagger_actor)
         if self.normalize_obs:
             state_dict = {
-            'model_state_dict': self.alg.dagger_actor.state_dict(),
+            'model_state_dict': model.state_dict(),
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
             'iter': self.current_learning_iteration,
             'normalizer': self.student_normalizer,
@@ -311,7 +318,7 @@ class DAggerRunner:
             }
         else:
             state_dict = {
-            'model_state_dict': self.alg.dagger_actor.state_dict(),
+            'model_state_dict': model.state_dict(),
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
             'iter': self.current_learning_iteration,
             'infos': infos,
@@ -337,7 +344,7 @@ class DAggerRunner:
         print("*" * 80)
         print("Loading model from {}...".format(path))
         loaded_dict = torch.load(path, map_location=self.device)
-        self.alg.dagger_actor.load_state_dict(loaded_dict['model_state_dict'])
+        unwrap_model(self.alg.dagger_actor).load_state_dict(loaded_dict['model_state_dict'])
         if self.normalize_obs:
             self.student_normalizer = loaded_dict['normalizer']
         if load_optimizer:

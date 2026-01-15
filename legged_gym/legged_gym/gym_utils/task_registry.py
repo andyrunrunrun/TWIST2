@@ -91,6 +91,13 @@ class TaskRegistry():
             env_cfg, _ = self.get_cfgs(name)
         # override cfg from args (if specified)
         env_cfg, _ = update_cfg_from_args(env_cfg, None, args)
+        # In distributed training, offset the seed per-rank so each process generates distinct rollouts.
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                env_cfg.seed = int(env_cfg.seed) + int(dist.get_rank())
+        except Exception:
+            pass
         set_seed(env_cfg.seed)
         # parse sim params (convert to dict first)
         sim_params = {"sim": class_to_dict(env_cfg.sim)}

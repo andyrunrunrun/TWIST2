@@ -90,7 +90,9 @@ class DaggerPPO:
 
         # PPO components
         self.actor_critic = actor_critic
-        self.actor_critic.to(self.device)
+        # If wrapped (e.g. DDP), the module is already placed on the correct device.
+        if not hasattr(self.actor_critic, "module"):
+            self.actor_critic.to(self.device)
         self.teacher_actor_critic = teacher_actor_critic
         self.teacher_actor_critic.to(self.device)
         self.teacher_loaded = teacher_loaded
@@ -179,13 +181,14 @@ class DaggerPPO:
                 obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
                 old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch = sample
                 obs_est_batch = obs_batch.clone()
-                self.actor_critic.act(obs_est_batch, masks=masks_batch, hidden_states=hid_states_batch[0]) # match distribution dimension
-
-                actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
-                value_batch = self.actor_critic.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
-                mu_batch = self.actor_critic.action_mean
-                sigma_batch = self.actor_critic.action_std
-                entropy_batch = self.actor_critic.entropy
+                # Use module forward (model(...)) so DDP forward hooks are triggered.
+                _, actions_log_prob_batch, value_batch, mu_batch, sigma_batch, entropy_batch = self.actor_critic(
+                    obs_est_batch,
+                    critic_obs_batch,
+                    actions_batch,
+                    masks=masks_batch,
+                    hidden_states=hid_states_batch,
+                )
                 
                 # KL
                 if self.desired_kl != None and self.schedule == 'adaptive':

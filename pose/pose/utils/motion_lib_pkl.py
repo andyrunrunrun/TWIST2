@@ -639,6 +639,36 @@ class MotionLib:
             if self._max_motions > 0:
                 motion_list = motion_list[: self._max_motions]
 
+            # DDP: shard motion list across ranks to avoid each process loading the full dataset.
+            # Sharding happens after motion_ids/shuffle/max_motions so every rank applies the same
+            # deterministic preprocessing before splitting.
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    world_size = dist.get_world_size()
+                    if world_size > 1:
+                        rank = dist.get_rank()
+
+                        # In DDP, random subsampling during loading makes each rank load a different
+                        # unpredictable subset. Force full loading per-rank for reproducibility.
+                        if self._sample_ratio != 1.0:
+                            if rank == 0:
+                                print(
+                                    f"[MotionLib] Warning: sample_ratio={self._sample_ratio} with DDP sharding; "
+                                    "forcing sample_ratio=1.0 to keep per-rank motion sets deterministic."
+                                )
+                            self._sample_ratio = 1.0
+
+                        # Ensure each rank gets at least one motion even when world_size > num_motions.
+                        if len(motion_list) < world_size:
+                            repeats = (world_size + len(motion_list) - 1) // len(motion_list)
+                            motion_list = (motion_list * repeats)[:world_size]
+
+                        # Strided sharding (rank, rank+W, ...).
+                        motion_list = motion_list[rank::world_size]
+            except Exception:
+                pass
+
             if len(motion_list) == 0:
                 raise ValueError(
                     f"No motions selected from YAML. motion_file={motion_file}, "
