@@ -38,6 +38,9 @@ class G1MimicDistill(HumanoidMimic):
         self._motion_ids[env_ids] = motion_ids
         self._motion_time_offsets[env_ids] = motion_times
         
+        if hasattr(self._motion_lib, "prefetch"):
+            self._motion_lib.prefetch(motion_ids)
+
         root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, body_pos, root_pos_delta_local, root_rot_delta_local = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
         root_pos[:, 2] += self.cfg.motion.height_offset
         self._ref_root_pos[env_ids] = root_pos
@@ -54,6 +57,8 @@ class G1MimicDistill(HumanoidMimic):
     def _update_ref_motion(self):
         motion_ids = self._motion_ids
         motion_times = self._get_motion_times()
+        if hasattr(self._motion_lib, "prefetch"):
+            self._motion_lib.prefetch(motion_ids)
         root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, body_pos, root_pos_delta_local, root_rot_delta_local = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
         root_pos[:, 2] += self.cfg.motion.height_offset
         root_pos[:, :2] += self.episode_init_origin[:, :2]
