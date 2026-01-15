@@ -74,4 +74,7 @@ TWIST2-clean/
 
 unitree_sdk2/
 
-twist2_demonstration/
+twist2_demonstration/legged_gym/motion_data_configs/
+*.jsonbackup
+*.jsonbackupo
+legged_gym/legged_gym/scripts/*.json
