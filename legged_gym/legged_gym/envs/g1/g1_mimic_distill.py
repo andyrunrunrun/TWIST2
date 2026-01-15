@@ -25,6 +25,16 @@ class G1MimicDistill(HumanoidMimic):
             self.total_env_steps_counter = 24 * 100000
             self.global_counter = 24 * 100000
 
+    def _scale_ref_root_pos_delta_local(self, motion_ids: torch.Tensor, root_pos_delta_local: torch.Tensor) -> torch.Tensor:
+        """
+        MotionLib's `root_pos_delta_local` is stored as per-motion-frame displacement (dt = 1/fps).
+        Scale it to per-env-step displacement so it matches `root_states - last_root_pos` (dt = self.dt).
+        """
+        # NOTE: MotionLib stores per-motion dt; each motion can have its own fps.
+        dt_motion = self._motion_lib._motion_dt[motion_ids].to(dtype=root_pos_delta_local.dtype)
+        scale = (float(self.dt) / dt_motion).unsqueeze(-1)
+        return root_pos_delta_local * scale
+
     def _reset_ref_motion(self, env_ids, motion_ids=None):
         n = len(env_ids)
         if motion_ids is None:
@@ -49,7 +59,7 @@ class G1MimicDistill(HumanoidMimic):
         self._ref_root_ang_vel[env_ids] = root_ang_vel
         self._ref_dof_pos[env_ids] = dof_pos
         self._ref_dof_vel[env_ids] = dof_vel
-        self._ref_root_pos_delta_local[env_ids] = root_pos_delta_local
+        self._ref_root_pos_delta_local[env_ids] = self._scale_ref_root_pos_delta_local(motion_ids, root_pos_delta_local)
         self._ref_root_rot_delta_local[env_ids] = root_rot_delta_local
         self._ref_body_pos[env_ids] = convert_to_global_root_body_pos(root_pos=root_pos, root_rot=root_rot, body_pos=body_pos)
     
@@ -69,7 +79,7 @@ class G1MimicDistill(HumanoidMimic):
         self._ref_root_ang_vel[:] = root_ang_vel
         self._ref_dof_pos[:] = dof_pos
         self._ref_dof_vel[:] = dof_vel
-        self._ref_root_pos_delta_local[:] = root_pos_delta_local
+        self._ref_root_pos_delta_local[:] = self._scale_ref_root_pos_delta_local(motion_ids, root_pos_delta_local)
         self._ref_root_rot_delta_local[:] = root_rot_delta_local
         self._ref_body_pos[:] = convert_to_global_root_body_pos(root_pos=root_pos, root_rot=root_rot, body_pos=body_pos)
         
