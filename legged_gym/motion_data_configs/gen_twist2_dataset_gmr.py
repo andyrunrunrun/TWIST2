@@ -9,7 +9,46 @@ python legged_gym/motion_data_configs/gen_twist2_dataset_from_scratch.py
 """
 
 ROOT_PATH = "/home/huanghao/source/datasets/gmr_retarget_x"
-OUTPUT_YAML = "/home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/test.yaml"
+OUTPUT_DIR = "/home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs"
+
+
+def generate_output_filename(selected_folders, special_weights, default_weight, total_count):
+    """
+    根据选择的文件夹和权重动态生成输出文件名
+    格式: folder1_weight1_folder2_weight2_..._总数.yaml
+    """
+    parts = []
+    for folder in selected_folders:
+        weight = special_weights.get(folder, default_weight)
+        # 使用简短的文件夹名（取前几个字符或缩写）
+        short_name = folder.replace("_g1_GMR_30fps", "").replace("_gmr_120fps", "")
+        parts.append(f"{short_name}_w{weight}")
+    
+    # 添加总数
+    parts.append(f"total{total_count}")
+    
+    filename = "_".join(parts) + ".yaml"
+    return os.path.join(OUTPUT_DIR, filename)
+
+# ============================================================
+# 手动配置要扫描的文件夹列表
+# 注释掉不需要的文件夹即可排除
+# ============================================================
+SELECTED_FOLDERS = [
+    "AAAaaaaaaaatest",           # 测试文件夹
+    "AMASS",                     # AMASS 数据集
+    "EgoBody_g1_GMR_30fps",      # EgoBody 数据集
+    # "MotionMillion_g1_GMR_30fps",  # MotionMillion 数据集
+    "OMOMO",                     # OMOMO 数据集
+    "inter_x_gmr_120fps",        # Inter-X 数据集 (120fps)
+    "interhuman",                # InterHuman 数据集
+    "lafan1",                    # LaFAN1 数据集
+    "twist1_to_twist2",          # TWIST1 转换数据
+    "twist2_pico_clean",         # TWIST2 Pico 清洗后数据
+    "twist2_pico_no_clean",      # TWIST2 Pico 未清洗数据
+    "v1_v2_v3_g1",               # V1/V2/V3 G1 数据
+]
+
 # 配置特殊目录及其对应的权重
 # 格式: {"目录名": 权重, ...}
 SPECIAL_WEIGHTS = {
@@ -20,17 +59,38 @@ SPECIAL_WEIGHTS = {
 DEFAULT_WEIGHT = 1
 
 
-def scan_pkl_files(root_path):
+def scan_pkl_files(root_path, selected_folders=None):
     """
-    递归扫描 root_path 下所有 .pkl 文件，返回相对于 root_path 的路径列表
+    扫描指定文件夹下所有 .pkl 文件，返回相对于 root_path 的路径列表
+    
+    Args:
+        root_path: 根目录路径
+        selected_folders: 要扫描的子文件夹列表，如果为 None 则扫描所有
     """
     pkl_files = []
-    for dirpath, dirnames, filenames in os.walk(root_path):
-        for filename in filenames:
-            if filename.endswith('.pkl'):
-                abs_path = os.path.join(dirpath, filename)
-                rel_path = os.path.relpath(abs_path, root_path)
-                pkl_files.append(rel_path)
+    
+    if selected_folders:
+        # 只扫描指定的文件夹
+        for folder in selected_folders:
+            folder_path = os.path.join(root_path, folder)
+            if not os.path.isdir(folder_path):
+                print(f"警告：文件夹不存在，已跳过: {folder}")
+                continue
+            for dirpath, dirnames, filenames in os.walk(folder_path):
+                for filename in filenames:
+                    if filename.endswith('.pkl'):
+                        abs_path = os.path.join(dirpath, filename)
+                        rel_path = os.path.relpath(abs_path, root_path)
+                        pkl_files.append(rel_path)
+    else:
+        # 扫描所有文件夹（原有逻辑）
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            for filename in filenames:
+                if filename.endswith('.pkl'):
+                    abs_path = os.path.join(dirpath, filename)
+                    rel_path = os.path.relpath(abs_path, root_path)
+                    pkl_files.append(rel_path)
+    
     return pkl_files
 
 
@@ -66,44 +126,63 @@ def generate_yaml_data(root_path, pkl_files):
 
 def main():
     print(f"正在扫描目录: {ROOT_PATH}")
+    print(f"已选择的文件夹: {SELECTED_FOLDERS}")
+    print()
     
     if not os.path.isdir(ROOT_PATH):
         print(f"错误：找不到目录 {ROOT_PATH}")
         return
     
-    # 扫描所有 pkl 文件
-    pkl_files = scan_pkl_files(ROOT_PATH)
+    # 扫描指定文件夹中的 pkl 文件
+    pkl_files = scan_pkl_files(ROOT_PATH, SELECTED_FOLDERS)
     print(f"找到 {len(pkl_files)} 个 .pkl 文件")
     
-    # 统计权重分布
-    stats = {k: 0 for k in SPECIAL_WEIGHTS.keys()}
-    stats['default'] = 0
+    # 按文件夹统计数量
+    folder_stats = {folder: 0 for folder in SELECTED_FOLDERS}
     
     for f in pkl_files:
-        path_segments = f.split(os.sep)
-        matched = False
-        for special_dir in SPECIAL_WEIGHTS.keys():
-            if special_dir in path_segments:
-                stats[special_dir] += 1
-                matched = True
-                break
-        if not matched:
-            stats['default'] += 1
-
-    for special_dir, count in stats.items():
-        if special_dir == 'default':
-            pass # 稍后打印
-        else:
-            weight = SPECIAL_WEIGHTS[special_dir]
-            print(f"  - {special_dir} 目录下: {count} 个 (权重={weight})")
-            
-    print(f"  - 其他目录: {stats['default']} 个 (权重={DEFAULT_WEIGHT})")
+        # 获取一级文件夹名称
+        top_folder = f.split(os.sep)[0]
+        if top_folder in folder_stats:
+            folder_stats[top_folder] += 1
+    
+    # 计算表格宽度
+    max_folder_len = max(len(folder) for folder in SELECTED_FOLDERS) if SELECTED_FOLDERS else 10
+    max_folder_len = max(max_folder_len, len("文件夹"))
+    
+    # 打印表格
+    print()
+    print("=" * (max_folder_len + 40))
+    print(f"{'文件夹':<{max_folder_len}} | {'数量':>8} | {'权重':>6} | {'占比':>8}")
+    print("-" * (max_folder_len + 40))
+    
+    total_count = 0
+    total_weighted = 0
+    
+    for folder in SELECTED_FOLDERS:
+        count = folder_stats.get(folder, 0)
+        weight = SPECIAL_WEIGHTS.get(folder, DEFAULT_WEIGHT)
+        total_count += count
+        total_weighted += count * weight
+    
+    for folder in SELECTED_FOLDERS:
+        count = folder_stats.get(folder, 0)
+        weight = SPECIAL_WEIGHTS.get(folder, DEFAULT_WEIGHT)
+        percent = (count / total_count * 100) if total_count > 0 else 0
+        print(f"{folder:<{max_folder_len}} | {count:>8} | {weight:>6} | {percent:>7.2f}%")
+    
+    print("-" * (max_folder_len + 40))
+    print(f"{'合计':<{max_folder_len}} | {total_count:>8} | {'-':>6} | {'100.00%':>8}")
+    print("=" * (max_folder_len + 40))
+    
+    # 生成输出文件名
+    output_yaml = generate_output_filename(SELECTED_FOLDERS, SPECIAL_WEIGHTS, DEFAULT_WEIGHT, total_count)
     
     # 生成 yaml 数据
     data = generate_yaml_data(ROOT_PATH, pkl_files)
     
     # 写入文件
-    with open(OUTPUT_YAML, 'w', encoding='utf-8') as f:
+    with open(output_yaml, 'w', encoding='utf-8') as f:
         yaml.dump(
             data,
             f,
@@ -112,7 +191,7 @@ def main():
             default_flow_style=False
         )
     
-    print(f"\n已生成配置文件: {OUTPUT_YAML}")
+    print(f"\n已生成配置文件: {output_yaml}")
     print(f"root_path: {ROOT_PATH}")
     print(f"总计 {len(pkl_files)} 个动作文件")
 
