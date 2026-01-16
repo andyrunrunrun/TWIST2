@@ -192,6 +192,10 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
     if env_cfg is not None:
         if args.teleop_mode:
             env_cfg.env.teleop_mode = True
+        if getattr(args, "gpu_cache", None) is not None:
+            # MotionLib GPU cache budget (GiB). Only applies to mimic tasks that have a `motion` cfg block.
+            if hasattr(env_cfg, "motion"):
+                setattr(env_cfg.motion, "gpu_cache_gib", float(args.gpu_cache))
         # num envs
         if args.num_envs is not None:
             env_cfg.env.num_envs = args.num_envs
@@ -294,6 +298,7 @@ def get_args():
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
         {"name": "--device", "type": str, "default": "cuda:0", "help": 'Device for sim, rl, and graphics'},
+        {"name": "--gpu_cache", "type": float, "default": 4.0, "help": "MotionLib VRAM cache budget per process (GiB)."},
 
         {"name": "--rows", "type": int, "help": "num_rows."},
         {"name": "--cols", "type": int, "help": "num_cols"},

@@ -99,7 +99,8 @@ class HumanoidMimic(HumanoidChar):
                                     max_motions=getattr(self.cfg.motion, "max_motions", -1),
                                     motion_ids=getattr(self.cfg.motion, "motion_ids", ""),
                                     shuffle_motions=getattr(self.cfg.motion, "shuffle_motions", False),
-                                    shuffle_seed=getattr(self.cfg.motion, "shuffle_seed", 0))
+                                    shuffle_seed=getattr(self.cfg.motion, "shuffle_seed", 0),
+                                    gpu_cache_gib=getattr(self.cfg.motion, "gpu_cache_gib", 4.0))
         return
     
     def _init_motion_buffers(self):
