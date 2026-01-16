@@ -41,6 +41,8 @@ from .g1.g1_mimic import G1Mimic
 from .g1.g1_mimic_distill import G1MimicDistill
 from .g1.g1_mimic_distill_config import G1MimicPrivCfg, G1MimicPrivCfgPPO, G1MimicStuCfg, G1MimicStuCfgDAgger
 from .g1.g1_mimic_distill_config import G1MimicStuRLCfg, G1MimicStuRLCfgDAgger
+from .g1.g1_mimic_distill_config import G1MimicPrivLimbWeightCfg, G1MimicPrivLimbWeightCfgPPO
+from .g1.g1_mimic_distill_config import G1MimicStuLimbWeightCfg, G1MimicStuLimbWeightCfgDAgger
 
 from .g1.g1_mimic_future import G1MimicFuture
 from .g1.g1_mimic_future_config import G1MimicStuFutureCfg, G1MimicStuFutureCfgDAgger
@@ -53,6 +55,7 @@ task_registry.register("g1_mimic", G1Mimic, G1MimicCfg(), G1MimicCfgPPO())
 task_registry.register("g1_stu_mimic", G1MimicDistill, G1MimicStuCfg(), G1MimicStuCfgDAgger())
 task_registry.register("g1_priv_mimic", G1MimicDistill, G1MimicPrivCfg(), G1MimicPrivCfgPPO())
 task_registry.register("g1_stu_rl", G1MimicDistill, G1MimicStuRLCfg(), G1MimicStuRLCfgDAgger())
+task_registry.register("g1_priv_mimic_limbw", G1MimicDistill, G1MimicPrivLimbWeightCfg(), G1MimicPrivLimbWeightCfgPPO())
+task_registry.register("g1_stu_mimic_limbw", G1MimicDistill, G1MimicStuLimbWeightCfg(), G1MimicStuLimbWeightCfgDAgger())
 task_registry.register("g1_stu_future", G1MimicFuture, G1MimicStuFutureCfg(), G1MimicStuFutureCfgDAgger())
-
 

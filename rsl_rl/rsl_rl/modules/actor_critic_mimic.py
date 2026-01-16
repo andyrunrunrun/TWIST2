@@ -258,6 +258,15 @@ class ActorCriticMimic(nn.Module):
     def if_fix_std(self):
         return self.fix_action_std
 
+
+class ActorCriticMimicLimbWeight(ActorCriticMimic):
+    """Alias class for limb-weight conditioned teacher policies.
+
+    Functionally identical to ActorCriticMimic; kept as a separate class name so configs can
+    explicitly select the limb-weight variant without touching the original teacher setup.
+    """
+    pass
+
 def get_activation(act_name):
     if act_name == "elu":
         return nn.ELU()

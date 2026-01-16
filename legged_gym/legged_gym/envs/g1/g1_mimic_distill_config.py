@@ -494,6 +494,41 @@ class G1MimicStuRLCfgDAgger(G1MimicStuRLCfg):
         activation = 'silu'
         layer_norm = True
         motion_latent_dim = 128
+
+
+class G1MimicPrivLimbWeightCfg(G1MimicPrivCfg):
+    class env(G1MimicPrivCfg.env):
+        use_limb_weights = True
+        limb_weights_dim = 4
+        limb_weights_fixed = None  # list/tuple[4] or "a,b,c,d" string
+
+        n_obs_single = G1MimicPrivCfg.env.n_obs_single + limb_weights_dim
+        n_priv_obs_single = G1MimicPrivCfg.env.n_priv_obs_single + limb_weights_dim
+        num_observations = n_priv_obs_single
+        num_privileged_obs = n_priv_obs_single
+
+
+class G1MimicPrivLimbWeightCfgPPO(G1MimicPrivCfgPPO):
+    class runner(G1MimicPrivCfgPPO.runner):
+        policy_class_name = 'ActorCriticMimicLimbWeight'
+
+
+class G1MimicStuLimbWeightCfg(G1MimicStuCfg):
+    class env(G1MimicStuCfg.env):
+        use_limb_weights = True
+        limb_weights_dim = 4
+        limb_weights_fixed = None  # list/tuple[4] or "a,b,c,d" string
+
+        n_obs_single = G1MimicStuCfg.env.n_obs_single + limb_weights_dim
+        num_observations = n_obs_single * (G1MimicPrivCfg.env.history_len + 1)
+
+        n_priv_obs_single = G1MimicPrivCfg.env.n_priv_obs_single + limb_weights_dim
+        num_privileged_obs = n_priv_obs_single
+
+
+class G1MimicStuLimbWeightCfgDAgger(G1MimicStuCfgDAgger):
+    class teachercfg(G1MimicPrivLimbWeightCfgPPO):
+        pass
         
 
 
