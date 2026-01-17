@@ -91,12 +91,16 @@ class MotionLib:
         self._body_link_list = []
         
         motion_files, motion_weights, hy_feat_files, hy_feat_dim, hy_feat_t = self._fetch_motion_files(motion_file)
-        self._hy_feat_files = [str(p) for p in hy_feat_files]
+        hy_feat_files = [str(p) for p in hy_feat_files]
         self._hy_feat_dim = int(hy_feat_dim)
         self._hy_feat_t = float(hy_feat_t)
+        self._hy_feat_files = []
         num_motion_files = len(motion_files)
         
         num_sub_motions_total = 0
+
+        if self._hy_feat_dim > 0 and self._motion_decompose:
+            raise ValueError("HY features are not supported with motion_decompose=True. Please disable motion_decompose.")
             
         for i in tqdm(range(num_motion_files), desc="[MotionLib] Loading motions"):
             if torch.rand(1) > self._sample_ratio and num_motion_files > 1:
@@ -149,6 +153,12 @@ class MotionLib:
             except Exception as e:
                 print(f"Error adding motion {curr_file}: {e}")
                 continue
+
+            # Keep HY feature file list aligned with successfully loaded motions (some motion files may be skipped).
+            if self._hy_feat_dim > 0:
+                self._hy_feat_files.append(hy_feat_files[i])
+            else:
+                self._hy_feat_files.append("")
             
             
             if self._motion_decompose:
