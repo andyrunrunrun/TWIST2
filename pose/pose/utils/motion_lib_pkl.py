@@ -1,4 +1,6 @@
 import os, pickle, yaml
+from pathlib import Path
+from itertools import islice
 import torch
 from pose.utils.torch_utils import quat_diff, quat_to_exp_map, slerp, euler_from_quaternion
 from tqdm import tqdm
@@ -32,6 +34,8 @@ class MotionLib:
                  shuffle_seed: int = 0,
                  store_on_cpu: bool = True, # keep dataset tensors on CPU, move slices to GPU on demand
                  gpu_cache_gib: float = 4.0, # cache active motions on GPU up to this budget (GiB); 0 disables
+                 # Optional HY-Motion single-stream feature support (loaded per motion on demand)
+                 hy_feat_cache_motions: int = 0,  # CPU LRU cache size (motions). 0 disables.
                  ):
         self._device = torch.device(device)
         self._store_on_cpu = bool(store_on_cpu)
@@ -51,6 +55,13 @@ class MotionLib:
         self._motion_ids_spec = str(motion_ids) if motion_ids is not None else ""
         self._shuffle_motions = bool(shuffle_motions)
         self._shuffle_seed = int(shuffle_seed) if shuffle_seed is not None else 0
+
+        # Optional HY-Motion single-stream features (.npz alongside a separate root).
+        self._hy_feat_files: List[str] = []
+        self._hy_feat_dim = 0
+        self._hy_feat_t = 1.0
+        self._hy_feat_cache_motions = int(hy_feat_cache_motions) if hy_feat_cache_motions is not None else 0
+        self._hy_feat_cache_cpu: "OrderedDict[int, torch.Tensor]" = OrderedDict()
         
         # load motions
         self._load_motions(motion_file)
@@ -79,7 +90,10 @@ class MotionLib:
         self._motion_local_body_pos = []
         self._body_link_list = []
         
-        motion_files, motion_weights = self._fetch_motion_files(motion_file)
+        motion_files, motion_weights, hy_feat_files, hy_feat_dim, hy_feat_t = self._fetch_motion_files(motion_file)
+        self._hy_feat_files = [str(p) for p in hy_feat_files]
+        self._hy_feat_dim = int(hy_feat_dim)
+        self._hy_feat_t = float(hy_feat_t)
         num_motion_files = len(motion_files)
         
         num_sub_motions_total = 0
@@ -265,7 +279,11 @@ class MotionLib:
         D = int(self._motion_dof_pos.shape[-1])
         B = int(self._motion_local_body_pos.shape[1])
         floats_per_frame = 19 + 2 * D + 3 * B
-        return int(floats_per_frame * 4)
+        bytes_per_frame = int(floats_per_frame * 4)
+        if self._hy_feat_dim > 0:
+            # HY features are cached as float16 to reduce VRAM pressure.
+            bytes_per_frame += int(self._hy_feat_dim * 2)
+        return bytes_per_frame
 
     def _init_gpu_cache(self) -> None:
         self._gpu_cache_enabled = (
@@ -304,6 +322,7 @@ class MotionLib:
         self._cache_local_body_pos = None
         self._cache_root_pos_delta_local = None
         self._cache_root_rot_delta_local = None
+        self._cache_hy_feat = None
 
     def _cache_is_initialized(self) -> bool:
         return self._cache_capacity_frames > 0
@@ -317,8 +336,8 @@ class MotionLib:
         D = int(self._motion_dof_pos.shape[-1])
         B = int(self._motion_local_body_pos.shape[1])
 
-        def alloc(shape_tail):
-            return torch.empty((new_capacity_frames, *shape_tail), device=self._device, dtype=torch.float32)
+        def alloc(shape_tail, *, dtype: torch.dtype = torch.float32):
+            return torch.empty((new_capacity_frames, *shape_tail), device=self._device, dtype=dtype)
 
         new_root_pos = alloc((3,))
         new_root_rot = alloc((4,))
@@ -329,6 +348,9 @@ class MotionLib:
         new_local_body_pos = alloc((B, 3))
         new_root_pos_delta_local = alloc((3,))
         new_root_rot_delta_local = alloc((3,))
+        new_hy_feat = None
+        if self._hy_feat_dim > 0:
+            new_hy_feat = alloc((int(self._hy_feat_dim),), dtype=torch.float16)
 
         if old_cap > 0:
             new_root_pos[:old_cap].copy_(self._cache_root_pos)
@@ -340,6 +362,8 @@ class MotionLib:
             new_local_body_pos[:old_cap].copy_(self._cache_local_body_pos)
             new_root_pos_delta_local[:old_cap].copy_(self._cache_root_pos_delta_local)
             new_root_rot_delta_local[:old_cap].copy_(self._cache_root_rot_delta_local)
+            if new_hy_feat is not None and self._cache_hy_feat is not None:
+                new_hy_feat[:old_cap].copy_(self._cache_hy_feat)
 
         self._cache_root_pos = new_root_pos
         self._cache_root_rot = new_root_rot
@@ -350,6 +374,8 @@ class MotionLib:
         self._cache_local_body_pos = new_local_body_pos
         self._cache_root_pos_delta_local = new_root_pos_delta_local
         self._cache_root_rot_delta_local = new_root_rot_delta_local
+        if new_hy_feat is not None:
+            self._cache_hy_feat = new_hy_feat
 
         self._cache_capacity_frames = new_capacity_frames
         self._cache_free_segment_add(old_cap, new_capacity_frames - old_cap)
@@ -456,6 +482,11 @@ class MotionLib:
         self._cache_local_body_pos[off:end_off].copy_(self._motion_local_body_pos[start:end], non_blocking=True)
         self._cache_root_pos_delta_local[off:end_off].copy_(self._motion_root_pos_delta_local[start:end], non_blocking=True)
         self._cache_root_rot_delta_local[off:end_off].copy_(self._motion_root_rot_delta_local[start:end], non_blocking=True)
+        if self._hy_feat_dim > 0:
+            hy = self._load_hy_feat_motion_cpu(motion_id, expected_len=length)
+            if hy is None:
+                raise RuntimeError(f"HY feature missing for motion_id={motion_id} file={self._motion_files[motion_id]!r}")
+            self._cache_hy_feat[off:end_off].copy_(hy, non_blocking=True)
 
         self._cache_meta[motion_id] = (off, length)
         self._cache_lru[motion_id] = None
@@ -621,11 +652,60 @@ class MotionLib:
         if motion_file.endswith(".yaml"):
             motion_files = []
             motion_weights = []
+            hy_feat_files: List[str] = []
+            hy_feat_dim = 0
+            hy_feat_t = 1.0
             with open(motion_file, "r") as f:
                 motion_config = yaml.load(f, Loader=yaml.SafeLoader)
             
-            motion_root_path = motion_config["root_path"]
-            motion_list = motion_config["motions"]
+            motion_root_path = os.path.expandvars(os.path.expanduser(str(motion_config["root_path"])))
+            hy_feat_root = motion_config.get("hy_feat_root", None)
+            if hy_feat_root is not None:
+                hy_feat_root = os.path.expandvars(os.path.expanduser(str(hy_feat_root)))
+            hy_feat_t = float(motion_config.get("hy_feat_t", 1.0))
+            hy_feat_dim = int(motion_config.get("hy_feat_dim", 1280 if hy_feat_root is not None else 0))
+            if hy_feat_root is None:
+                hy_feat_dim = 0
+
+            if bool(motion_config.get("auto_discover", False)):
+                pattern = str(motion_config.get("auto_discover_glob", "**/motion.pkl"))
+                weight = float(motion_config.get("auto_discover_weight", 1.0))
+                base = motion_root_path
+
+                base_path = Path(base)
+
+                def _iter_auto_files():
+                    # Fast deterministic scan for the common HYMotion layout: <id>/<seed>/motion.pkl.
+                    if pattern == "**/motion.pkl":
+                        try:
+                            first_level = [e for e in os.scandir(base_path) if e.is_dir()]
+                        except FileNotFoundError:
+                            return
+                        for e1 in sorted(first_level, key=lambda e: e.name):
+                            try:
+                                second_level = [e for e in os.scandir(e1.path) if e.is_dir()]
+                            except FileNotFoundError:
+                                continue
+                            for e2 in sorted(second_level, key=lambda e: e.name):
+                                p = Path(e2.path) / "motion.pkl"
+                                if p.is_file():
+                                    yield p
+                    else:
+                        yield from base_path.glob(pattern)
+
+                # Avoid enumerating the full dataset when only a small deterministic prefix is needed.
+                early_limit = None
+                if (pattern == "**/motion.pkl") and (self._max_motions > 0) and (not self._motion_ids_spec.strip()) and (not self._shuffle_motions):
+                    early_limit = self._max_motions
+
+                if early_limit is not None:
+                    files = [str(p) for p in islice(_iter_auto_files(), early_limit)]
+                else:
+                    files = sorted(str(p) for p in _iter_auto_files())
+
+                motion_list = [{"file": os.path.relpath(p, base), "weight": weight, "description": "auto"} for p in files]
+            else:
+                motion_list = motion_config["motions"]
 
             # Optional subset selection for faster visualization/debug.
             if self._motion_ids_spec.strip():
@@ -686,6 +766,16 @@ class MotionLib:
 
                 motion_weights.append(curr_weight)
                 motion_files.append(curr_file)
+                if hy_feat_root is not None:
+                    rel = Path(curr_file).relative_to(Path(motion_root_path))
+                    parts = rel.parts
+                    if len(parts) < 3:
+                        raise ValueError(f"Cannot derive HY feature path from motion file: {curr_file}")
+                    sample_id = parts[0]
+                    seed = parts[1]
+                    hy_feat_files.append(str(Path(hy_feat_root) / sample_id / seed / "single_stream_feat.npz"))
+                else:
+                    hy_feat_files.append("")
         else:
             curr_file = motion_file
             if curr_file.endswith(".pkl"):
@@ -694,8 +784,117 @@ class MotionLib:
                     curr_file = npz_file
             motion_files = [curr_file]
             motion_weights = [1.0]
+            hy_feat_files = [""]
+            hy_feat_dim = 0
+            hy_feat_t = 1.0
         
-        return motion_files, motion_weights
+        return motion_files, motion_weights, hy_feat_files, hy_feat_dim, hy_feat_t
+
+    def _load_hy_feat_motion_cpu(self, motion_id: int, *, expected_len: int) -> Optional[torch.Tensor]:
+        if self._hy_feat_dim <= 0:
+            return None
+        mid = int(motion_id)
+        if mid in self._hy_feat_cache_cpu:
+            self._hy_feat_cache_cpu.move_to_end(mid, last=True)
+            return self._hy_feat_cache_cpu[mid]
+
+        path = str(self._hy_feat_files[mid])
+        if not path or not os.path.exists(path):
+            return None
+
+        with np.load(path, allow_pickle=False) as z:
+            t_arr = z["t"].astype(np.float32)
+            feat = z["feat"]
+        if feat.ndim != 3:
+            raise ValueError(f"Expected feat.ndim==3 in {path}, got {feat.shape}")
+
+        # Select t=1.0 stream by default.
+        t_target = float(self._hy_feat_t)
+        idx = int(np.argmin(np.abs(t_arr - t_target)))
+        feat_sel = feat[idx]
+        if feat_sel.shape[-1] != int(self._hy_feat_dim):
+            raise ValueError(f"Unexpected HY feat dim in {path}: {feat_sel.shape} (expected last dim {self._hy_feat_dim})")
+        if feat_sel.shape[0] != int(expected_len):
+            raise ValueError(
+                f"HY feat length mismatch for motion_id={mid}: feat_T={feat_sel.shape[0]} expected={expected_len} file={path}"
+            )
+
+        out = torch.as_tensor(feat_sel, device="cpu", dtype=torch.float16)
+        if self._hy_feat_cache_motions > 0:
+            self._hy_feat_cache_cpu[mid] = out
+            self._hy_feat_cache_cpu.move_to_end(mid, last=True)
+            while len(self._hy_feat_cache_cpu) > int(self._hy_feat_cache_motions):
+                self._hy_feat_cache_cpu.popitem(last=False)
+        return out
+
+    def calc_hy_feat_frame(self, motion_ids: torch.Tensor, motion_times: torch.Tensor) -> torch.Tensor:
+        """Return HY-Motion single-stream feature at t≈hy_feat_t, interpolated to motion_times.
+
+        The feature files are expected to be aligned to the same per-motion frame grid as the motion data:
+          single_stream_feat.npz: feat[K, T, D] where T == num_frames of the motion.
+        """
+        if self._hy_feat_dim <= 0:
+            raise RuntimeError("HY features are not enabled for this MotionLib instance (hy_feat_dim==0).")
+        motion_ids = motion_ids.to(self._device)
+        motion_times = motion_times.to(self._device)
+
+        motion_loop_num = torch.floor(motion_times / self._motion_lengths[motion_ids])
+        motion_times = motion_times - motion_loop_num * self._motion_lengths[motion_ids]
+
+        _fi0, _fi1, fi0_local, fi1_local, blend = self._calc_frame_blend(motion_ids, motion_times)
+
+        n = int(motion_ids.shape[0])
+        D = int(self._hy_feat_dim)
+
+        feat0 = torch.empty((n, D), device=self._device, dtype=torch.float16)
+        feat1 = torch.empty((n, D), device=self._device, dtype=torch.float16)
+
+        use_cache = self._gpu_cache_enabled and (self._cache_hy_feat is not None)
+        if use_cache:
+            cache_off = self._cache_offset[motion_ids].to(torch.int64)
+            cached_mask = cache_off >= 0
+            if not bool(cached_mask.all()):
+                self.prefetch(motion_ids[cached_mask.logical_not()])
+                cache_off = self._cache_offset[motion_ids].to(torch.int64)
+                cached_mask = cache_off >= 0
+
+            if bool(cached_mask.any()):
+                idx = cached_mask.nonzero(as_tuple=False).flatten()
+                cache_off_c = cache_off[idx]
+                cache_idx0 = cache_off_c + fi0_local[idx].to(torch.int64)
+                cache_idx1 = cache_off_c + fi1_local[idx].to(torch.int64)
+                feat0[idx] = self._cache_hy_feat[cache_idx0]
+                feat1[idx] = self._cache_hy_feat[cache_idx1]
+
+            if bool(cached_mask.logical_not().any()):
+                # Fallback: load from disk + per-motion cache on demand.
+                idx = cached_mask.logical_not().nonzero(as_tuple=False).flatten()
+                for mid in motion_ids[idx].unique().tolist():
+                    mid = int(mid)
+                    mask = (motion_ids[idx] == mid).nonzero(as_tuple=False).flatten()
+                    ii = idx[mask]
+                    seq = self._load_hy_feat_motion_cpu(mid, expected_len=int(self._motion_num_frames_cpu[mid]))
+                    if seq is None:
+                        raise RuntimeError(f"HY feature missing for motion_id={mid} file={self._motion_files[mid]!r}")
+                    seq_dev = seq.to(self._device, dtype=torch.float16, non_blocking=False) if self._device.type == "cuda" else seq
+                    feat0[ii] = seq_dev[fi0_local[ii]]
+                    feat1[ii] = seq_dev[fi1_local[ii]]
+        else:
+            # No GPU cache: group by motion_id and use per-motion CPU LRU cache.
+            for mid in motion_ids.unique().tolist():
+                mid = int(mid)
+                idx = (motion_ids == mid).nonzero(as_tuple=False).flatten()
+                seq = self._load_hy_feat_motion_cpu(mid, expected_len=int(self._motion_num_frames_cpu[mid]))
+                if seq is None:
+                    raise RuntimeError(f"HY feature missing for motion_id={mid} file={self._motion_files[mid]!r}")
+                seq_dev = seq.to(self._device, dtype=torch.float16, non_blocking=False) if self._device.type == "cuda" else seq
+                feat0[idx] = seq_dev[fi0_local[idx]]
+                feat1[idx] = seq_dev[fi1_local[idx]]
+
+        # Interpolate in float32 for stability.
+        blend_f = blend.to(dtype=torch.float32).unsqueeze(-1)
+        out = (1.0 - blend_f) * feat0.to(dtype=torch.float32) + blend_f * feat1.to(dtype=torch.float32)
+        return out
 
     @staticmethod
     def _parse_index_spec(spec: str, n: int) -> List[int]:
