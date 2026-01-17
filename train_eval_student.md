@@ -99,11 +99,11 @@ CUDA_VISIBLE_DEVICES=0 python legged_gym/legged_gym/scripts/train.py \
 cd legged_gym/legged_gym/scripts
 
 python play.py \
-  --task g1_stu_future --proj_name g1_stu_future --exptid 0116_student \
+  --task g1_stu_future --proj_name g1_stu_future --exptid 0116_student_ddp \
   --device cuda:0 --num_envs 1 \
   --headless --record_video \
   --checkpoint -1 \
-  --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/twist2_dataset.yaml \
+  --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml \
   --motion.max_motions 8 --record_num_motions 8 --random
 ```
 
