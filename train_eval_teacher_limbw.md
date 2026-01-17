@@ -5,7 +5,7 @@
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 legged_gym/legged_gym/scripts/train.py \
     --task g1_priv_mimic_limbw \
     --proj_name g1_priv_mimic_limbw \
-    --exptid 0116_teacher \
+    --exptid 0116_teacher_limbw \
     --num_envs 4096 --max_iterations 100000 \
     --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml
 
@@ -32,35 +32,35 @@ CUDA_VISIBLE_DEVICES=5 python legged_gym/legged_gym/scripts/train.py \
 
 ```bash
 # teacher policy：5 个样本 × 4 组 weights => 20 段 clip 拼成一个视频
-python legged_gym/legged_gym/scripts/play_limbw_compare.py \
+cd legged_gym/legged_gym/scripts
+python play_limbw_compare.py \
     --task g1_priv_mimic_limbw \
     --proj_name g1_priv_mimic_limbw \
-    --exptid 0116_teacher \
-    --record_num_motions 5 \
+    --exptid 0116_teacher_limbw \
+    --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml \
+    --random \
+    --motion.max_motions 8 \
+    --record_num_motions 8 \
     --seed 123 \
     --limbw_cases_json '[[1,1,1,1],[1,0,0,0],[0,1,0,0],[0,0,1,0]]'
 
 # student policy（同样用法；替换 task/proj/exptid 为 student 的）
-python legged_gym/legged_gym/scripts/play_limbw_compare.py \
+cd legged_gym/legged_gym/scripts
+python play_limbw_compare.py \
     --task g1_stu_mimic_limbw \
     --proj_name g1_stu_mimic_limbw \
     --exptid <stu_exptid> \
-    --record_num_motions 5 \
+    --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml \
+    --random \
+    --motion.max_motions 8 \
+    --record_num_motions 8 \
     --seed 123 \
     --limbw_cases_json '[[1,1,1,1],[1,0,0,0],[0,1,0,0],[0,0,1,0]]'
-
-# 指定录哪些 motion（支持逗号与范围，如 0,3,10-20）
-python legged_gym/legged_gym/scripts/play_limbw_compare.py \
-    --task g1_priv_mimic_limbw \
-    --proj_name g1_priv_mimic_limbw \
-    --exptid 0116_teacher \
-    --record_motion_ids '0,1,2,3,4' \
-    --seed 123 \
-    --limbw_cases_json '[[1,1,1,1],[0,0,1,0]]'
 ```
 
 输出视频默认在：
 `legged_gym/logs/videos_retarget/<exptid>/<proj_name>-<exptid>-limbw_compare.mp4`（可用 `--record_video_name xxx.mp4` 改名）
 
 注：该脚本会强制开启录视频，需要可用的图形上下文（X/Wayland 或 `xvfb-run`），否则会报 “camera sensors unavailable”。
+
 
