@@ -1,0 +1,11 @@
+# HYMotion100k (HY-Motion -> GMR Unitree G1) motions (no HY features).
+#
+# Required env var:
+#   HY_HUMANOID_ROOT=/path/to/HY-Humanoid (this repo)
+#
+# Motion files are discovered automatically under root_path by glob.
+root_path: ${HY_HUMANOID_ROOT}/GMR/data/HYMotion100k_g1_GMR_30fps
+
+auto_discover: true
+auto_discover_glob: "**/motion.pkl"
+auto_discover_weight: 1.0

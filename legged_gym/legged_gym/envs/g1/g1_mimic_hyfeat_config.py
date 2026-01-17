@@ -6,33 +6,12 @@ from legged_gym import LEGGED_GYM_ROOT_DIR
 class G1HyMotion100kPrivCfg(G1MimicPrivCfg):
     """Teacher (privileged) config for HYMotion100k."""
 
-    class env(G1MimicPrivCfg.env):
-        # Include current frame (0) in privileged target steps so student can use tar_motion_steps=[0] without fallback.
-        tar_motion_steps_priv = [0] + list(G1MimicPrivCfg.env.tar_motion_steps_priv)
-
-        # Student-step list is not used for obs_type='priv' but keep it valid.
-        tar_motion_steps = [0]
-
-        # Recompute dims that depend on tar_motion_steps_priv.
-        n_priv_mimic_obs = len(tar_motion_steps_priv) * (21 + G1MimicPrivCfg.env.num_actions + 3 * 9)
-        n_mimic_obs_single = G1MimicPrivCfg.env.n_mimic_obs_single
-        n_mimic_obs = len(tar_motion_steps) * n_mimic_obs_single
-
-        n_obs_single = n_priv_mimic_obs + G1MimicPrivCfg.env.n_proprio + G1MimicPrivCfg.env.n_priv_info
-        n_priv_obs_single = n_obs_single
-
-        num_observations = n_priv_obs_single
-        num_privileged_obs = n_priv_obs_single
-
     class motion(G1MimicPrivCfg.motion):
-        # HYMotion100k GMR motions with HY single-stream features.
-        motion_file = f"{LEGGED_GYM_ROOT_DIR}/motion_data_configs/hymotion100k_g1_gmr_30fps.yaml"
+        # HYMotion100k GMR motions (no HY features needed for teacher).
+        motion_file = f"{LEGGED_GYM_ROOT_DIR}/motion_data_configs/hymotion100k_g1_gmr_30fps_no_feat.yaml"
         motion_curriculum = True
         motion_curriculum_gamma = 0.01
         motion_decompose = False
-
-        # MotionLib caches HY features per-motion on CPU (optional).
-        hy_feat_cache_motions = 1024
 
 
 class G1HyMotion100kPrivCfgPPO(G1MimicPrivCfgPPO):
@@ -61,7 +40,8 @@ class G1HyMotion100kStuHyFeatCfg(G1HyMotion100kPrivCfg):
     class env(G1HyMotion100kPrivCfg.env):
         obs_type = "student_hyfeat"
 
-        tar_motion_steps = [0]
+        # Match the default student target timing (1 step ahead).
+        tar_motion_steps = [1]
         n_mimic_obs_single = 6 + 29
         n_mimic_obs = len(tar_motion_steps) * n_mimic_obs_single
         n_proprio = G1MimicPrivCfg.env.n_proprio
@@ -70,6 +50,8 @@ class G1HyMotion100kStuHyFeatCfg(G1HyMotion100kPrivCfg):
         # HY single-stream feature settings (t=1.0 only).
         hy_feat_dim = 1280
         hy_feat_history_steps = G1MimicPrivCfg.env.history_len + 1
+        # Align feature timestamps with mimic targets: feature(t + 1*dt).
+        hy_feat_time_offset_steps = 1
 
         # Total student obs: (current + history) + feature_history
         num_observations = n_obs_single * (G1MimicPrivCfg.env.history_len + 1) + hy_feat_dim * hy_feat_history_steps
@@ -81,7 +63,11 @@ class G1HyMotion100kStuHyFeatCfg(G1HyMotion100kPrivCfg):
         mask_steps_per_iter = 24  # must match runner.num_steps_per_env
 
     class motion(G1HyMotion100kPrivCfg.motion):
-        pass
+        # Student needs HY feature paths enabled.
+        motion_file = f"{LEGGED_GYM_ROOT_DIR}/motion_data_configs/hymotion100k_g1_gmr_30fps.yaml"
+
+        # MotionLib caches HY features per-motion on CPU (optional).
+        hy_feat_cache_motions = 1024
 
 
 class G1HyMotion100kStuHyFeatCfgDAgger(G1HyMotion100kStuHyFeatCfg):

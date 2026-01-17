@@ -22,6 +22,7 @@ class G1MimicHyFeat(G1MimicDistill):
         self._hy_feat_history_steps = int(getattr(cfg.env, "hy_feat_history_steps", cfg.env.history_len + 1))
         if self._hy_feat_history_steps != int(cfg.env.history_len + 1):
             raise ValueError("Currently only supports hy_feat_history_steps == history_len + 1.")
+        self._hy_feat_time_offset_steps = int(getattr(cfg.env, "hy_feat_time_offset_steps", 0))
         self._hy_feat_history_buf = torch.zeros(
             (self.num_envs, int(cfg.env.history_len), int(self._hy_feat_dim)),
             device=self.device,
@@ -137,9 +138,10 @@ class G1MimicHyFeat(G1MimicDistill):
 
         # HY feature at current time (interpolated to env dt)
         motion_times = self._get_motion_times()
+        hy_feat_times = motion_times + float(self._hy_feat_time_offset_steps) * float(self.dt)
         if hasattr(self._motion_lib, "prefetch"):
             self._motion_lib.prefetch(self._motion_ids)
-        hy_feat = self._motion_lib.calc_hy_feat_frame(self._motion_ids, motion_times)
+        hy_feat = self._motion_lib.calc_hy_feat_frame(self._motion_ids, hy_feat_times)
         hy_feat = hy_feat.to(dtype=torch.float32)
 
         # Feature sequence: [history (len=H), current] -> (H+1, D)
