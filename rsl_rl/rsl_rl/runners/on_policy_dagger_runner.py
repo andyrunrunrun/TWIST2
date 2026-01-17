@@ -126,6 +126,17 @@ class OnPolicyDaggerRunner:
                                         num_history_steps=self.env.cfg.env.history_len,
                                         num_actions=self.env.num_actions,
                                         **self.policy_cfg).to(self.device)
+        elif "HyFeat" in self.cfg["policy_class_name"]:
+            actor_critic = policy_class(num_observations=self.env.num_obs,
+                                        num_critic_observations=self.env.num_privileged_obs,
+                                        num_motion_observations=self.env.cfg.env.n_mimic_obs,
+                                        num_motion_steps=len(self.env.cfg.env.tar_motion_steps),
+                                        num_priop_observations=self.env.cfg.env.n_proprio,
+                                        num_history_steps=self.env.cfg.env.history_len,
+                                        num_feature_dim=getattr(self.env.cfg.env, "hy_feat_dim", 0),
+                                        num_feature_steps=getattr(self.env.cfg.env, "hy_feat_history_steps", self.env.cfg.env.history_len + 1),
+                                        num_actions=self.env.num_actions,
+                                        **self.policy_cfg).to(self.device)
         elif "Future" in self.cfg["policy_class_name"]:
             actor_critic = policy_class(num_observations=self.env.num_obs,
                                         num_critic_observations=self.env.num_privileged_obs,
