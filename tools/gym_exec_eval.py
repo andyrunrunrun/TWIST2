@@ -13,6 +13,11 @@ written to CSV, including termination reason and basic tracking error metrics fr
 Policy sources:
 - --policy_type=runner (default): loads an RSL-RL checkpoint via task_registry.make_alg_runner()
 - --policy_type=onnx: runs a standalone ONNX policy on gym observations via onnxruntime
+
+
+python tools/gym_exec_eval.py --task g1_priv_mimic --proj_name g1_priv_mimic --resumeid 0106_teacher --checkpoint -1 \
+    --motion_yaml legged_gym/motion_data_configs/wbc_0117_230k.yaml --out_csv outputs/wbc_0117_230k_teacher0106_cpu_w64.csv \
+    --device cpu --headless --num_envs 1 --episode_length_s 300 --log_stride 200 --runner_backend onnx --workers 64 --mp_start_method spawn
 """
 
 from __future__ import annotations
@@ -779,307 +784,54 @@ def main() -> None:
     ap.add_argument("--no_rand", action="store_true")
     ap.add_argument("--episode_length_s", type=float, default=120.0)
     ap.add_argument("--log_stride", type=int, default=1)
+    ap.add_argument("--workers", type=int, default=1, help="Number of worker processes (IsaacGym per-process sharding)")
+    ap.add_argument("--mp_start_method", type=str, default="spawn", choices=["spawn", "fork", "forkserver"])
+    ap.add_argument("--no_merge", action="store_true", help="Do not merge worker CSVs; keep per-worker outputs in /tmp")
     args, _unknown = ap.parse_known_args()
 
-    if yaml is None:
-        raise RuntimeError("pyyaml is required")
+    if int(args.workers) <= 1:
+        _run_eval_single_process(args)
+        return
 
-    # IsaacGym should be imported before torch.
-    import isaacgym  # noqa: F401
-    from isaacgym import gymapi  # noqa: F401
-    import torch  # noqa: F401
+    if bool(args.append) or int(args.skip_motions) > 0:
+        raise ValueError("--append/--skip_motions are not supported with --workers > 1 (use output sharding instead).")
+    if int(args.num_shards) != 1 or int(args.shard_idx) != 0:
+        raise ValueError("With --workers > 1, do not set --num_shards/--shard_idx (they are controlled by workers).")
 
-    import legged_gym.envs  # noqa: F401
-    from legged_gym.gym_utils import task_registry
-    from legged_gym.gym_utils.helpers import get_args as get_legged_gym_args
+    if str(args.device).startswith("cuda") and int(args.workers) > 1:
+        print("[warn] --workers > 1 on a single GPU can be unstable in IsaacGym; prefer one process per GPU.", flush=True)
 
-    gym_args = get_legged_gym_args()
-    # In this repo, `--no_rand` also rewrites cfg_train.runner.policy_class_name to non-mimic defaults.
-    # We control eval determinism via env_cfg overrides below.
-    try:
-        gym_args.no_rand = False
-    except Exception:
-        pass
+    import multiprocessing as mp
 
-    mmdd = time.strftime("%m%d", time.localtime())
-    tmp_dir = Path(f"/tmp/codex-{mmdd}-gym-exec-eval")
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    ctx = mp.get_context(str(args.mp_start_method))
+    tmp_dir = _default_tmp_dir()
+    # Avoid collisions between different runs on the same day.
+    run_key = hashlib.sha1(repr(sorted(vars(args).items())).encode("utf-8")).hexdigest()[:10]
+    run_dir = tmp_dir / f"mp_{run_key}"
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    root_path, motions = _select_motions_from_yaml(
-        Path(args.motion_yaml),
-        motion_ids=str(args.motion_ids),
-        max_motions=int(args.max_motions),
-        shuffle=bool(args.shuffle),
-        shuffle_seed=int(args.shuffle_seed),
-        shard_idx=int(args.shard_idx),
-        num_shards=int(args.num_shards),
-    )
-    if not motions:
-        raise RuntimeError("No motions selected; check --motion_ids/--max_motions/--shard_idx/--num_shards.")
+    args_dict = dict(vars(args))
+    args_dict["append"] = False
+    args_dict["skip_motions"] = 0
+    args_dict["workers"] = 1
 
-    subset_yaml = tmp_dir / f"subset_{Path(args.motion_yaml).stem}_n{len(motions)}_sh{args.shard_idx}of{args.num_shards}.yaml"
-    _write_subset_yaml(root_path=root_path, motions=motions, out_path=subset_yaml)
+    jobs: list[tuple[dict[str, Any], int, int, str]] = []
+    worker_csvs: list[Path] = []
+    for wi in range(int(args.workers)):
+        p = run_dir / f"worker_{wi}_of_{int(args.workers)}.csv"
+        worker_csvs.append(p)
+        jobs.append((args_dict, wi, int(args.workers), str(p)))
 
-    env_cfg, train_cfg = task_registry.get_cfgs(name=str(args.task))
-    env_cfg.env.num_envs = int(args.num_envs)
-    env_cfg.env.debug_viz = False
-    env_cfg.env.episode_length_s = float(args.episode_length_s)
-    env_cfg.env.record_video = False
-    env_cfg.env.rand_reset = False
+    with ctx.Pool(processes=int(args.workers)) as pool:
+        pool.starmap(_worker_entry, jobs)
 
-    if hasattr(env_cfg, "noise"):
-        env_cfg.noise.add_noise = False
-    if hasattr(env_cfg, "domain_rand"):
-        try:
-            env_cfg.domain_rand.domain_rand_general = False
-        except Exception:
-            pass
-
-    if hasattr(env_cfg, "motion"):
-        env_cfg.motion.motion_curriculum = False
-        env_cfg.motion.motion_file = str(subset_yaml)
-        env_cfg.motion.max_motions = -1
-        env_cfg.motion.motion_ids = ""
-        env_cfg.motion.shuffle_motions = False
-
-    train_cfg.runner.resume = True
-    env, _ = task_registry.make_env(name=str(args.task), args=gym_args, env_cfg=env_cfg)
-    _install_reset_reason_trace(env)
-
-    policy_type = str(args.policy_type).strip().lower()
-    normalizer = None
-    infer_actions: Callable[[Any], Any]
-    if policy_type == "runner":
-        ppo_runner, train_cfg = task_registry.make_alg_runner(
-            log_root="default", env=env, name=str(args.task), args=gym_args, train_cfg=train_cfg
-        )
-        policy = ppo_runner.get_inference_policy(device=env.device)
-        if getattr(env_cfg.env, "normalize_obs", False):
-            try:
-                normalizer = ppo_runner.get_normalizer(device=env.device)
-            except Exception:
-                normalizer = None
-
-        runner_backend = str(args.runner_backend).strip().lower()
-        if runner_backend not in {"onnx", "torch"}:
-            raise ValueError(f"Unsupported --runner_backend={args.runner_backend!r}")
-
-        if runner_backend == "torch":
-            def infer_actions(obs_in):
-                return _call_policy(policy, obs_in, hist_encoding=True)
-        else:
-            # Export ckpt -> ONNX once, then run onnxruntime for faster inference.
-            ckpt_path = _resolve_ckpt_path(proj_name=str(args.proj_name), resumeid=str(args.resumeid), checkpoint=int(args.checkpoint))
-
-            cache_dir = _default_ckpt_to_onnx_cache_dir() if not str(args.onnx_cache_dir).strip() else Path(args.onnx_cache_dir).expanduser().resolve()
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            st = ckpt_path.stat()
-            include_norm_pref = bool(args.onnx_include_normalizer) or (normalizer is not None)
-
-            def _cache_path(norm_flag: bool) -> Path:
-                key = f"{ckpt_path}:{st.st_size}:{getattr(st, 'st_mtime_ns', int(st.st_mtime*1e9))}:{int(args.onnx_opset)}:norm{int(norm_flag)}"
-                h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
-                return cache_dir / f"{ckpt_path.stem}-{h}.onnx"
-
-            out_onnx = _cache_path(include_norm_pref)
-
-            def _use_onnx(path: Path, *, baked_normalizer: bool) -> None:
-                nonlocal normalizer, infer_actions
-                if baked_normalizer:
-                    normalizer = None
-                infer_onnx = _make_onnx_policy(str(path), device=str(args.device))
-
-                def _infer(obs_in):
-                    return infer_onnx(obs_in)
-
-                infer_actions = _infer
-
-            if out_onnx.exists():
-                _use_onnx(out_onnx, baked_normalizer=include_norm_pref)
-            else:
-                # First try exporting with normalizer if requested/available.
-                try:
-                    _export_actor_critic_to_onnx(
-                        actor_critic=ppo_runner.alg.actor_critic,
-                        normalizer=normalizer,
-                        out_path=out_onnx,
-                        opset=int(args.onnx_opset),
-                        include_normalizer=include_norm_pref,
-                        obs_dim=int(env.num_obs),
-                    )
-                except Exception as e:
-                    # Retry exporting without normalizer (keep python-side normalizer).
-                    if include_norm_pref and (normalizer is not None):
-                        out_onnx2 = _cache_path(False)
-                        try:
-                            _export_actor_critic_to_onnx(
-                                actor_critic=ppo_runner.alg.actor_critic,
-                                normalizer=None,
-                                out_path=out_onnx2,
-                                opset=int(args.onnx_opset),
-                                include_normalizer=False,
-                                obs_dim=int(env.num_obs),
-                            )
-                        except Exception as e2:
-                            print(f"[warn] ONNX export failed ({type(e2).__name__}: {e2}); falling back to torch policy.", flush=True)
-
-                            def infer_actions(obs_in):
-                                return _call_policy(policy, obs_in, hist_encoding=True)
-                        else:
-                            _use_onnx(out_onnx2, baked_normalizer=False)
-                    else:
-                        print(f"[warn] ONNX export failed ({type(e).__name__}: {e}); falling back to torch policy.", flush=True)
-
-                        def infer_actions(obs_in):
-                            return _call_policy(policy, obs_in, hist_encoding=True)
-                else:
-                    _use_onnx(out_onnx, baked_normalizer=include_norm_pref)
-
-    else:
-        if not str(args.onnx_path).strip():
-            raise ValueError("--onnx_path is required when --policy_type=onnx")
-        infer_onnx = _make_onnx_policy(str(args.onnx_path), device=str(args.device))
-
-        def infer_actions(obs_in):
-            return infer_onnx(obs_in)
+    if bool(args.no_merge):
+        print(f"[done] worker_csvs={[str(p) for p in worker_csvs]}", flush=True)
+        return
 
     out_csv = Path(args.out_csv).expanduser().resolve()
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    mode = "a" if bool(args.append) else "w"
-    write_header = (mode == "w") or (not out_csv.exists()) or (out_csv.stat().st_size == 0)
-
-    fieldnames = [
-        "motion_idx_original",
-        "motion_id_loaded",
-        "motion_relpath",
-        "status",
-        "done_reason",
-        "done_time_s",
-        "motion_len_s",
-        "progress",
-        "wall_time_s",
-        "steps_exec",
-        "err_root_pos_l2_mean",
-        "err_root_rot_deg_mean",
-        "err_dof_pos_l2_mean",
-        "err_dof_vel_l2_mean",
-        "err_keybody_pos_l1_mean",
-        "error",
-    ]
-
-    log_stride = max(1, int(args.log_stride))
-    print(f"[{_now()}] selected_motions={len(motions)} env_dt={float(env.dt):.4f}s log_stride={log_stride}", flush=True)
-
-    with open(out_csv, mode, newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
-            w.writeheader()
-
-        for local_id, m in enumerate(motions):
-            if int(args.skip_motions) > 0 and int(local_id) < int(args.skip_motions):
-                continue
-            row: dict[str, Any] = {
-                "motion_idx_original": int(m.original_idx),
-                "motion_id_loaded": int(local_id),
-                "motion_relpath": str(m.relpath),
-            }
-            try:
-                t_wall0 = time.perf_counter()
-                env_ids = torch.arange(env.num_envs, device=env.device)
-                motion_id_tensor = torch.full((env.num_envs,), int(local_id), device=env.device, dtype=torch.long)
-                env.reset_idx(env_ids, motion_ids=motion_id_tensor)
-                obs = _refresh_obs(env)
-
-                motion_len_s = float(env._motion_lib.get_motion_length(motion_id_tensor[:1]).item())
-                max_steps = max(1, int(math.ceil(motion_len_s / float(env.dt))))
-                steps_exec = 0
-
-                n_log = 0
-                sum_root_pos = 0.0
-                sum_root_rot_deg = 0.0
-                sum_dof_pos = 0.0
-                sum_dof_vel = 0.0
-                sum_keybody = 0.0
-                done_reason = ""
-                done_time_s = float("nan")
-
-                for step in range(max_steps):
-                    steps_exec = step + 1
-                    if normalizer is not None:
-                        obs_in = normalizer.normalize(obs.detach())
-                    else:
-                        obs_in = obs.detach()
-                    actions = infer_actions(obs_in)
-                    step_out = env.step(actions.detach())
-                    obs = step_out[0]
-                    dones = step_out[3]
-
-                    if (step % log_stride) == 0:
-                        log = env.get_episode_log(env_ids=0)
-                        if "err_root_pos_l2" in log:
-                            sum_root_pos += float(log["err_root_pos_l2"])
-                        if "err_root_rot_rad" in log:
-                            sum_root_rot_deg += float(log["err_root_rot_rad"]) * 180.0 / math.pi
-                        if "err_dof_pos_l2" in log:
-                            sum_dof_pos += float(log["err_dof_pos_l2"])
-                        if "err_dof_vel_l2" in log:
-                            sum_dof_vel += float(log["err_dof_vel_l2"])
-                        if "err_keybody_pos_l1" in log:
-                            sum_keybody += float(log["err_keybody_pos_l1"])
-                        n_log += 1
-
-                    if bool(dones[0].item()):
-                        done_reason = str(getattr(env, "_exec_eval_last_reason", [""])[0])  # type: ignore[attr-defined]
-                        done_time_s = float(getattr(env, "_exec_eval_last_time_s", [float("nan")])[0])  # type: ignore[attr-defined]
-                        break
-
-                if not done_reason:
-                    done_reason = "unknown"
-                progress = float(done_time_s / motion_len_s) if (motion_len_s > 0 and math.isfinite(done_time_s)) else float("nan")
-                status = "ok" if done_reason == "motion_end" else "fail"
-                wall_time_s = float(time.perf_counter() - t_wall0)
-
-                row.update(
-                    {
-                        "status": status,
-                        "done_reason": done_reason,
-                        "done_time_s": float(done_time_s),
-                        "motion_len_s": float(motion_len_s),
-                        "progress": float(progress),
-                        "wall_time_s": float(wall_time_s),
-                        "steps_exec": int(steps_exec),
-                        "err_root_pos_l2_mean": float(sum_root_pos / max(1, n_log)),
-                        "err_root_rot_deg_mean": float(sum_root_rot_deg / max(1, n_log)),
-                        "err_dof_pos_l2_mean": float(sum_dof_pos / max(1, n_log)),
-                        "err_dof_vel_l2_mean": float(sum_dof_vel / max(1, n_log)),
-                        "err_keybody_pos_l1_mean": float(sum_keybody / max(1, n_log)),
-                        "error": "",
-                    }
-                )
-            except Exception as e:
-                row.update(
-                    {
-                        "status": "error",
-                        "done_reason": "",
-                        "done_time_s": float("nan"),
-                        "motion_len_s": float("nan"),
-                        "progress": float("nan"),
-                        "wall_time_s": float("nan"),
-                        "steps_exec": int(0),
-                        "err_root_pos_l2_mean": float("nan"),
-                        "err_root_rot_deg_mean": float("nan"),
-                        "err_dof_pos_l2_mean": float("nan"),
-                        "err_dof_vel_l2_mean": float("nan"),
-                        "err_keybody_pos_l1_mean": float("nan"),
-                        "error": f"{type(e).__name__}: {e}",
-                    }
-                )
-
-            w.writerow({k: row.get(k) for k in fieldnames})
-            if ((local_id + 1) % 10) == 0:
-                print(f"[{_now()}] processed={local_id+1}/{len(motions)}", flush=True)
-
-    print(f"[done] out_csv={out_csv}")
+    _merge_csvs(inputs=worker_csvs, out_csv=out_csv)
+    print(f"[done] out_csv={out_csv} (merged {len(worker_csvs)} workers)", flush=True)
 
 
 if __name__ == "__main__":
