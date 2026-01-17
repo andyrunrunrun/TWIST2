@@ -1,4 +1,4 @@
-import os, pickle, yaml
+import os, pickle, struct, warnings, yaml
 from pathlib import Path
 from itertools import islice
 import torch
@@ -8,6 +8,8 @@ from pose.utils.isaacgym_torch_utils import quat_rotate_inverse, quat_mul, quat_
 import numpy as np
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
+
+_WARNED_TRUNCATED_PICKLE = False
 
 def smooth(x, box_pts, device):
     box = torch.ones(box_pts, device=device) / box_pts
@@ -559,8 +561,46 @@ class MotionLib:
     def _load_motion_data(self, path: str):
         if path.endswith(".npz"):
             return self._load_motion_npz(path)
+        try:
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        except pickle.UnpicklingError as e:
+            msg = str(e)
+            if "pickle data was truncated" not in msg:
+                raise
+
+        # Some GMR-generated motion.pkl files were observed to be missing the final STOP opcode
+        # (exactly 1 byte shorter than the PROTO5 FRAME length). Repair in-memory on the fly.
         with open(path, "rb") as f:
-            return pickle.load(f)
+            data = f.read()
+        repaired = self._repair_proto5_frame_missing_stop(data, path=path)
+        return pickle.loads(repaired)
+
+    @staticmethod
+    def _repair_proto5_frame_missing_stop(data: bytes, *, path: str) -> bytes:
+        """Repair a PROTO5+FRAME pickle missing exactly the final STOP byte ('.').
+
+        Raises ValueError if the blob does not match the expected pattern.
+        """
+        if len(data) < 11:
+            raise ValueError(f"Pickle too short to repair: {path} (size={len(data)})")
+        if not (data[0] == 0x80 and data[1] == 0x05 and data[2] == 0x95):
+            raise ValueError(f"Unsupported pickle header (expected PROTO5+FRAME): {path}")
+        frame_len = struct.unpack("<Q", data[3:11])[0]
+        expected_size = 11 + int(frame_len)
+        if len(data) == expected_size - 1:
+            global _WARNED_TRUNCATED_PICKLE
+            if not _WARNED_TRUNCATED_PICKLE:
+                warnings.warn(
+                    f"[MotionLib] Detected truncated pickle missing STOP; repairing in-memory (example: {path}). "
+                    "Consider regenerating the dataset to avoid this overhead.",
+                    RuntimeWarning,
+                )
+                _WARNED_TRUNCATED_PICKLE = True
+            return data + b"."
+        raise ValueError(
+            f"Cannot repair pickle: {path} (size={len(data)} expected={expected_size} diff={len(data)-expected_size})"
+        )
 
     @staticmethod
     def _finite_difference(x: torch.Tensor, dt: float) -> torch.Tensor:
