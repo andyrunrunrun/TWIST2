@@ -47,6 +47,14 @@ from .g1.g1_mimic_distill_config import G1MimicStuLimbWeightCfg, G1MimicStuLimbW
 from .g1.g1_mimic_future import G1MimicFuture
 from .g1.g1_mimic_future_config import G1MimicStuFutureCfg, G1MimicStuFutureCfgDAgger
 
+from .g1.g1_mimic_hyfeat import G1MimicHyFeat
+from .g1.g1_mimic_hyfeat_config import (
+    G1HyMotion100kPrivCfg,
+    G1HyMotion100kPrivCfgPPO,
+    G1HyMotion100kStuHyFeatCfg,
+    G1HyMotion100kStuHyFeatCfgDAgger,
+)
+
 from legged_gym.gym_utils.task_registry import task_registry
 
 
@@ -59,3 +67,6 @@ task_registry.register("g1_priv_mimic_limbw", G1MimicDistill, G1MimicPrivLimbWei
 task_registry.register("g1_stu_mimic_limbw", G1MimicDistill, G1MimicStuLimbWeightCfg(), G1MimicStuLimbWeightCfgDAgger())
 task_registry.register("g1_stu_future", G1MimicFuture, G1MimicStuFutureCfg(), G1MimicStuFutureCfgDAgger())
 
+# HYMotion100k (HY features + curriculum masking on mimic_obs)
+task_registry.register("g1_priv_hymotion100k", G1MimicHyFeat, G1HyMotion100kPrivCfg(), G1HyMotion100kPrivCfgPPO())
+task_registry.register("g1_stu_hymotion100k_hyfeat", G1MimicHyFeat, G1HyMotion100kStuHyFeatCfg(), G1HyMotion100kStuHyFeatCfgDAgger())
