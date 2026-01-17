@@ -14,11 +14,20 @@ from typing import List, Optional, Sequence
 
 import faulthandler
 import numpy as np
-import torch
 from termcolor import cprint
 from tqdm import tqdm
 
+# Isaac Gym requires importing isaacgym modules before torch. Some environments preload torch
+# (e.g., via sitecustomize/usercustomize). If that happened, drop torch from sys.modules so
+# isaacgym can import cleanly, then import torch afterwards.
+if "torch" in sys.modules:
+    for _k in list(sys.modules.keys()):
+        if _k == "torch" or _k.startswith("torch."):
+            del sys.modules[_k]
+
 from isaacgym.torch_utils import quat_rotate, quat_rotate_inverse
+
+import torch
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs import *  # noqa: F401,F403
@@ -358,4 +367,3 @@ if __name__ == "__main__":
     args = get_args()
     base_seed = int(getattr(args, "seed", 0) or 0)
     play_limbw_compare(args, limbw_cases=limbw_cases, base_seed=base_seed)
-
