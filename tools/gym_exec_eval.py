@@ -18,13 +18,15 @@ Policy sources:
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import math
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -228,8 +230,9 @@ def _make_onnx_policy(onnx_path: str, *, device: str):
     except Exception as e:  # pragma: no cover
         raise RuntimeError(f"onnxruntime is required for --policy_type onnx: {type(e).__name__}: {e}") from e
 
-    device = str(device)
+    device = str(device).strip().lower()
     device_id = 0
+    use_cuda = device.startswith("cuda")
     if device.startswith("cuda:"):
         try:
             device_id = int(device.split(":", 1)[1])
@@ -238,7 +241,7 @@ def _make_onnx_policy(onnx_path: str, *, device: str):
 
     providers = []
     available = ort.get_available_providers()
-    if "CUDAExecutionProvider" in available:
+    if use_cuda and "CUDAExecutionProvider" in available:
         providers.append(("CUDAExecutionProvider", {"device_id": int(device_id)}))
     providers.append("CPUExecutionProvider")
 
@@ -271,6 +274,474 @@ def _make_onnx_policy(onnx_path: str, *, device: str):
     return _infer
 
 
+def _default_ckpt_to_onnx_cache_dir() -> Path:
+    mmdd = time.strftime("%m%d", time.localtime())
+    return Path(f"/tmp/codex-{mmdd}-gym-pt-to-onnx")
+
+def _default_tmp_dir() -> Path:
+    mmdd = time.strftime("%m%d", time.localtime())
+    return Path(f"/tmp/codex-{mmdd}-gym-exec-eval")
+
+
+def _resolve_ckpt_path(*, proj_name: str, resumeid: str, checkpoint: int) -> Path:
+    from legged_gym import LEGGED_GYM_ROOT_DIR
+    from legged_gym.gym_utils.helpers import get_load_path
+
+    if not str(resumeid).strip():
+        raise ValueError("--resumeid is required to resolve the checkpoint path for ONNX export")
+    root = Path(LEGGED_GYM_ROOT_DIR) / "logs" / str(proj_name) / str(resumeid)
+    ckpt = Path(get_load_path(str(root), checkpoint=int(checkpoint))).expanduser().resolve()
+    if not ckpt.exists():
+        raise FileNotFoundError(ckpt)
+    return ckpt
+
+
+def _acquire_lock(lock_path: Path, *, timeout_s: float = 600.0, poll_s: float = 0.2) -> int:
+    """
+    Cross-process lock using an exclusive lock file.
+    Returns an fd that must be closed by _release_lock().
+    """
+    lock_path = Path(lock_path).expanduser().resolve()
+    t0 = time.time()
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+            try:
+                os.write(fd, str(os.getpid()).encode("utf-8"))
+            except Exception:
+                pass
+            return fd
+        except FileExistsError:
+            if (time.time() - t0) > float(timeout_s):
+                raise TimeoutError(f"Timed out waiting for lock: {lock_path}")
+            time.sleep(float(poll_s))
+
+
+def _release_lock(fd: int, lock_path: Path) -> None:
+    try:
+        os.close(fd)
+    finally:
+        try:
+            Path(lock_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _export_actor_critic_to_onnx(
+    *,
+    actor_critic,
+    normalizer,
+    out_path: Path,
+    opset: int,
+    include_normalizer: bool,
+    obs_dim: int,
+) -> None:
+    import torch
+
+    ac = copy.deepcopy(actor_critic).to("cpu").eval()
+    n = None
+    if include_normalizer and (normalizer is not None):
+        try:
+            n = copy.deepcopy(normalizer).to("cpu").eval()
+        except Exception:
+            n = None
+
+    class _Wrapper(torch.nn.Module):
+        def __init__(self, ac0, n0):
+            super().__init__()
+            self.ac = ac0
+            self.n = n0
+
+        def forward(self, obs: torch.Tensor) -> torch.Tensor:
+            x = obs
+            if self.n is not None:
+                x = self.n.normalize(x)
+            # act_inference signature varies; always request eval=True (deterministic mean).
+            try:
+                return self.ac.act_inference(x, eval=True, hist_encoding=True)
+            except TypeError:
+                try:
+                    return self.ac.act_inference(x, eval=True)
+                except TypeError:
+                    return self.ac.act_inference(x)
+
+    wrapper = _Wrapper(ac, n).eval()
+
+    dummy = torch.zeros((1, int(obs_dim)), dtype=torch.float32)
+    out_path = Path(out_path).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Avoid race conditions when multiple workers export the same ckpt simultaneously.
+    lock_path = out_path.with_suffix(out_path.suffix + ".lock")
+    tmp_path = out_path.with_suffix(out_path.suffix + f".tmp.{os.getpid()}")
+    fd = _acquire_lock(lock_path)
+    try:
+        if out_path.exists():
+            return
+        torch.onnx.export(
+            wrapper,
+            dummy,
+            str(tmp_path),
+            opset_version=int(opset),
+            input_names=["obs"],
+            output_names=["actions"],
+            dynamic_axes={"obs": {0: "batch"}, "actions": {0: "batch"}},
+        )
+        os.replace(str(tmp_path), str(out_path))
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        _release_lock(fd, lock_path)
+
+
+def _merge_csvs(*, inputs: list[Path], out_csv: Path) -> None:
+    rows: list[dict[str, str]] = []
+    fieldnames: list[str] | None = None
+    for p in inputs:
+        with open(p, "r", encoding="utf-8", newline="") as f:
+            r = csv.DictReader(f)
+            if fieldnames is None:
+                fieldnames = list(r.fieldnames or [])
+            for row in r:
+                rows.append(dict(row))
+    if fieldnames is None:
+        raise RuntimeError("No input CSVs to merge")
+
+    def _k(d: dict[str, str]):
+        try:
+            return (int(d.get("motion_idx_original", "0")), d.get("motion_relpath", ""))
+        except Exception:
+            return (0, d.get("motion_relpath", ""))
+
+    rows.sort(key=_k)
+    out_csv = Path(out_csv).expanduser().resolve()
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_csv, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def _worker_entry(args_dict: dict[str, Any], shard_idx: int, num_shards: int, out_csv: str) -> str:
+    args = argparse.Namespace(**args_dict)
+    args.shard_idx = int(shard_idx)
+    args.num_shards = int(num_shards)
+    args.out_csv = str(out_csv)
+    args.append = False
+    args.skip_motions = 0
+    _run_eval_single_process(args)
+    return str(out_csv)
+
+
+def _run_eval_single_process(args: argparse.Namespace) -> None:
+    if yaml is None:
+        raise RuntimeError("pyyaml is required")
+
+    # IsaacGym should be imported before torch.
+    import isaacgym  # noqa: F401
+    from isaacgym import gymapi  # noqa: F401
+    import torch  # noqa: F401
+
+    import legged_gym.envs  # noqa: F401
+    from legged_gym.gym_utils import task_registry
+    from legged_gym.gym_utils.helpers import get_args as get_legged_gym_args
+
+    gym_args = get_legged_gym_args()
+    # In this repo, `--no_rand` also rewrites cfg_train.runner.policy_class_name to non-mimic defaults.
+    # We control eval determinism via env_cfg overrides below.
+    try:
+        gym_args.no_rand = False
+    except Exception:
+        pass
+
+    tmp_dir = _default_tmp_dir()
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    root_path, motions = _select_motions_from_yaml(
+        Path(args.motion_yaml),
+        motion_ids=str(args.motion_ids),
+        max_motions=int(args.max_motions),
+        shuffle=bool(args.shuffle),
+        shuffle_seed=int(args.shuffle_seed),
+        shard_idx=int(args.shard_idx),
+        num_shards=int(args.num_shards),
+    )
+    if not motions:
+        raise RuntimeError("No motions selected; check --motion_ids/--max_motions/--shard_idx/--num_shards.")
+
+    subset_yaml = tmp_dir / f"subset_{Path(args.motion_yaml).stem}_n{len(motions)}_sh{args.shard_idx}of{args.num_shards}.yaml"
+    _write_subset_yaml(root_path=root_path, motions=motions, out_path=subset_yaml)
+
+    env_cfg, train_cfg = task_registry.get_cfgs(name=str(args.task))
+    env_cfg.env.num_envs = int(args.num_envs)
+    env_cfg.env.debug_viz = False
+    env_cfg.env.episode_length_s = float(args.episode_length_s)
+    env_cfg.env.record_video = False
+    env_cfg.env.rand_reset = False
+
+    if hasattr(env_cfg, "noise"):
+        env_cfg.noise.add_noise = False
+    if hasattr(env_cfg, "domain_rand"):
+        try:
+            env_cfg.domain_rand.domain_rand_general = False
+        except Exception:
+            pass
+
+    if hasattr(env_cfg, "motion"):
+        env_cfg.motion.motion_curriculum = False
+        env_cfg.motion.motion_file = str(subset_yaml)
+        env_cfg.motion.max_motions = -1
+        env_cfg.motion.motion_ids = ""
+        env_cfg.motion.shuffle_motions = False
+
+    train_cfg.runner.resume = True
+    env, _ = task_registry.make_env(name=str(args.task), args=gym_args, env_cfg=env_cfg)
+    _install_reset_reason_trace(env)
+
+    policy_type = str(args.policy_type).strip().lower()
+    normalizer = None
+    infer_actions: Callable[[Any], Any]
+    if policy_type == "runner":
+        ppo_runner, train_cfg = task_registry.make_alg_runner(
+            log_root="default", env=env, name=str(args.task), args=gym_args, train_cfg=train_cfg
+        )
+        policy = ppo_runner.get_inference_policy(device=env.device)
+        if getattr(env_cfg.env, "normalize_obs", False):
+            try:
+                normalizer = ppo_runner.get_normalizer(device=env.device)
+            except Exception:
+                normalizer = None
+
+        runner_backend = str(args.runner_backend).strip().lower()
+        if runner_backend not in {"onnx", "torch"}:
+            raise ValueError(f"Unsupported --runner_backend={args.runner_backend!r}")
+
+        if runner_backend == "torch":
+            def infer_actions(obs_in):
+                return _call_policy(policy, obs_in, hist_encoding=True)
+        else:
+            ckpt_path = _resolve_ckpt_path(
+                proj_name=str(args.proj_name),
+                resumeid=str(args.resumeid),
+                checkpoint=int(args.checkpoint),
+            )
+
+            cache_dir = _default_ckpt_to_onnx_cache_dir() if not str(args.onnx_cache_dir).strip() else Path(args.onnx_cache_dir).expanduser().resolve()
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            st = ckpt_path.stat()
+            include_norm_pref = bool(args.onnx_include_normalizer) or (normalizer is not None)
+
+            def _cache_path(norm_flag: bool) -> Path:
+                key = f"{ckpt_path}:{st.st_size}:{getattr(st, 'st_mtime_ns', int(st.st_mtime*1e9))}:{int(args.onnx_opset)}:norm{int(norm_flag)}"
+                h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+                return cache_dir / f"{ckpt_path.stem}-{h}.onnx"
+
+            out_onnx = _cache_path(include_norm_pref)
+
+            def _use_onnx(path: Path, *, baked_normalizer: bool) -> None:
+                nonlocal normalizer, infer_actions
+                if baked_normalizer:
+                    normalizer = None
+                infer_onnx = _make_onnx_policy(str(path), device=str(args.device))
+
+                def _infer(obs_in):
+                    return infer_onnx(obs_in)
+
+                infer_actions = _infer
+
+            if out_onnx.exists():
+                _use_onnx(out_onnx, baked_normalizer=include_norm_pref)
+            else:
+                try:
+                    _export_actor_critic_to_onnx(
+                        actor_critic=ppo_runner.alg.actor_critic,
+                        normalizer=normalizer,
+                        out_path=out_onnx,
+                        opset=int(args.onnx_opset),
+                        include_normalizer=include_norm_pref,
+                        obs_dim=int(env.num_obs),
+                    )
+                except Exception as e:
+                    if include_norm_pref and (normalizer is not None):
+                        out_onnx2 = _cache_path(False)
+                        try:
+                            _export_actor_critic_to_onnx(
+                                actor_critic=ppo_runner.alg.actor_critic,
+                                normalizer=None,
+                                out_path=out_onnx2,
+                                opset=int(args.onnx_opset),
+                                include_normalizer=False,
+                                obs_dim=int(env.num_obs),
+                            )
+                        except Exception as e2:
+                            print(f"[warn] ONNX export failed ({type(e2).__name__}: {e2}); falling back to torch policy.", flush=True)
+
+                            def infer_actions(obs_in):
+                                return _call_policy(policy, obs_in, hist_encoding=True)
+                        else:
+                            _use_onnx(out_onnx2, baked_normalizer=False)
+                    else:
+                        print(f"[warn] ONNX export failed ({type(e).__name__}: {e}); falling back to torch policy.", flush=True)
+
+                        def infer_actions(obs_in):
+                            return _call_policy(policy, obs_in, hist_encoding=True)
+                else:
+                    _use_onnx(out_onnx, baked_normalizer=include_norm_pref)
+
+    elif policy_type == "onnx":
+        if not str(args.onnx_path).strip():
+            raise ValueError("--onnx_path is required when --policy_type=onnx")
+        infer_onnx = _make_onnx_policy(str(args.onnx_path), device=str(args.device))
+
+        def infer_actions(obs_in):
+            return infer_onnx(obs_in)
+    else:
+        raise ValueError(f"Unsupported --policy_type={args.policy_type!r}")
+
+    out_csv = Path(args.out_csv).expanduser().resolve()
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if bool(args.append) else "w"
+    write_header = (mode == "w") or (not out_csv.exists()) or (out_csv.stat().st_size == 0)
+
+    fieldnames = [
+        "motion_idx_original",
+        "motion_id_loaded",
+        "motion_relpath",
+        "status",
+        "done_reason",
+        "done_time_s",
+        "motion_len_s",
+        "progress",
+        "wall_time_s",
+        "steps_exec",
+        "err_root_pos_l2_mean",
+        "err_root_rot_deg_mean",
+        "err_dof_pos_l2_mean",
+        "err_dof_vel_l2_mean",
+        "err_keybody_pos_l1_mean",
+        "error",
+    ]
+
+    import torch
+    log_stride = max(1, int(args.log_stride))
+    print(f"[{_now()}] selected_motions={len(motions)} env_dt={float(env.dt):.4f}s log_stride={log_stride}", flush=True)
+
+    with open(out_csv, mode, newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            w.writeheader()
+
+        for local_id, m in enumerate(motions):
+            if int(args.skip_motions) > 0 and int(local_id) < int(args.skip_motions):
+                continue
+            row: dict[str, Any] = {
+                "motion_idx_original": int(m.original_idx),
+                "motion_id_loaded": int(local_id),
+                "motion_relpath": str(m.relpath),
+            }
+            try:
+                t_wall0 = time.perf_counter()
+                env_ids = torch.arange(env.num_envs, device=env.device)
+                motion_id_tensor = torch.full((env.num_envs,), int(local_id), device=env.device, dtype=torch.long)
+                env.reset_idx(env_ids, motion_ids=motion_id_tensor)
+                obs = _refresh_obs(env)
+
+                motion_len_s = float(env._motion_lib.get_motion_length(motion_id_tensor[:1]).item())
+                max_steps = max(1, int(math.ceil(motion_len_s / float(env.dt))))
+                steps_exec = 0
+
+                n_log = 0
+                sum_root_pos = 0.0
+                sum_root_rot_deg = 0.0
+                sum_dof_pos = 0.0
+                sum_dof_vel = 0.0
+                sum_keybody = 0.0
+                done_reason = ""
+                done_time_s = float("nan")
+
+                for step in range(max_steps):
+                    steps_exec = step + 1
+                    if normalizer is not None:
+                        obs_in = normalizer.normalize(obs.detach())
+                    else:
+                        obs_in = obs.detach()
+                    actions = infer_actions(obs_in)
+                    step_out = env.step(actions.detach())
+                    obs = step_out[0]
+                    dones = step_out[3]
+
+                    if (step % log_stride) == 0:
+                        log = env.get_episode_log(env_ids=0)
+                        if "err_root_pos_l2" in log:
+                            sum_root_pos += float(log["err_root_pos_l2"])
+                        if "err_root_rot_rad" in log:
+                            sum_root_rot_deg += float(log["err_root_rot_rad"]) * 180.0 / math.pi
+                        if "err_dof_pos_l2" in log:
+                            sum_dof_pos += float(log["err_dof_pos_l2"])
+                        if "err_dof_vel_l2" in log:
+                            sum_dof_vel += float(log["err_dof_vel_l2"])
+                        if "err_keybody_pos_l1" in log:
+                            sum_keybody += float(log["err_keybody_pos_l1"])
+                        n_log += 1
+
+                    if bool(dones[0].item()):
+                        done_reason = str(getattr(env, "_exec_eval_last_reason", [""])[0])  # type: ignore[attr-defined]
+                        done_time_s = float(getattr(env, "_exec_eval_last_time_s", [float("nan")])[0])  # type: ignore[attr-defined]
+                        break
+
+                if not done_reason:
+                    done_reason = "unknown"
+                progress = float(done_time_s / motion_len_s) if (motion_len_s > 0 and math.isfinite(done_time_s)) else float("nan")
+                status = "ok" if done_reason == "motion_end" else "fail"
+                wall_time_s = float(time.perf_counter() - t_wall0)
+
+                row.update(
+                    {
+                        "status": status,
+                        "done_reason": done_reason,
+                        "done_time_s": float(done_time_s),
+                        "motion_len_s": float(motion_len_s),
+                        "progress": float(progress),
+                        "wall_time_s": float(wall_time_s),
+                        "steps_exec": int(steps_exec),
+                        "err_root_pos_l2_mean": float(sum_root_pos / max(1, n_log)),
+                        "err_root_rot_deg_mean": float(sum_root_rot_deg / max(1, n_log)),
+                        "err_dof_pos_l2_mean": float(sum_dof_pos / max(1, n_log)),
+                        "err_dof_vel_l2_mean": float(sum_dof_vel / max(1, n_log)),
+                        "err_keybody_pos_l1_mean": float(sum_keybody / max(1, n_log)),
+                        "error": "",
+                    }
+                )
+            except Exception as e:
+                row.update(
+                    {
+                        "status": "error",
+                        "done_reason": "",
+                        "done_time_s": float("nan"),
+                        "motion_len_s": float("nan"),
+                        "progress": float("nan"),
+                        "wall_time_s": float("nan"),
+                        "steps_exec": int(0),
+                        "err_root_pos_l2_mean": float("nan"),
+                        "err_root_rot_deg_mean": float("nan"),
+                        "err_dof_pos_l2_mean": float("nan"),
+                        "err_dof_vel_l2_mean": float("nan"),
+                        "err_keybody_pos_l1_mean": float("nan"),
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+                )
+
+            w.writerow({k: row.get(k) for k in fieldnames})
+            if ((local_id + 1) % 10) == 0:
+                print(f"[{_now()}] processed={local_id+1}/{len(motions)}", flush=True)
+
+    print(f"[done] out_csv={out_csv}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Evaluate legged_gym (IsaacGym) policies on a subset of motions; output per-motion CSV.")
     ap.add_argument("--motion_yaml", type=str, required=True, help="Motion config YAML (root_path + motions[].file)")
@@ -291,6 +762,16 @@ def main() -> None:
     ap.add_argument("--checkpoint", type=int, default=-1)
     ap.add_argument("--policy_type", type=str, default="runner", choices=["runner", "onnx"])
     ap.add_argument("--onnx_path", type=str, default="")
+    ap.add_argument(
+        "--runner_backend",
+        type=str,
+        default="onnx",
+        choices=["onnx", "torch"],
+        help="When --policy_type=runner: export ckpt to ONNX and run onnxruntime (onnx) or run torch directly (torch).",
+    )
+    ap.add_argument("--onnx_cache_dir", type=str, default="", help="Cache dir for exported ONNX (default: /tmp/codex-<mmdd>-gym-pt-to-onnx/)")
+    ap.add_argument("--onnx_opset", type=int, default=11)
+    ap.add_argument("--onnx_include_normalizer", action="store_true", help="Bake observation normalizer into exported ONNX (default: auto)")
 
     ap.add_argument("--device", type=str, default="cuda:0")
     ap.add_argument("--headless", action="store_true")
@@ -379,8 +860,80 @@ def main() -> None:
             except Exception:
                 normalizer = None
 
-        def infer_actions(obs_in):
-            return _call_policy(policy, obs_in, hist_encoding=True)
+        runner_backend = str(args.runner_backend).strip().lower()
+        if runner_backend not in {"onnx", "torch"}:
+            raise ValueError(f"Unsupported --runner_backend={args.runner_backend!r}")
+
+        if runner_backend == "torch":
+            def infer_actions(obs_in):
+                return _call_policy(policy, obs_in, hist_encoding=True)
+        else:
+            # Export ckpt -> ONNX once, then run onnxruntime for faster inference.
+            ckpt_path = _resolve_ckpt_path(proj_name=str(args.proj_name), resumeid=str(args.resumeid), checkpoint=int(args.checkpoint))
+
+            cache_dir = _default_ckpt_to_onnx_cache_dir() if not str(args.onnx_cache_dir).strip() else Path(args.onnx_cache_dir).expanduser().resolve()
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            st = ckpt_path.stat()
+            include_norm_pref = bool(args.onnx_include_normalizer) or (normalizer is not None)
+
+            def _cache_path(norm_flag: bool) -> Path:
+                key = f"{ckpt_path}:{st.st_size}:{getattr(st, 'st_mtime_ns', int(st.st_mtime*1e9))}:{int(args.onnx_opset)}:norm{int(norm_flag)}"
+                h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+                return cache_dir / f"{ckpt_path.stem}-{h}.onnx"
+
+            out_onnx = _cache_path(include_norm_pref)
+
+            def _use_onnx(path: Path, *, baked_normalizer: bool) -> None:
+                nonlocal normalizer, infer_actions
+                if baked_normalizer:
+                    normalizer = None
+                infer_onnx = _make_onnx_policy(str(path), device=str(args.device))
+
+                def _infer(obs_in):
+                    return infer_onnx(obs_in)
+
+                infer_actions = _infer
+
+            if out_onnx.exists():
+                _use_onnx(out_onnx, baked_normalizer=include_norm_pref)
+            else:
+                # First try exporting with normalizer if requested/available.
+                try:
+                    _export_actor_critic_to_onnx(
+                        actor_critic=ppo_runner.alg.actor_critic,
+                        normalizer=normalizer,
+                        out_path=out_onnx,
+                        opset=int(args.onnx_opset),
+                        include_normalizer=include_norm_pref,
+                        obs_dim=int(env.num_obs),
+                    )
+                except Exception as e:
+                    # Retry exporting without normalizer (keep python-side normalizer).
+                    if include_norm_pref and (normalizer is not None):
+                        out_onnx2 = _cache_path(False)
+                        try:
+                            _export_actor_critic_to_onnx(
+                                actor_critic=ppo_runner.alg.actor_critic,
+                                normalizer=None,
+                                out_path=out_onnx2,
+                                opset=int(args.onnx_opset),
+                                include_normalizer=False,
+                                obs_dim=int(env.num_obs),
+                            )
+                        except Exception as e2:
+                            print(f"[warn] ONNX export failed ({type(e2).__name__}: {e2}); falling back to torch policy.", flush=True)
+
+                            def infer_actions(obs_in):
+                                return _call_policy(policy, obs_in, hist_encoding=True)
+                        else:
+                            _use_onnx(out_onnx2, baked_normalizer=False)
+                    else:
+                        print(f"[warn] ONNX export failed ({type(e).__name__}: {e}); falling back to torch policy.", flush=True)
+
+                        def infer_actions(obs_in):
+                            return _call_policy(policy, obs_in, hist_encoding=True)
+                else:
+                    _use_onnx(out_onnx, baked_normalizer=include_norm_pref)
 
     else:
         if not str(args.onnx_path).strip():
@@ -404,6 +957,8 @@ def main() -> None:
         "done_time_s",
         "motion_len_s",
         "progress",
+        "wall_time_s",
+        "steps_exec",
         "err_root_pos_l2_mean",
         "err_root_rot_deg_mean",
         "err_dof_pos_l2_mean",
@@ -429,6 +984,7 @@ def main() -> None:
                 "motion_relpath": str(m.relpath),
             }
             try:
+                t_wall0 = time.perf_counter()
                 env_ids = torch.arange(env.num_envs, device=env.device)
                 motion_id_tensor = torch.full((env.num_envs,), int(local_id), device=env.device, dtype=torch.long)
                 env.reset_idx(env_ids, motion_ids=motion_id_tensor)
@@ -436,6 +992,7 @@ def main() -> None:
 
                 motion_len_s = float(env._motion_lib.get_motion_length(motion_id_tensor[:1]).item())
                 max_steps = max(1, int(math.ceil(motion_len_s / float(env.dt))))
+                steps_exec = 0
 
                 n_log = 0
                 sum_root_pos = 0.0
@@ -447,6 +1004,7 @@ def main() -> None:
                 done_time_s = float("nan")
 
                 for step in range(max_steps):
+                    steps_exec = step + 1
                     if normalizer is not None:
                         obs_in = normalizer.normalize(obs.detach())
                     else:
@@ -479,6 +1037,7 @@ def main() -> None:
                     done_reason = "unknown"
                 progress = float(done_time_s / motion_len_s) if (motion_len_s > 0 and math.isfinite(done_time_s)) else float("nan")
                 status = "ok" if done_reason == "motion_end" else "fail"
+                wall_time_s = float(time.perf_counter() - t_wall0)
 
                 row.update(
                     {
@@ -487,6 +1046,8 @@ def main() -> None:
                         "done_time_s": float(done_time_s),
                         "motion_len_s": float(motion_len_s),
                         "progress": float(progress),
+                        "wall_time_s": float(wall_time_s),
+                        "steps_exec": int(steps_exec),
                         "err_root_pos_l2_mean": float(sum_root_pos / max(1, n_log)),
                         "err_root_rot_deg_mean": float(sum_root_rot_deg / max(1, n_log)),
                         "err_dof_pos_l2_mean": float(sum_dof_pos / max(1, n_log)),
@@ -503,6 +1064,8 @@ def main() -> None:
                         "done_time_s": float("nan"),
                         "motion_len_s": float("nan"),
                         "progress": float("nan"),
+                        "wall_time_s": float("nan"),
+                        "steps_exec": int(0),
                         "err_root_pos_l2_mean": float("nan"),
                         "err_root_rot_deg_mean": float("nan"),
                         "err_dof_pos_l2_mean": float("nan"),
@@ -521,4 +1084,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
