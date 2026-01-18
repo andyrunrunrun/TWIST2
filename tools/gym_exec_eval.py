@@ -932,11 +932,18 @@ def _run_eval_single_process(args: argparse.Namespace) -> None:
         "err_dof_pos_l2_mean",
         "err_dof_vel_l2_mean",
         "err_keybody_pos_l1_mean",
+        "root_pos_mean_l2_m",
+        "root_pos_mean_l1_m",
+        "root_rot_mean_deg",
+        "joint_dof_mean_l1",
+        "joint_vel_mean_l1",
+        "fk_rel_mean_l2_m",
         "error",
     ]
 
     import torch
     log_stride = max(1, int(args.log_stride))
+    metrics = _MetricsAccumulator(env, log_stride=log_stride)
     print(f"[{_now()}] selected_motions={len(motions)} env_dt={float(env.dt):.4f}s log_stride={log_stride}", flush=True)
 
     with open(out_csv, mode, newline="", encoding="utf-8") as f:
@@ -958,17 +965,11 @@ def _run_eval_single_process(args: argparse.Namespace) -> None:
                 motion_id_tensor = torch.full((env.num_envs,), int(local_id), device=env.device, dtype=torch.long)
                 env.reset_idx(env_ids, motion_ids=motion_id_tensor)
                 obs = _refresh_obs(env)
+                metrics.reset(env_ids)
 
                 motion_len_s = float(env._motion_lib.get_motion_length(motion_id_tensor[:1]).item())
                 max_steps = max(1, int(math.ceil(motion_len_s / float(env.dt))))
                 steps_exec = 0
-
-                n_log = 0
-                sum_root_pos = 0.0
-                sum_root_rot_deg = 0.0
-                sum_dof_pos = 0.0
-                sum_dof_vel = 0.0
-                sum_keybody = 0.0
                 done_reason = ""
                 done_time_s = float("nan")
 
@@ -983,20 +984,6 @@ def _run_eval_single_process(args: argparse.Namespace) -> None:
                     obs = step_out[0]
                     dones = step_out[3]
 
-                    if (step % log_stride) == 0:
-                        log = env.get_episode_log(env_ids=0)
-                        if "err_root_pos_l2" in log:
-                            sum_root_pos += float(log["err_root_pos_l2"])
-                        if "err_root_rot_rad" in log:
-                            sum_root_rot_deg += float(log["err_root_rot_rad"]) * 180.0 / math.pi
-                        if "err_dof_pos_l2" in log:
-                            sum_dof_pos += float(log["err_dof_pos_l2"])
-                        if "err_dof_vel_l2" in log:
-                            sum_dof_vel += float(log["err_dof_vel_l2"])
-                        if "err_keybody_pos_l1" in log:
-                            sum_keybody += float(log["err_keybody_pos_l1"])
-                        n_log += 1
-
                     if bool(dones[0].item()):
                         done_reason = str(getattr(env, "_exec_eval_last_reason", [""])[0])  # type: ignore[attr-defined]
                         done_time_s = float(getattr(env, "_exec_eval_last_time_s", [float("nan")])[0])  # type: ignore[attr-defined]
@@ -1007,6 +994,16 @@ def _run_eval_single_process(args: argparse.Namespace) -> None:
                 progress = float(done_time_s / motion_len_s) if (motion_len_s > 0 and math.isfinite(done_time_s)) else float("nan")
                 status = "ok" if done_reason == "motion_end" else "fail"
                 wall_time_s = float(time.perf_counter() - t_wall0)
+                m = metrics.means(torch.tensor([0], device=env.device))
+                root_pos_l2_mean = float(m.get("root_pos_l2")[0].item()) if m else float("nan")
+                root_pos_l1_mean = float(m.get("root_pos_l1")[0].item()) if m else float("nan")
+                root_rot_deg_mean = float(m.get("root_rot_rad")[0].item()) * 180.0 / math.pi if m else float("nan")
+                dof_pos_l2_mean = float(m.get("dof_pos_l2")[0].item()) if m else float("nan")
+                dof_pos_l1_mean = float(m.get("dof_pos_l1")[0].item()) if m else float("nan")
+                dof_vel_l2_mean = float(m.get("dof_vel_l2")[0].item()) if m else float("nan")
+                dof_vel_l1_mean = float(m.get("dof_vel_l1")[0].item()) if m else float("nan")
+                keybody_l1_mean = float(m.get("keybody_l1")[0].item()) if m else float("nan")
+                keybody_l2_mean = float(m.get("keybody_l2")[0].item()) if m else float("nan")
 
                 row.update(
                     {
@@ -1017,11 +1014,17 @@ def _run_eval_single_process(args: argparse.Namespace) -> None:
                         "progress": float(progress),
                         "wall_time_s": float(wall_time_s),
                         "steps_exec": int(steps_exec),
-                        "err_root_pos_l2_mean": float(sum_root_pos / max(1, n_log)),
-                        "err_root_rot_deg_mean": float(sum_root_rot_deg / max(1, n_log)),
-                        "err_dof_pos_l2_mean": float(sum_dof_pos / max(1, n_log)),
-                        "err_dof_vel_l2_mean": float(sum_dof_vel / max(1, n_log)),
-                        "err_keybody_pos_l1_mean": float(sum_keybody / max(1, n_log)),
+                        "err_root_pos_l2_mean": float(root_pos_l2_mean),
+                        "err_root_rot_deg_mean": float(root_rot_deg_mean),
+                        "err_dof_pos_l2_mean": float(dof_pos_l2_mean),
+                        "err_dof_vel_l2_mean": float(dof_vel_l2_mean),
+                        "err_keybody_pos_l1_mean": float(keybody_l1_mean),
+                        "root_pos_mean_l2_m": float(root_pos_l2_mean),
+                        "root_pos_mean_l1_m": float(root_pos_l1_mean),
+                        "root_rot_mean_deg": float(root_rot_deg_mean),
+                        "joint_dof_mean_l1": float(dof_pos_l1_mean),
+                        "joint_vel_mean_l1": float(dof_vel_l1_mean),
+                        "fk_rel_mean_l2_m": float(keybody_l2_mean),
                         "error": "",
                     }
                 )
@@ -1040,6 +1043,12 @@ def _run_eval_single_process(args: argparse.Namespace) -> None:
                         "err_dof_pos_l2_mean": float("nan"),
                         "err_dof_vel_l2_mean": float("nan"),
                         "err_keybody_pos_l1_mean": float("nan"),
+                        "root_pos_mean_l2_m": float("nan"),
+                        "root_pos_mean_l1_m": float("nan"),
+                        "root_rot_mean_deg": float("nan"),
+                        "joint_dof_mean_l1": float("nan"),
+                        "joint_vel_mean_l1": float("nan"),
+                        "fk_rel_mean_l2_m": float("nan"),
                         "error": f"{type(e).__name__}: {e}",
                     }
                 )
