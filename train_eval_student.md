@@ -106,6 +106,7 @@ python play.py \
   --device cuda:0 --num_envs 1 \
   --headless --record_video \
   --checkpoint -1 \
+  --eval_student \
   --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml \
   --motion.max_motions 8 --record_num_motions 8 --random
 ```
