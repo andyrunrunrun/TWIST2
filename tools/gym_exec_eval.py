@@ -743,18 +743,40 @@ def _merge_csvs(*, inputs: list[Path], out_csv: Path) -> None:
             w.writerow({k: row.get(k, "") for k in fieldnames})
 
 
-def _load_done_motion_ids_loaded(*, csv_path: Path, motions: list[SelectedMotion]) -> set[int]:
-    """Load already-evaluated motion ids (0..len(motions)-1) from an existing CSV."""
+def _load_resume_state(
+    *, csv_path: Path, motions_loaded: list[SelectedMotion]
+) -> tuple[set[int], set[str], set[int]]:
+    """Load resume state from an existing CSV for the loaded motion list."""
     csv_path = Path(csv_path).expanduser().resolve()
-    num_motions = int(len(motions))
-    done: set[int] = set()
-    orig_to_loaded: dict[int, int] = {int(m.original_idx): int(i) for i, m in enumerate(motions)}
+    num_motions = int(len(motions_loaded))
+    done_loaded: set[int] = set()
+    done_relpaths: set[str] = set()
+    done_original: set[int] = set()
+    orig_to_loaded: dict[int, int] = {
+        int(m.original_idx): int(i) for i, m in enumerate(motions_loaded) if int(m.original_idx) >= 0
+    }
+    rel_to_loaded: dict[str, int] = {str(m.relpath): int(i) for i, m in enumerate(motions_loaded)}
     try:
         with open(csv_path, "r", encoding="utf-8", newline="") as f:
             r = csv.DictReader(f)
             for row in r:
                 if not row:
                     continue
+
+                rel = str(row.get("motion_relpath", "") or "").strip()
+                if rel:
+                    done_relpaths.add(rel)
+
+                orig = None
+                orig_s = str(row.get("motion_idx_original", "") or "").strip()
+                if orig_s:
+                    try:
+                        orig = int(orig_s)
+                    except Exception:
+                        orig = None
+                    if orig is not None:
+                        done_original.add(int(orig))
+
                 mid_s = str(row.get("motion_id_loaded", "") or "").strip()
                 if mid_s:
                     try:
@@ -765,24 +787,24 @@ def _load_done_motion_ids_loaded(*, csv_path: Path, motions: list[SelectedMotion
                         except Exception:
                             mid = None
                     if mid is not None and 0 <= int(mid) < num_motions:
-                        done.add(int(mid))
+                        done_loaded.add(int(mid))
                         continue
 
-                orig_s = str(row.get("motion_idx_original", "") or "").strip()
-                if not orig_s:
-                    continue
-                try:
-                    orig = int(orig_s)
-                except Exception:
-                    continue
-                mid2 = orig_to_loaded.get(int(orig))
-                if mid2 is not None:
-                    done.add(int(mid2))
+                if orig is not None:
+                    mid2 = orig_to_loaded.get(int(orig))
+                    if mid2 is not None:
+                        done_loaded.add(int(mid2))
+                        continue
+
+                if rel:
+                    mid3 = rel_to_loaded.get(rel)
+                    if mid3 is not None:
+                        done_loaded.add(int(mid3))
     except FileNotFoundError:
-        return set()
+        return set(), set(), set()
     except Exception as e:
         print(f"[warn] Failed to read resume CSV {csv_path}: {type(e).__name__}: {e}", flush=True)
-    return done
+    return done_loaded, done_relpaths, done_original
 
 
 def _worker_entry(args_dict: dict[str, Any], shard_idx: int, num_shards: int, out_csv: str) -> str:
@@ -1207,6 +1229,7 @@ def _run_eval_queue_mode(args: argparse.Namespace) -> None:
     )
     if not motions:
         raise RuntimeError("No motions selected; check --motion_ids/--max_motions/--shard_idx/--num_shards.")
+    motions_selected = motions
 
     # Avoid writing a huge subset YAML when selection is identity (full evaluation in YAML order).
     need_subset = (
@@ -1229,17 +1252,6 @@ def _run_eval_queue_mode(args: argparse.Namespace) -> None:
     mode = "a" if bool(args.append) else "w"
     if mode == "w" and out_csv.exists():
         out_csv.unlink()
-
-    done_loaded: set[int] = set()
-    if mode == "a" and out_csv.exists() and out_csv.stat().st_size > 0:
-        done_loaded = _load_done_motion_ids_loaded(csv_path=out_csv, motions=motions)
-        if done_loaded:
-            print(f"[resume] {len(done_loaded)}/{len(motions)} motions already in {out_csv}", flush=True)
-
-    if len(done_loaded) >= len(motions):
-        print(f"[done] already complete: {out_csv}", flush=True)
-        _maybe_write_summary(out_csv, args)
-        return
 
     env_cfg, train_cfg = task_registry.get_cfgs(name=str(args.task))
     env_cfg.env.num_envs = int(args.num_envs)
@@ -1266,29 +1278,17 @@ def _run_eval_queue_mode(args: argparse.Namespace) -> None:
     train_cfg.runner.resume = True
     env, _ = task_registry.make_env(name=str(args.task), args=gym_args, env_cfg=env_cfg)
 
-    policy_type = str(args.policy_type).strip().lower()
-    if policy_type != "runner":
-        raise ValueError("--queue_eval currently supports only --policy_type runner (use torch policy like training)")
-
-    # For GPU throughput, prefer torch inference (avoids torch->numpy copies).
-    if str(args.runner_backend).strip().lower() != "torch":
-        print("[warn] --queue_eval on GPU is fastest with --runner_backend torch; forcing torch backend.", flush=True)
-
-    ppo_runner, train_cfg = task_registry.make_alg_runner(
-        log_root="default", env=env, name=str(args.task), args=gym_args, train_cfg=train_cfg
+    loaded_files = getattr(env._motion_lib, "_motion_files", None)
+    motions_loaded, _selected_to_loaded, missing, unknown_loaded = _align_selected_motions_with_loaded(
+        root_path=root_path, motions=motions_selected, loaded_files=loaded_files
     )
-    policy = ppo_runner.get_inference_policy(device=env.device)
-    normalizer = None
-    if getattr(env_cfg.env, "normalize_obs", False):
-        try:
-            normalizer = ppo_runner.get_normalizer(device=env.device)
-        except Exception:
-            normalizer = None
+    if missing:
+        print(f"[warn] {len(missing)}/{len(motions_selected)} motions failed to load; writing error rows.", flush=True)
+    if unknown_loaded:
+        print(f"[warn] {len(unknown_loaded)} loaded motions not found in selection; using fallback metadata.", flush=True)
 
-    # Precompute motion lengths on device for fast batch indexing.
+    motions = motions_loaded
     num_motions = int(len(motions))
-    motion_ids_all = torch.arange(num_motions, device=env.device, dtype=torch.long)
-    motion_len_all = env._motion_lib.get_motion_length(motion_ids_all).detach()
 
     fieldnames = [
         "motion_idx_original",
@@ -1314,6 +1314,83 @@ def _run_eval_queue_mode(args: argparse.Namespace) -> None:
         "fk_rel_mean_l2_m",
         "error",
     ]
+
+    done_loaded: set[int] = set()
+    done_relpaths: set[str] = set()
+    done_original: set[int] = set()
+    if mode == "a" and out_csv.exists() and out_csv.stat().st_size > 0:
+        done_loaded, done_relpaths, done_original = _load_resume_state(csv_path=out_csv, motions_loaded=motions)
+        if done_loaded:
+            print(f"[resume] {len(done_loaded)}/{num_motions} motions already in {out_csv}", flush=True)
+
+    if missing:
+        missing_to_write = [
+            m for m in missing if (m.relpath not in done_relpaths) and (int(m.original_idx) not in done_original)
+        ]
+        if missing_to_write:
+            write_header = (mode == "w") or (not out_csv.exists()) or (out_csv.stat().st_size == 0)
+            with open(out_csv, mode, encoding="utf-8", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                if write_header:
+                    w.writeheader()
+                for m in missing_to_write:
+                    w.writerow(
+                        {
+                            "motion_idx_original": int(m.original_idx),
+                            "motion_id_loaded": "",
+                            "motion_relpath": str(m.relpath),
+                            "status": "error",
+                            "done_reason": "load_failed",
+                            "done_time_s": float("nan"),
+                            "motion_len_s": float("nan"),
+                            "progress": float("nan"),
+                            "wall_time_s": float("nan"),
+                            "steps_exec": int(0),
+                            "err_root_pos_l2_mean": float("nan"),
+                            "err_root_rot_deg_mean": float("nan"),
+                            "err_dof_pos_l2_mean": float("nan"),
+                            "err_dof_vel_l2_mean": float("nan"),
+                            "err_keybody_pos_l1_mean": float("nan"),
+                            "root_pos_mean_l2_m": float("nan"),
+                            "root_pos_mean_l1_m": float("nan"),
+                            "root_rot_mean_deg": float("nan"),
+                            "joint_dof_mean_l1": float("nan"),
+                            "joint_vel_mean_l1": float("nan"),
+                            "fk_rel_mean_l2_m": float("nan"),
+                            "error": "motion_not_loaded",
+                        }
+                    )
+            if mode == "w":
+                mode = "a"
+
+    if num_motions == 0 or len(done_loaded) >= num_motions:
+        print(f"[done] already complete: {out_csv}", flush=True)
+        _maybe_write_summary(out_csv, args)
+        return
+
+    policy_type = str(args.policy_type).strip().lower()
+    if policy_type != "runner":
+        raise ValueError("--queue_eval currently supports only --policy_type runner (use torch policy like training)")
+
+    # For GPU throughput, prefer torch inference (avoids torch->numpy copies).
+    if str(args.runner_backend).strip().lower() != "torch":
+        print("[warn] --queue_eval on GPU is fastest with --runner_backend torch; forcing torch backend.", flush=True)
+
+    ppo_runner, train_cfg = task_registry.make_alg_runner(
+        log_root="default", env=env, name=str(args.task), args=gym_args, train_cfg=train_cfg
+    )
+    policy = ppo_runner.get_inference_policy(device=env.device)
+    normalizer = None
+    if getattr(env_cfg.env, "normalize_obs", False):
+        try:
+            normalizer = ppo_runner.get_normalizer(device=env.device)
+        except Exception:
+            normalizer = None
+
+    # Precompute motion lengths on device for fast batch indexing.
+    num_motions = int(len(motions))
+    motion_ids_all = torch.arange(num_motions, device=env.device, dtype=torch.long)
+    motion_len_all = env._motion_lib.get_motion_length(motion_ids_all).detach()
 
     metrics_mode = str(getattr(args, "queue_metrics", "fast") or "fast").strip().lower()
     if metrics_mode not in {"fast", "final", "mean"}:
