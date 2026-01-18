@@ -59,12 +59,14 @@ CUDA_VISIBLE_DEVICES=0 python legged_gym/legged_gym/scripts/train.py \
 ### 3) 多卡 DDP（torchrun）
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 legged_gym/legged_gym/scripts/train.py \
+CUDA_VISIBLE_DEVICES=3,4,5,6 torchrun --standalone --nproc_per_node=4 legged_gym/legged_gym/scripts/train.py \
   --task g1_stu_future \
   --proj_name g1_stu_future \
   --exptid 0116_student_ddp \
   --teacher_exptid 0106_teacher \
-  --teacher_checkpoint -1
+  --teacher_checkpoint -1 \
+  --num_envs 4096 --max_iterations 100000 \
+  --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml
 ```
 
 说明：
@@ -75,15 +77,16 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 legged_gym/leg
 ### 4) 续训 / 微调（从旧 student ckpt 载入，但写到新 exptid）
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python legged_gym/legged_gym/scripts/train.py \
+CUDA_VISIBLE_DEVICES=3,4,5,6 torchrun --standalone --nproc_per_node=4 legged_gym/legged_gym/scripts/train.py \
   --task g1_stu_future \
   --proj_name g1_stu_future \
-  --exptid 0116_student_finetune \
-  --resumeid 0116_student \
-  --checkpoint 20000 \
-  --device cuda:0 \
+  --exptid 0116_student_ddp \
   --teacher_exptid 0106_teacher \
-  --teacher_checkpoint -1
+  --teacher_checkpoint -1 \
+  --resumeid 0116_student_ddp \
+  --checkpoint -1 \
+  --num_envs 4096 --max_iterations 100000 \
+  --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml
 ```
 
 其中：
