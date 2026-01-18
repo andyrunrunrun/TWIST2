@@ -97,6 +97,61 @@ class SelectedMotion:
     weight: float
 
 
+def _expand_path(path: str) -> str:
+    return os.path.expandvars(os.path.expanduser(str(path)))
+
+
+def _norm_path(path: str) -> str:
+    return os.path.normpath(_expand_path(path))
+
+
+def _motion_full_path(root_path: str, relpath: str) -> str:
+    root_expanded = _expand_path(root_path)
+    full = os.path.join(root_expanded, str(relpath))
+    if full.endswith(".pkl"):
+        npz = full[:-4] + ".npz"
+        if os.path.exists(npz):
+            full = npz
+    return full
+
+
+def _align_selected_motions_with_loaded(
+    *,
+    root_path: str,
+    motions: list[SelectedMotion],
+    loaded_files: Optional[list[str]],
+) -> tuple[list[SelectedMotion], dict[int, int], list[SelectedMotion], list[str]]:
+    if not loaded_files:
+        selected_to_loaded = {i: i for i in range(len(motions))}
+        return list(motions), selected_to_loaded, [], []
+
+    selected_map: dict[str, list[tuple[int, SelectedMotion]]] = {}
+    for idx, m in enumerate(motions):
+        key = _norm_path(_motion_full_path(root_path, m.relpath))
+        selected_map.setdefault(key, []).append((idx, m))
+
+    loaded: list[SelectedMotion] = []
+    selected_to_loaded: dict[int, int] = {}
+    unknown_loaded: list[str] = []
+    for loaded_idx, path in enumerate(loaded_files):
+        key = _norm_path(str(path))
+        bucket = selected_map.get(key)
+        if bucket:
+            sel_idx, m = bucket.pop(0)
+            loaded.append(m)
+            selected_to_loaded[int(sel_idx)] = int(loaded_idx)
+        else:
+            unknown_loaded.append(str(path))
+            loaded.append(SelectedMotion(original_idx=-1, relpath=str(path), weight=1.0))
+
+    missing: list[SelectedMotion] = []
+    for bucket in selected_map.values():
+        for _sel_idx, m in bucket:
+            missing.append(m)
+
+    return loaded, selected_to_loaded, missing, unknown_loaded
+
+
 def _select_motions_from_yaml(
     motion_yaml: Path,
     *,
@@ -811,6 +866,15 @@ def _run_eval_single_process(args: argparse.Namespace) -> None:
     env, _ = task_registry.make_env(name=str(args.task), args=gym_args, env_cfg=env_cfg)
     _install_reset_reason_trace(env)
 
+    loaded_files = getattr(env._motion_lib, "_motion_files", None)
+    motions_loaded, selected_to_loaded, missing, unknown_loaded = _align_selected_motions_with_loaded(
+        root_path=root_path, motions=motions, loaded_files=loaded_files
+    )
+    if missing:
+        print(f"[warn] {len(missing)}/{len(motions)} motions failed to load; writing error rows.", flush=True)
+    if unknown_loaded:
+        print(f"[warn] {len(unknown_loaded)} loaded motions not found in selection; using fallback metadata.", flush=True)
+
     policy_type = str(args.policy_type).strip().lower()
     normalizer = None
     infer_actions: Callable[[Any], Any]
@@ -944,7 +1008,11 @@ def _run_eval_single_process(args: argparse.Namespace) -> None:
     import torch
     log_stride = max(1, int(args.log_stride))
     metrics = _MetricsAccumulator(env, log_stride=log_stride)
-    print(f"[{_now()}] selected_motions={len(motions)} env_dt={float(env.dt):.4f}s log_stride={log_stride}", flush=True)
+    print(
+        f"[{_now()}] selected_motions={len(motions)} loaded_motions={len(motions_loaded)} "
+        f"env_dt={float(env.dt):.4f}s log_stride={log_stride}",
+        flush=True,
+    )
 
     with open(out_csv, mode, newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -954,15 +1022,42 @@ def _run_eval_single_process(args: argparse.Namespace) -> None:
         for local_id, m in enumerate(motions):
             if int(args.skip_motions) > 0 and int(local_id) < int(args.skip_motions):
                 continue
+            loaded_id = selected_to_loaded.get(int(local_id))
             row: dict[str, Any] = {
                 "motion_idx_original": int(m.original_idx),
-                "motion_id_loaded": int(local_id),
+                "motion_id_loaded": int(loaded_id) if loaded_id is not None else "",
                 "motion_relpath": str(m.relpath),
             }
+            if loaded_id is None:
+                row.update(
+                    {
+                        "status": "error",
+                        "done_reason": "load_failed",
+                        "done_time_s": float("nan"),
+                        "motion_len_s": float("nan"),
+                        "progress": float("nan"),
+                        "wall_time_s": float("nan"),
+                        "steps_exec": int(0),
+                        "err_root_pos_l2_mean": float("nan"),
+                        "err_root_rot_deg_mean": float("nan"),
+                        "err_dof_pos_l2_mean": float("nan"),
+                        "err_dof_vel_l2_mean": float("nan"),
+                        "err_keybody_pos_l1_mean": float("nan"),
+                        "root_pos_mean_l2_m": float("nan"),
+                        "root_pos_mean_l1_m": float("nan"),
+                        "root_rot_mean_deg": float("nan"),
+                        "joint_dof_mean_l1": float("nan"),
+                        "joint_vel_mean_l1": float("nan"),
+                        "fk_rel_mean_l2_m": float("nan"),
+                        "error": "motion_not_loaded",
+                    }
+                )
+                w.writerow({k: row.get(k) for k in fieldnames})
+                continue
             try:
                 t_wall0 = time.perf_counter()
                 env_ids = torch.arange(env.num_envs, device=env.device)
-                motion_id_tensor = torch.full((env.num_envs,), int(local_id), device=env.device, dtype=torch.long)
+                motion_id_tensor = torch.full((env.num_envs,), int(loaded_id), device=env.device, dtype=torch.long)
                 env.reset_idx(env_ids, motion_ids=motion_id_tensor)
                 obs = _refresh_obs(env)
                 metrics.reset(env_ids)
