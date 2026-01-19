@@ -91,7 +91,7 @@ class G1HyMotion100kStuHyFeatCfgDAgger(G1HyMotion100kStuHyFeatCfg):
         run_name = ""
 
         teacher_experiment_name = "g1_priv_hymotion100k"
-        teacher_proj_name = "g1_priv_hymotion100k"
+        teacher_proj_name = "g1_priv_mimic"
         teacher_checkpoint = -1
         eval_student = False
 

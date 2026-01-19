@@ -22,7 +22,7 @@ CUDA_VISIBLE_DEVICES=1,2 torchrun --standalone --nproc_per_node=2 legged_gym/leg
 - 录制完整 motion 长度，并把所有 clips 拼到一个 mp4；overlay 会标注 sample/motion_id/weights
 
 ```bash
-# teacher policy：5 个样本 × 4 组 weights => 20 段 clip 拼成一个视频
+# teacher policy：5 个样本 × 5 组 weights => 20 段 clip 拼成一个视频
 cd legged_gym/legged_gym/scripts
 python play_limbw_compare.py \
     --task g1_priv_mimic_limbw \
@@ -33,7 +33,7 @@ python play_limbw_compare.py \
     --motion.max_motions 8 \
     --record_num_motions 8 \
     --seed 123 \
-    --limbw_cases_json '[[1,1,1,1],[1,0,0,0],[0,1,0,0],[0,0,1,0]]'
+    --limbw_cases_json '[[1,1,1,1],[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]'
 
 # student policy（同样用法；替换 task/proj/exptid 为 student 的）
 cd legged_gym/legged_gym/scripts
@@ -46,7 +46,7 @@ python play_limbw_compare.py \
     --motion.max_motions 8 \
     --record_num_motions 8 \
     --seed 123 \
-    --limbw_cases_json '[[1,1,1,1],[1,0,0,0],[0,1,0,0],[0,0,1,0]]'
+    --limbw_cases_json '[[1,1,1,1],[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]'
 ```
 
 输出视频默认在：

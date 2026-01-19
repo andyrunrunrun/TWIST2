@@ -11,6 +11,8 @@ python tools/mujoco_exec_eval.py --motion_yaml legged_gym/motion_data_configs/hu
     --out_csv ./outputs/twist2_exec_metrics.csv --policy_path assets/ckpts/twist2_1017_20k.onnx \
     --xml_path assets/g1/g1_sim2sim_29dof.xml --disable_termination --body_set joint_bodies29  --workers 16
 
+legged_gym/logs/g1_stu_future/0116_student_ddp/model_42500.onnx
+
 python tools/mujoco_exec_eval.py --motion_yaml legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml \
     --out_csv ./outputs/twist2_exec_metrics_teacher_deltalocal.csv --policy_path legged_gym/logs/g1_priv_mimic/0106_teacher_deltalocal/model_85000.pt \
     --xml_path assets/g1/g1_sim2sim_29dof.xml --disable_termination --body_set joint_bodies29  --workers 128

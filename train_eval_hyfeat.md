@@ -21,7 +21,8 @@ teacher ckpt 路径（DAgger 会用到）：
 ### 1) 训练
 
 ```bash
-CUDA_VISIBLE_DEVICES=3,4 torchrun --standalone --nproc_per_node=2 legged_gym/legged_gym/scripts/train.py \
+export HY_HUMANOID_ROOT=/home/weijin/source/Humanoid/HY-Humanoid
+CUDA_VISIBLE_DEVICES=2,3 torchrun --standalone --nproc_per_node=2 legged_gym/legged_gym/scripts/train.py \
   --task g1_stu_hymotion100k_hyfeat \
   --proj_name g1_stu_hymotion100k_hyfeat \
   --exptid 0118_hyfeat_ddp \
