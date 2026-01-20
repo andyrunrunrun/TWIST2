@@ -56,6 +56,8 @@ def _get_distributed_env():
     return world_size > 1, rank, local_rank, world_size
 
 
+# The `_setup_distributed` function is responsible for setting up distributed training if multiple
+# GPUs are available. Here is a breakdown of what the function does:
 def _setup_distributed(args):
     enabled, rank, local_rank, world_size = _get_distributed_env()
     if not enabled:
