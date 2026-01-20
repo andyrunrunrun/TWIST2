@@ -14,7 +14,6 @@ phc/
 motion_data/
 
 ignore/
-doc/legged_gym/motion_data_configs
 
 deploy_real/photo
 
@@ -22,6 +21,7 @@ track_dataset/
 
 *.pt
 *.log
+*.yaml
 
 debug.mp4
 
