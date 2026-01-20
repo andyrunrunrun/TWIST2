@@ -25,6 +25,61 @@ class G1MimicDistill(HumanoidMimic):
             self.total_env_steps_counter = 24 * 100000
             self.global_counter = 24 * 100000
 
+    def _limb_weights_enabled(self) -> bool:
+        return bool(getattr(self.cfg.env, "use_limb_weights", False))
+
+    @staticmethod
+    def _parse_limb_weights_value(value):
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            return [float(x) for x in value]
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return None
+            s = s.strip("[]()")
+            parts = [p.strip() for p in s.split(",") if p.strip()]
+            return [float(x) for x in parts]
+        try:
+            import numpy as np
+            if isinstance(value, np.ndarray):
+                return [float(x) for x in value.tolist()]
+        except Exception:
+            pass
+        return value
+
+    def set_limb_weights(self, limb_weights, env_ids=None):
+        """Set per-env limb weights used both as obs and tracking reward coefficients.
+
+        limb_weights order: [L_arm, R_arm, L_leg, R_leg], values in [0, 1].
+        """
+        if not self._limb_weights_enabled():
+            return
+        lw = self._parse_limb_weights_value(limb_weights)
+        if lw is None:
+            return
+        lw = torch.tensor(lw, device=self.device, dtype=torch.float).view(1, 4).clamp(0.0, 1.0)
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        self.limb_weights[env_ids] = lw.expand(len(env_ids), -1)
+        self._update_dof_err_w(env_ids)
+
+    def set_limb_weights_fixed(self, limb_weights):
+        if hasattr(self.cfg.env, "limb_weights_fixed"):
+            self.cfg.env.limb_weights_fixed = limb_weights
+        self.set_limb_weights(limb_weights)
+
+    def _scale_ref_root_pos_delta_local(self, motion_ids: torch.Tensor, root_pos_delta_local: torch.Tensor) -> torch.Tensor:
+        """
+        MotionLib's `root_pos_delta_local` is stored as per-motion-frame displacement (dt = 1/fps).
+        Scale it to per-env-step displacement so it matches `root_states - last_root_pos` (dt = self.dt).
+        """
+        # NOTE: MotionLib stores per-motion dt; each motion can have its own fps.
+        dt_motion = self._motion_lib._motion_dt[motion_ids].to(dtype=root_pos_delta_local.dtype)
+        scale = (float(self.dt) / dt_motion).unsqueeze(-1)
+        return root_pos_delta_local * scale
+
     def _reset_ref_motion(self, env_ids, motion_ids=None):
         n = len(env_ids)
         if motion_ids is None:
@@ -49,7 +104,7 @@ class G1MimicDistill(HumanoidMimic):
         self._ref_root_ang_vel[env_ids] = root_ang_vel
         self._ref_dof_pos[env_ids] = dof_pos
         self._ref_dof_vel[env_ids] = dof_vel
-        self._ref_root_pos_delta_local[env_ids] = root_pos_delta_local
+        self._ref_root_pos_delta_local[env_ids] = self._scale_ref_root_pos_delta_local(motion_ids, root_pos_delta_local)
         self._ref_root_rot_delta_local[env_ids] = root_rot_delta_local
         self._ref_body_pos[env_ids] = convert_to_global_root_body_pos(root_pos=root_pos, root_rot=root_rot, body_pos=body_pos)
     
@@ -69,7 +124,7 @@ class G1MimicDistill(HumanoidMimic):
         self._ref_root_ang_vel[:] = root_ang_vel
         self._ref_dof_pos[:] = dof_pos
         self._ref_dof_vel[:] = dof_vel
-        self._ref_root_pos_delta_local[:] = root_pos_delta_local
+        self._ref_root_pos_delta_local[:] = self._scale_ref_root_pos_delta_local(motion_ids, root_pos_delta_local)
         self._ref_root_rot_delta_local[:] = root_rot_delta_local
         self._ref_body_pos[:] = convert_to_global_root_body_pos(root_pos=root_pos, root_rot=root_rot, body_pos=body_pos)
         
@@ -109,6 +164,60 @@ class G1MimicDistill(HumanoidMimic):
         super()._init_buffers()
         self.obs_history_buf = torch.zeros((self.num_envs, self.cfg.env.history_len, self.cfg.env.n_obs_single), device=self.device)
         self.privileged_obs_history_buf = torch.zeros((self.num_envs, self.cfg.env.history_len, self.cfg.env.n_priv_obs_single), device=self.device)
+
+        if self._limb_weights_enabled():
+            self.limb_weights = torch.zeros((self.num_envs, 4), device=self.device, dtype=torch.float)
+            self._dof_err_w_base = self._dof_err_w.clone().to(dtype=torch.float)
+            self._dof_err_w = self._dof_err_w_base.unsqueeze(0).repeat(self.num_envs, 1)
+
+            self._g1_dof_ids_l_leg = torch.arange(0, 6, device=self.device, dtype=torch.long)
+            self._g1_dof_ids_r_leg = torch.arange(6, 12, device=self.device, dtype=torch.long)
+            self._g1_dof_ids_l_arm = torch.arange(15, 22, device=self.device, dtype=torch.long)
+            self._g1_dof_ids_r_arm = torch.arange(22, 29, device=self.device, dtype=torch.long)
+
+            key_body_names = list(getattr(self.cfg.motion, "key_bodies", []))
+            key_body_limb_src = []
+            mapping = {
+                "left_rubber_hand": 0,
+                "right_rubber_hand": 1,
+                "left_ankle_roll_link": 2,
+                "right_ankle_roll_link": 3,
+                "left_knee_link": 2,
+                "right_knee_link": 3,
+                "left_elbow_link": 0,
+                "right_elbow_link": 1,
+            }
+            for name in key_body_names:
+                key_body_limb_src.append(mapping.get(name, -1))
+            self._key_body_limb_src = torch.tensor(key_body_limb_src, device=self.device, dtype=torch.long)
+        else:
+            self.limb_weights = None
+            self._dof_err_w_base = None
+            self._key_body_limb_src = None
+
+    def _reset_buffers_extra(self, env_ids):
+        if not self._limb_weights_enabled():
+            return
+        fixed = getattr(self.cfg.env, "limb_weights_fixed", None)
+        fixed = self._parse_limb_weights_value(fixed)
+        if fixed is not None:
+            if len(fixed) != 4:
+                raise ValueError(f"limb_weights_fixed must have 4 values, got: {fixed}")
+            lw = torch.tensor(fixed, device=self.device, dtype=torch.float).view(1, 4).clamp(0.0, 1.0)
+            self.limb_weights[env_ids] = lw.expand(len(env_ids), -1)
+        else:
+            self.limb_weights[env_ids] = torch.rand((len(env_ids), 4), device=self.device, dtype=torch.float)
+        self._update_dof_err_w(env_ids)
+
+    def _update_dof_err_w(self, env_ids):
+        if (not self._limb_weights_enabled()) or self._dof_err_w_base is None:
+            return
+        lw = self.limb_weights[env_ids]  # (M, 4) in order [L_arm, R_arm, L_leg, R_leg]
+        self._dof_err_w[env_ids] = self._dof_err_w_base.unsqueeze(0)
+        self._dof_err_w[env_ids][:, self._g1_dof_ids_l_arm] *= lw[:, 0:1]
+        self._dof_err_w[env_ids][:, self._g1_dof_ids_r_arm] *= lw[:, 1:2]
+        self._dof_err_w[env_ids][:, self._g1_dof_ids_l_leg] *= lw[:, 2:3]
+        self._dof_err_w[env_ids][:, self._g1_dof_ids_r_leg] *= lw[:, 3:4]
     
     def _get_noise_scale_vec(self, cfg):
         noise_scale_vec = torch.zeros(1, self.cfg.env.n_proprio, device=self.device)
@@ -243,6 +352,10 @@ class G1MimicDistill(HumanoidMimic):
             proprio_obs_buf,
             priv_info,
         ), dim=-1)
+
+        if self._limb_weights_enabled():
+            obs_buf = torch.cat((obs_buf, self.limb_weights), dim=-1)
+            priv_obs_buf = torch.cat((priv_obs_buf, self.limb_weights), dim=-1)
         
         self.privileged_obs_buf = priv_obs_buf
         # self.privileged_obs_buf = torch.cat([priv_obs_buf, self.obs_history_buf.view(self.num_envs, -1)], dim=-1)

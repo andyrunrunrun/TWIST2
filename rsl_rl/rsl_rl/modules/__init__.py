@@ -30,6 +30,9 @@
 
 from .actor_critic import ActorCritic
 from .actor_critic_mimic import ActorCriticMimic
+from .actor_critic_mimic import ActorCriticMimicLimbWeight
 from .dagger_actor import DAggerActor
 from .actor_critic_teleop import ActorCriticTeleop
 from .actor_critic_future import ActorCriticFuture
+from .actor_critic_hyfeat import ActorCriticHyFeat
+from .actor_critic_hyfeat import ActorCriticMimicHyMotion

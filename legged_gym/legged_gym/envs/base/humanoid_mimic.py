@@ -92,14 +92,19 @@ class HumanoidMimic(HumanoidChar):
         self._init_motion_buffers()
         
     def _load_motions(self):
-        self._motion_lib = MotionLib(motion_file=self.cfg.motion.motion_file, device=self.device,
-                                     sample_ratio=self.cfg.motion.sample_ratio,
-                                    motion_decompose=self.cfg.motion.motion_decompose,
-                                    motion_smooth=self.cfg.motion.motion_smooth,
-                                    max_motions=getattr(self.cfg.motion, "max_motions", -1),
-                                    motion_ids=getattr(self.cfg.motion, "motion_ids", ""),
-                                    shuffle_motions=getattr(self.cfg.motion, "shuffle_motions", False),
-                                    shuffle_seed=getattr(self.cfg.motion, "shuffle_seed", 0))
+        self._motion_lib = MotionLib(
+            motion_file=self.cfg.motion.motion_file,
+            device=self.device,
+            sample_ratio=self.cfg.motion.sample_ratio,
+            motion_decompose=self.cfg.motion.motion_decompose,
+            motion_smooth=self.cfg.motion.motion_smooth,
+            max_motions=getattr(self.cfg.motion, "max_motions", -1),
+            motion_ids=getattr(self.cfg.motion, "motion_ids", ""),
+            shuffle_motions=getattr(self.cfg.motion, "shuffle_motions", False),
+            shuffle_seed=getattr(self.cfg.motion, "shuffle_seed", 0),
+            hy_feat_cache_motions=getattr(self.cfg.motion, "hy_feat_cache_motions", 0),
+            gpu_cache_gib=getattr(self.cfg.motion, "gpu_cache_gib", 4.0),
+        )
         return
     
     def _init_motion_buffers(self):
@@ -925,7 +930,13 @@ class HumanoidMimic(HumanoidChar):
         # tar_key_body_pos = convert_to_local_root_body_pos(self._ref_root_rot, tar_key_body_pos)
         tar_key_body_pos = convert_to_local_root_body_pos(ref_yaw_quat, tar_key_body_pos)
         key_body_pos_diff = key_body_pos - tar_key_body_pos
-        key_body_pos_err = torch.sum(key_body_pos_diff * key_body_pos_diff, dim=-1)
+        key_body_pos_err = torch.sum(key_body_pos_diff * key_body_pos_diff, dim=-1)  # (num_envs, num_key_bodies)
+        if bool(getattr(self.cfg.env, "use_limb_weights", False)) and hasattr(self, "limb_weights") and self.limb_weights is not None and hasattr(self, "_key_body_limb_src") and self._key_body_limb_src is not None:
+            src = self._key_body_limb_src.to(device=key_body_pos_err.device)
+            gather_idx = src.clamp(min=0)
+            body_w = self.limb_weights[:, gather_idx]
+            body_w = torch.where(src.unsqueeze(0) < 0, torch.ones_like(body_w), body_w)
+            key_body_pos_err = key_body_pos_err * body_w
         key_body_pos_err = torch.sum(key_body_pos_err, dim=-1)
         
         key_body_pos_scale = 10.0
@@ -939,7 +950,13 @@ class HumanoidMimic(HumanoidChar):
         # tar_key_body_pos = tar_key_body_pos - self._ref_root_pos.unsqueeze(1)
         
         key_body_pos_diff = key_body_pos - tar_key_body_pos
-        key_body_pos_err = torch.sum(key_body_pos_diff * key_body_pos_diff, dim=-1)
+        key_body_pos_err = torch.sum(key_body_pos_diff * key_body_pos_diff, dim=-1)  # (num_envs, num_key_bodies)
+        if bool(getattr(self.cfg.env, "use_limb_weights", False)) and hasattr(self, "limb_weights") and self.limb_weights is not None and hasattr(self, "_key_body_limb_src") and self._key_body_limb_src is not None:
+            src = self._key_body_limb_src.to(device=key_body_pos_err.device)
+            gather_idx = src.clamp(min=0)
+            body_w = self.limb_weights[:, gather_idx]
+            body_w = torch.where(src.unsqueeze(0) < 0, torch.ones_like(body_w), body_w)
+            key_body_pos_err = key_body_pos_err * body_w
         key_body_pos_err = torch.sum(key_body_pos_err, dim=-1)
         
         key_body_pos_scale = 10.0

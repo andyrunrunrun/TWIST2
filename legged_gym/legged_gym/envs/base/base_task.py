@@ -53,10 +53,15 @@ class BaseTask():
         else:
             self.device = 'cpu'
 
-        # graphics device for rendering, -1 for no rendering
+        # graphics device for rendering, -1 for no rendering.
+        # NOTE: In Isaac Gym, camera sensors require a graphics device even if no viewer window is created.
+        # This repo historically mapped "headless" to "no rendering", which breaks `--record_video`.
         self.graphics_device_id = self.sim_device_id
-        if self.headless == True:
-            self.graphics_device_id = -1
+        if self.headless:
+            if getattr(cfg.env, "record_video", False):
+                self.graphics_device_id = self.sim_device_id
+            else:
+                self.graphics_device_id = -1
 
         self.num_envs = cfg.env.num_envs
         self.num_obs = cfg.env.num_observations

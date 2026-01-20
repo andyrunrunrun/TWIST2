@@ -132,8 +132,27 @@ class ActorCritic(nn.Module):
     def reset(self, dones=None):
         pass
 
-    def forward(self):
-        raise NotImplementedError
+    def forward(self, observations, critic_observations=None, actions=None, **kwargs):
+        """DDP-friendly forward.
+
+        Calling the module (`model(...)`) ensures DDP forward hooks are triggered.
+        This returns everything PPO-style updates need in a single forward pass.
+        """
+        self.update_distribution(observations)
+
+        if actions is None:
+            actions = self.distribution.sample()
+
+        actions_log_prob = self.get_actions_log_prob(actions)
+        entropy = self.entropy
+        mu = self.action_mean
+        sigma = self.action_std
+
+        value = None
+        if critic_observations is not None:
+            value = self.evaluate(critic_observations, **kwargs)
+
+        return actions, actions_log_prob, value, mu, sigma, entropy
     
     @property
     def action_mean(self):

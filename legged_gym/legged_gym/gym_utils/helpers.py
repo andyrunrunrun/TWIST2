@@ -30,6 +30,7 @@
 
 import os
 import copy
+import sys
 import torch
 import numpy as np
 import random
@@ -84,22 +85,39 @@ def set_nested_attr(obj, attr_path, value):
         raise AttributeError(f"'{type(obj).__name__}' object has no attribute '{final_attr}'")
 
 def parse_dot_notation_args(unknown_args):
-    """Parse unknown arguments in dot notation format (--config.param value)"""
+    """Parse unknown arguments in dot notation format.
+
+    Supported forms:
+      - --a.b value
+      - --a.b=value
+      - a.b=value
+      - --a.b   (treated as boolean true)
+    """
     config_overrides = {}
     i = 0
     while i < len(unknown_args):
         arg = unknown_args[i]
         if arg.startswith('--') and '.' in arg:
-            # Remove -- prefix and get the config path
             config_path = arg[2:]
+            # Support --a.b=value
+            if '=' in config_path:
+                key, value = config_path.split('=', 1)
+                config_overrides[key] = value
+                i += 1
+                continue
+
+            # Support --a.b value or --a.b (boolean)
             if i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith('--'):
-                # Next argument is the value
                 config_overrides[config_path] = unknown_args[i + 1]
                 i += 2
             else:
-                # No value provided, treat as boolean flag
                 config_overrides[config_path] = 'true'
                 i += 1
+        elif (not arg.startswith('--')) and ('.' in arg) and ('=' in arg):
+            # Support a.b=value
+            key, value = arg.split('=', 1)
+            config_overrides[key] = value
+            i += 1
         else:
             i += 1
     return config_overrides
@@ -174,6 +192,10 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
     if env_cfg is not None:
         if args.teleop_mode:
             env_cfg.env.teleop_mode = True
+        if getattr(args, "gpu_cache", None) is not None:
+            # MotionLib GPU cache budget (GiB). Only applies to mimic tasks that have a `motion` cfg block.
+            if hasattr(env_cfg, "motion"):
+                setattr(env_cfg.motion, "gpu_cache_gib", float(args.gpu_cache))
         # num envs
         if args.num_envs is not None:
             env_cfg.env.num_envs = args.num_envs
@@ -276,6 +298,7 @@ def get_args():
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
         {"name": "--device", "type": str, "default": "cuda:0", "help": 'Device for sim, rl, and graphics'},
+        {"name": "--gpu_cache", "type": float, "default": 4.0, "help": "MotionLib VRAM cache budget per process (GiB)."},
 
         {"name": "--rows", "type": int, "help": "num_rows."},
         {"name": "--cols", "type": int, "help": "num_cols"},
@@ -296,12 +319,22 @@ def get_args():
         {"name": "--no_wandb", "action": "store_true", "default": False, "help": "no wandb"},
 
         {"name": "--record_video", "action": "store_true", "default": False, "help": "record video"},
+        {"name": "--record_num_motions", "type": int, "default": 1, "help": "When --record_video is set: record this many motion clips (each clip records the full motion length)."},
+        {"name": "--record_motion_ids", "type": str, "default": "", "help": "When --record_video is set: motion indices to record, e.g. '0,3,10-20'. Overrides --record_num_motions."},
+        {"name": "--record_seed", "type": int, "default": 0, "help": "Seed used by --random (0 means auto)."},
+        {"name": "--random", "action": "store_true", "default": False, "help": "Random motion selection in play.py: enables YAML motion shuffling (motion.shuffle_motions) and shuffles which motions are recorded."},
+        {"name": "--record_split_videos", "action": "store_true", "default": False, "help": "When --record_video is set: save one mp4 per motion (legacy behavior). Default is a single concatenated video."},
+        {"name": "--record_video_name", "type": str, "default": "", "help": "Optional output mp4 name for concatenated recording (e.g. 'demo.mp4')."},
+        {"name": "--record_no_overlay", "action": "store_true", "default": False, "help": "Disable overlay text on recorded frames."},
         
         {"name": "--fix_action_std", "action": "store_true", "default": False, "help": "fix std"},
         {"name": "--no_rand", "action": "store_true", "default": False, "help": "no domain randomization"},
         
         {"name": "--teleop_mode", "action": "store_true", "default": False, "help": "teleop mode"},
         {"name": "--record_log", "action": "store_true", "default": False, "help": "record log"},
+        {"name": "--record_log_dir", "type": str, "default": "", "help": "When --record_log is set: output directory for the json log (e.g. '/tmp/twist2_logs'). Empty uses the default logs/env_logs/<run>."},
+        {"name": "--record_log_stride", "type": int, "default": 1, "help": "When --record_log is set: log every N env steps (>=1)."},
+        {"name": "--record_log_env_id", "type": int, "default": -1, "help": "When --record_log is set: which env index to log. -1 uses env.lookat_id if available, else 0."},
         
         {"name": "--use_transformer", "action": "store_true", "default": False, "help": "use transformer"},
 
@@ -434,6 +467,12 @@ def parse_arguments(description="Isaac Gym Example", headless=False, no_graphics
         args.sim_device = args.device
         args.rl_device = args.device
     args.sim_device_type, args.compute_device_id = parse_device_str(args.sim_device)
+
+    # If user didn't explicitly set graphics device, default it to the sim GPU.
+    # This avoids camera sensor creation failures when sim runs on a non-zero GPU.
+    if args.sim_device_type == 'cuda' and '--graphics_device_id' not in sys.argv:
+        args.graphics_device_id = args.compute_device_id
+
     pipeline = args.pipeline.lower()
 
     assert (pipeline == 'cpu' or pipeline in ('gpu', 'cuda')), f"Invalid pipeline '{args.pipeline}'. Should be either cpu or gpu."

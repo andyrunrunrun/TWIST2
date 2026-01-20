@@ -62,7 +62,8 @@ class DAgger:
         
         # dagger actor
         self.dagger_actor = dagger_actor
-        self.dagger_actor.to(self.device)
+        if not hasattr(self.dagger_actor, "module"):
+            self.dagger_actor.to(self.device)
         self.storage = None
         self.optimizer = optim.Adam(self.dagger_actor.parameters(), lr=self.learning_rate)
         self.transition = RolloutStorage.Transition()

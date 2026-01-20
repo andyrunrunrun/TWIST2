@@ -59,6 +59,15 @@ class HumanoidCharCfg(BaseConfig):
         teleop_mode = False
         normalize_obs = True
 
+        # Keypoint marker visualization (rendered geometry, visible in camera sensors).
+        # When enabled, the env spawns two sets of spheres for `cfg.motion.key_bodies`:
+        # - GT/reference keypoints (red)
+        # - policy/current keypoints (green)
+        viz_keypoints = False
+        viz_keypoints_radius = 0.05
+        viz_keypoints_gt_color = (1.0, 0.0, 0.0)
+        viz_keypoints_policy_color = (0.0, 1.0, 0.0)
+
     class terrain:
         mesh_type = 'trimesh' # "heightfield" # none, plane, heightfield or trimesh
         hf2mesh_method = "grid"  # grid or fast
@@ -297,6 +306,15 @@ class HumanoidCharCfg(BaseConfig):
         key_bodies = []
         upper_key_bodies = []
         motion_file = ""
+        # For visualization/debug: limit how many motions to load from a big YAML.
+        # -1 means load all.
+        max_motions = -1
+        # Optional subset selector for YAML-based motion lists. Examples: "0", "0,3,7", "10-20".
+        # Empty string means no filtering.
+        motion_ids = ""
+        # If True, shuffle the YAML motion list before applying max_motions/motion_ids.
+        shuffle_motions = False
+        shuffle_seed = 0
         height_offset = 0.0
         reset_consec_frames = 50
         sample_ratio = 1.0

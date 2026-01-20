@@ -87,31 +87,73 @@ class Humanoid(LeggedRobot):
 
     def _create_envs(self):
         super()._create_envs()
+        # Default: no recording cameras available (filled only when record_video=True and creation succeeds).
+        self._rendering_camera_handles = None
         if self.cfg.env.record_video:
             camera_props = gymapi.CameraProperties()
             camera_props.width = 720*2
             camera_props.height = 480*2
-            self._rendering_camera_handles = []
+            camera_handles = []
             for i in range(self.num_envs):
                 cam_pos = np.array([2, 0, 0.3])
                 camera_handle = self.gym.create_camera_sensor(self.envs[i], camera_props)
-                self._rendering_camera_handles.append(camera_handle)
+                if camera_handle < 0:
+                    print(
+                        "[Humanoid] Failed to create camera sensor (handle=-1). "
+                        "Disabling video recording. If you need headless video, run with a valid graphics context "
+                        "(e.g. via X/Wayland or `xvfb-run`) and ensure `--graphics_device_id` matches your GPU."
+                    )
+                    self.cfg.env.record_video = False
+                    self._rendering_camera_handles = None
+                    return
+                camera_handles.append(camera_handle)
                 self.gym.set_camera_location(camera_handle, self.envs[i], gymapi.Vec3(*cam_pos), gymapi.Vec3(*0*cam_pos))
+            self._rendering_camera_handles = camera_handles
                 
     def render_record(self, mode="rgb_array"):
+        handles = getattr(self, "_rendering_camera_handles", None)
+        if (not getattr(self.cfg.env, "record_video", False)) or handles is None or len(handles) != self.num_envs:
+            return None
+        if any(h < 0 for h in handles):
+            return None
         self.gym.step_graphics(self.sim)
-        self.gym.clear_lines(self.viewer)
-        self.gym.render_all_camera_sensors(self.sim)
-        imgs = []
+        if getattr(self, "viewer", None) is not None:
+            self.gym.clear_lines(self.viewer)
+        # Update camera poses to follow the robot before rendering.
         for i in range(self.num_envs):
-            cam = self._rendering_camera_handles[i]
+            cam = handles[i]
             root_pos = self.root_states[i, :3].cpu().numpy()
             cam_pos = root_pos + np.array([0, -2, 0.3])
             self.gym.set_camera_location(cam, self.envs[i], gymapi.Vec3(*cam_pos), gymapi.Vec3(*root_pos))
+
+        self.gym.render_all_camera_sensors(self.sim)
+
+        imgs = []
+        view_mats = []
+        proj_mats = []
+        for i in range(self.num_envs):
+            cam = handles[i]
+            try:
+                view = self.gym.get_camera_view_matrix(self.sim, self.envs[i], cam)
+                proj = self.gym.get_camera_proj_matrix(self.sim, self.envs[i], cam)
+                view = np.array(view, dtype=np.float32)
+                proj = np.array(proj, dtype=np.float32)
+                if view.size == 16:
+                    view = view.reshape(4, 4)
+                if proj.size == 16:
+                    proj = proj.reshape(4, 4)
+            except Exception:
+                view = None
+                proj = None
+            view_mats.append(view)
+            proj_mats.append(proj)
+
             img = self.gym.get_camera_image(self.sim, self.envs[i], cam, gymapi.IMAGE_COLOR)
             w, h = img.shape
             imgs.append(img.reshape([w, h // 4, 4]))
-                
+
+        self._rendering_camera_last_view_mats = view_mats
+        self._rendering_camera_last_proj_mats = proj_mats
         return imgs
     
                               

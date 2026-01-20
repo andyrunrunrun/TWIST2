@@ -196,6 +196,15 @@ bash train.sh 1021_twist2 cuda:0
 - arg 1: policy expid
 - arg 2: cuda device id
 
+**1.1**. Multi-GPU (DDP) training (torchrun):
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 legged_gym/legged_gym/scripts/train.py \
+  --task g1_stu_future --proj_name g1_stu_future --exptid 1021_twist2
+```
+- Each rank auto-binds to `cuda:$LOCAL_RANK` for both sim and RL.
+- Motion YAML lists are sharded per-rank to avoid loading the full dataset on every GPU.
+- Only rank 0 writes checkpoints and logs (wandb).
+
 **2**. Export policy to onnx model:
 ```bash
 bash to_onnx.sh $YOUR_POLICY_PATH

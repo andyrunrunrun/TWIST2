@@ -144,6 +144,51 @@ ROOT_PROC_RANK = 0
 
 global_mp_device = None
 
+
+def unwrap_model(model):
+    """Return the underlying module if wrapped (e.g. DDP), otherwise return as-is."""
+    return getattr(model, "module", model)
+
+class ForwardingDistributedDataParallel(torch.nn.parallel.DistributedDataParallel):
+    """A DDP wrapper that forwards missing attributes/methods to the wrapped module.
+
+    PyTorch's stock `DistributedDataParallel` does not proxy arbitrary attributes
+    (e.g. custom methods like `act()`, `evaluate()`, `if_fix_std()`), but this
+    repo expects the wrapped policy to keep the same public API.
+    """
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
+
+def maybe_wrap_ddp(model: torch.nn.Module, device: str, find_unused_parameters: bool = True):
+    """Wrap `model` with DistributedDataParallel when running with torch.distributed."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return model
+    if torch.distributed.get_world_size() <= 1:
+        return model
+
+    if isinstance(device, str) and device.startswith("cuda"):
+        try:
+            local_rank = int(device.split(":")[1]) if ":" in device else 0
+        except Exception:
+            local_rank = 0
+        return ForwardingDistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=find_unused_parameters,
+        )
+
+    # CPU DDP (rare in this repo, but keep it functional).
+    return ForwardingDistributedDataParallel(
+        model,
+        find_unused_parameters=find_unused_parameters,
+    )
+
 def init(rank, num_procs, device, master_port):
     global global_mp_device
 
