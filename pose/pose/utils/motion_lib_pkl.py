@@ -4,8 +4,20 @@ from pose.utils.torch_utils import quat_diff, quat_to_exp_map, slerp, euler_from
 from tqdm import tqdm
 from pose.utils.isaacgym_torch_utils import quat_rotate_inverse, quat_mul, quat_conjugate
 import numpy as np
+import sys
+from types import ModuleType
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
+# Patch sys.modules to fake missing modules from numpy 2.x
+class FakeModule(ModuleType):
+    def __init__(self, name, real=None):
+        super().__init__(name)
+        if real:
+            self.__dict__.update(real.__dict__)
+
+# Patch potentially missing modules
+sys.modules['numpy._core'] = FakeModule('numpy._core', np.core if hasattr(np, 'core') else np)
+sys.modules['numpy._core.multiarray'] = FakeModule('numpy._core.multiarray', getattr(np.core, 'multiarray', None))
 
 def smooth(x, box_pts, device):
     box = torch.ones(box_pts, device=device) / box_pts
@@ -31,7 +43,7 @@ class MotionLib:
                  shuffle_motions: bool = False, # for YAML configs: shuffle before applying max_motions (ignored if motion_ids given)
                  shuffle_seed: int = 0,
                  store_on_cpu: bool = True, # keep dataset tensors on CPU, move slices to GPU on demand
-                 gpu_cache_gib: float = 4.0, # cache active motions on GPU up to this budget (GiB); 0 disables
+                 gpu_cache_gib: float = 5.0, # cache active motions on GPU up to this budget (GiB); 0 disables
                  ):
         self._device = torch.device(device)
         self._store_on_cpu = bool(store_on_cpu)

@@ -309,6 +309,8 @@ def get_args():
         {"name": "--teacher_checkpoint", "type": int, "help": "teacher checkpoint", "default": -1},
         {"name": "--eval_student", "action": "store_true", "default": False, "help": "eval student"},
         {"name": "--jit_path", "type": str, "help": "jit path", "default": None},
+        {"name": "--motion_file", "type": str, "help": "Path to single motion PKL file for play.py", "default": None},
+        {"name": "--student_only", "action": "store_true", "default": False, "help": "Load student model directly without teacher (for play.py)"},
     ]
     # parse arguments
     args = parse_arguments(

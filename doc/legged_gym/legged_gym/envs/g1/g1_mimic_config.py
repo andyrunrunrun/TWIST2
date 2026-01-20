@@ -35,7 +35,7 @@ class G1MimicCfg(HumanoidMimicCfg):
         pose_termination_dist = 0.7
         root_tracking_termination_dist = 0.8
         rand_reset = True
-        track_root = False
+        track_root = True
         dof_err_w = [1.0, 1.0, 1.0, 1.0, 0.1, 0.1, # Left Leg
                      1.0, 1.0, 1.0, 1.0, 0.1, 0.1, # Right Leg
                      1.0, 1.0, 1.0, # waist yaw, roll, pitch

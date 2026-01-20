@@ -51,6 +51,7 @@ import mujoco as mj
 import mujoco.viewer as mjv
 import numpy as np
 import cv2
+from scipy.spatial.transform import Rotation as R
 from loop_rate_limiters import RateLimiter
 from general_motion_retargeting import GeneralMotionRetargeting as GMR
 from general_motion_retargeting import ROBOT_XML_DICT, ROBOT_BASE_DICT, RobotMotionViewer
@@ -231,7 +232,18 @@ def retarget_raw_data(raw_data, retarget, model, data, target_fps, optimize_late
             root_rot = root_rot_wxyz[[1, 2, 3, 0]]
             
             dof_pos = qpos[7:]
-            local_body_pos = data.xpos.copy()
+            
+            # 计算局部 body 位置 (相对于根节点，在根节点局部坐标系中)
+            # 参考 mujoco_exec_eval.py 中的 _Kinematics.bodies_rel_pelvis 方法
+            # 1. 先计算全局坐标系中的位置差
+            global_body_pos = data.xpos.copy()
+            delta = global_body_pos - root_pos[None, :]  # (n_bodies, 3) - (1, 3)
+            # 2. 将位置差旋转到根关节的局部坐标系
+            # root_rot_wxyz 是 MuJoCo 格式 [w,x,y,z]，需要转换为 scipy 格式 [x,y,z,w]
+            root_rot_scipy = root_rot_wxyz[[1, 2, 3, 0]]  # [w,x,y,z] -> [x,y,z,w]
+            root_rot_mat = R.from_quat(root_rot_scipy).as_matrix()  # (3, 3)
+            # 应用逆旋转：local = R^T @ delta^T -> (3, n_bodies) -> 转置得到 (n_bodies, 3)
+            local_body_pos = (root_rot_mat.T @ delta.T).T
             
             root_pos_list.append(root_pos)
             root_rot_list.append(root_rot)
@@ -445,6 +457,14 @@ def preview_single_file(pkl_path, robot_name, actual_human_height, target_fps,
     n_frames = retargeted_data['root_pos'].shape[0]
     fps = retargeted_data['fps']
     print(f"  ✓ 重定向完成: {n_frames} 帧")
+    
+    # 保存重定向后的数据到 temp 目录
+    temp_dir = "/home/huanghao/source/temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    pkl_basename = os.path.splitext(os.path.basename(pkl_path))[0]
+    output_pkl_path = os.path.join(temp_dir, f"{pkl_basename}_retargeted.pkl")
+    save_retargeted_pkl(output_pkl_path, retargeted_data)
+    print(f"  ✓ 已保存到: {output_pkl_path}")
     print()
     
     # 可视化播放 / 录制视频
@@ -566,7 +586,7 @@ def parse_arguments():
     parser.add_argument(
         "--actual_human_height",
         type=float,
-        default=1.81,
+        default=1.80,
         help="操作者实际身高 (米)"
     )
     parser.add_argument(

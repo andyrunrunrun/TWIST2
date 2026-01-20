@@ -39,6 +39,7 @@ python train.py --task "${task_name}" \
                 --proj_name "${proj_name}" \
                 --exptid "${exptid}" \
                 --device "${device}" \
-                --teacher_exptid "None"
-                # --resume
+                --teacher_exptid "None" \
+                --max_iterations 150000 \
+                --resume \
                 # --debug
