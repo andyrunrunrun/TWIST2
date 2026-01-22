@@ -14,7 +14,7 @@ export LD_LIBRARY_PATH=/home/huanghao/source/code/TWIST2:$LD_LIBRARY_PATH
 SCRIPT_DIR=$(dirname $(realpath $0))
 
 # Default values
-DEFAULT_MOTION_CONFIG="/home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/test.yaml"
+DEFAULT_MOTION_CONFIG="/home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/pico_numpy123_w1_total563.yaml"
 DEFAULT_NUM_ENVS=4096
 DEFAULT_DEVICE="cuda:0"
 

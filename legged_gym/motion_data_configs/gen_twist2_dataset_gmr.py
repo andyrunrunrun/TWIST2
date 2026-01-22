@@ -35,26 +35,26 @@ def generate_output_filename(selected_folders, special_weights, default_weight, 
 # 注释掉不需要的文件夹即可排除
 # ============================================================
 SELECTED_FOLDERS = [
-    "AAAaaaaaaaatest",           # 测试文件夹
+    # "AAAaaaaaaaatest",           # 测试文件夹
     "AMASS",                     # AMASS 数据集
-    "EgoBody_g1_GMR_30fps",      # EgoBody 数据集
-    # "MotionMillion_g1_GMR_30fps",  # MotionMillion 数据集
-    "OMOMO",                     # OMOMO 数据集
-    "inter_x_gmr_120fps",        # Inter-X 数据集 (120fps)
-    "interhuman",                # InterHuman 数据集
-    "lafan1",                    # LaFAN1 数据集
+    "EgoBody_g1_GMR_30fps_numpy123",      # EgoBody 数据集
+    "inter_x_gmr_120fps",  # MotionMillion 数据集
+    "interhuman_numpy123",                     # OMOMO 数据集
+    "lafan1",        # Inter-X 数据集 (120fps)
+    "MotionMillion_g1_GMR_30fps_numpy123",                # InterHuman 数据集
+    "OMOMO",                    # LaFAN1 数据集
     "twist1_to_twist2",          # TWIST1 转换数据
-    "twist2_pico_clean",         # TWIST2 Pico 清洗后数据
-    "twist2_pico_no_clean",      # TWIST2 Pico 未清洗数据
+    "pico_numpy123",         # TWIST2 Pico 清洗后数据
     "v1_v2_v3_g1",               # V1/V2/V3 G1 数据
+    "CORE4D_Real_numpy123"
 ]
 
 # 配置特殊目录及其对应的权重
 # 格式: {"目录名": 权重, ...}
 SPECIAL_WEIGHTS = {
     "v1_v2_v3_g1": 10,
-    "twist2_pico_clean": 10,
-    "twist2_pico_no_clean": 10,
+    "pico_numpy123": 20,
+    "MotionMillion_g1_GMR_30fps_numpy123": 0.1,
 }
 DEFAULT_WEIGHT = 1
 
