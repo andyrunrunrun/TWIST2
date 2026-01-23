@@ -31,6 +31,9 @@
 from .base_config import BaseConfig
 
 class HumanoidCharCfg(BaseConfig):
+    class train:
+        precision = "float32"
+
     class env:
         num_envs = 8192
         num_actions = 19
@@ -337,6 +340,12 @@ class HumanoidCharCfg(BaseConfig):
 
 class HumanoidCharCfgPPO(BaseConfig):
     seed = 1
+    
+    class train:
+        # 训练精度: "float32" (默认), "float16", "bfloat16"
+        # float16/bfloat16 可显著减少显存使用（约 30-50%）
+        precision = "float32"
+    
     class policy:
         init_noise_std = 1.0
         actor_hidden_dims = [512, 256, 128]

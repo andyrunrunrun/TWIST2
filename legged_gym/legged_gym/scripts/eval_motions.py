@@ -146,7 +146,7 @@ def worker_main(args):
             self.seed = None
             self.rows = None
             self.cols = None
-            self.no_rand = True
+            self.no_rand = False
             self.max_iterations = None
             self.resume = False
             self.experiment_name = None

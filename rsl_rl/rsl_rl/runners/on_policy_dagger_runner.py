@@ -172,11 +172,15 @@ class OnPolicyDaggerRunner:
             self.critic_normalizer = None
         
         alg_class = eval(self.cfg["algorithm_class_name"]) # DaggerPPO
+        # 获取训练精度配置（从 train_cfg["precision"] 或 train_cfg["train"]["precision"]，默认 float32）
+        precision = train_cfg.get("precision", train_cfg.get("train", {}).get("precision", "float32"))
         self.alg = alg_class(self.env, 
                                   actor_critic,
                                   self.teacher_actor_critic,
                                   teacher_loaded=self.teacher_loaded,
-                                  device=self.device, **self.alg_cfg)
+                                  device=self.device,
+                                  precision=precision,
+                                  **self.alg_cfg)
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
         self.dagger_update_freq = self.alg_cfg["dagger_update_freq"]

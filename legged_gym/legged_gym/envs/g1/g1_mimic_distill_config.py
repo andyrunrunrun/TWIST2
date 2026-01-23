@@ -209,7 +209,7 @@ class G1MimicPrivCfg(HumanoidMimicCfg):
             # 0628 version  
             # tracking_joint_dof = 0.6
             tracking_joint_dof = 2.0
-            tracking_joint_vel = 0.2
+            tracking_joint_vel = 0.3
             # delta-local root translation (enable via CLI override)
             tracking_root_pose_delta_local = 0.0
             # tracking_root_translation_xy = 1.0
@@ -365,6 +365,7 @@ class G1MimicStuRLCfg(G1MimicPrivCfg):
 
 class G1MimicPrivCfgPPO(HumanoidMimicCfgPPO):
     seed = 1
+    precision = 'float32'
     class runner(HumanoidMimicCfgPPO.runner):
         policy_class_name = 'ActorCriticMimic'
         algorithm_class_name = 'PPO'

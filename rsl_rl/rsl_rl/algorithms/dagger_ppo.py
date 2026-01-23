@@ -36,6 +36,7 @@ import numpy as np
 from rsl_rl.modules import ActorCritic
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
 from rsl_rl.utils import unpad_trajectories
+from torch.amp import autocast, GradScaler
 import time
 import math
 
@@ -77,12 +78,25 @@ class DaggerPPO:
                  grad_penalty_coef_schedule = [0.0, 0.0, 10, 10],
                  std_schedule = [1.0, 1.0, 10, 10],
                  num_hist=10,
+                 precision="float32",
                  **kwargs
                  ):
 
         self.env = env
         self.device = device
         self.num_hist = num_hist
+
+        # AMP (Automatic Mixed Precision) 配置
+        self.precision = precision
+        self.use_amp = precision in ("float16", "bfloat16")
+        if precision == "float16":
+            self.amp_dtype = torch.float16
+        elif precision == "bfloat16":
+            self.amp_dtype = torch.bfloat16
+        else:
+            self.amp_dtype = None
+        # float16 需要 GradScaler 防止梯度下溢，bfloat16 动态范围更大不需要
+        self.scaler = GradScaler('cuda', enabled=(self.use_amp and precision == "float16"))
 
         self.desired_kl = desired_kl
         self.schedule = schedule
@@ -110,7 +124,7 @@ class DaggerPPO:
         self.dagger_coef = dagger_coef
         self.dagger_coef_anneal_steps = dagger_coef_anneal_steps
         self.dagger_coef_min = dagger_coef_min
-        cprint("[DaggerPPO] dagger_coef: {}, dagger_coef_anneal_steps: {}, dagger_coef_min: {}".format(dagger_coef, dagger_coef_anneal_steps, dagger_coef_min), "green")
+        cprint("[DaggerPPO] dagger_coef: {}, dagger_coef_anneal_steps: {}, dagger_coef_min: {}, precision: {}".format(dagger_coef, dagger_coef_anneal_steps, dagger_coef_min, precision), "green")
         
         self.gamma = gamma
         self.lam = lam
@@ -181,14 +195,17 @@ class DaggerPPO:
                 obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
                 old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch = sample
                 obs_est_batch = obs_batch.clone()
-                # Use module forward (model(...)) so DDP forward hooks are triggered.
-                _, actions_log_prob_batch, value_batch, mu_batch, sigma_batch, entropy_batch = self.actor_critic(
-                    obs_est_batch,
-                    critic_obs_batch,
-                    actions_batch,
-                    masks=masks_batch,
-                    hidden_states=hid_states_batch,
-                )
+                
+                # 使用 autocast 进行混合精度前向传播
+                with autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
+                    # Use module forward (model(...)) so DDP forward hooks are triggered.
+                    _, actions_log_prob_batch, value_batch, mu_batch, sigma_batch, entropy_batch = self.actor_critic(
+                        obs_est_batch,
+                        critic_obs_batch,
+                        actions_batch,
+                        masks=masks_batch,
+                        hidden_states=hid_states_batch,
+                    )
                 
                 # KL
                 if self.desired_kl != None and self.schedule == 'adaptive':
@@ -247,11 +264,20 @@ class DaggerPPO:
                 
                 loss += kl_teacher_student_loss
 
-                # Gradient step
+                # Gradient step with AMP support
                 self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
-                self.optimizer.step()
+                if self.use_amp and self.precision == "float16":
+                    # float16 使用 GradScaler 进行梯度缩放
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    # float32 或 bfloat16 直接反向传播
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+                    self.optimizer.step()
 
                 mean_value_loss += value_loss.item()
                 mean_surrogate_loss += surrogate_loss.item()
