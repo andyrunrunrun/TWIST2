@@ -124,3 +124,51 @@ bash to_onnx.sh legged_gym/logs/g1_stu_future/0116_student/model_20000.pt
 ```
 
 输出的 onnx 默认会在脚本 `legged_gym/legged_gym/scripts/save_onnx.py` 里指定的目录/文件名规则下生成。
+
+## 内存优化（大型数据集）
+
+当动作数据集过大导致 CPU 内存不足时，可以使用以下参数优化内存使用。
+
+### 参数说明
+
+| 参数 | 默认值 | 说明 | 对应配置项 |
+|------|--------|------|------|
+| `--motion.storage_dtype` | `float32` | 数据存储精度，设为 `float16` 可减少约 50% CPU 内存 | `--motion.storage_dtype` |
+| `--gpu_cache` | `4.0` | GPU 缓存预算（GiB），用于缓存活跃动作 | `--motion.gpu_cache_gib` |
+| `--cpu_cache` | `50.0` | CPU LRU 缓存预算（GiB），配合 lazy_load 使用 | `--motion.cpu_cache_gib` |
+| `--lazy_load` | `False` | 延迟加载模式，启动时只加载元数据，按需加载数据 | `--motion.lazy_load` |
+
+### 使用示例
+
+```bash
+# 使用 float16 存储减少内存（最简单的优化，内存减半）
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 legged_gym/legged_gym/scripts/train.py \
+    --task g1_stu_future \
+    --proj_name g1_stu_future \
+    --exptid 0116_student_lowmem \
+    --teacher_exptid 0106_teacher \
+    --num_envs 4096 --max_iterations 100000 \
+    --motion.storage_dtype float16 \
+    --gpu_cache 8.0 \
+    --motion.motion_file /path/to/large_dataset.yaml
+
+# 延迟加载模式（超大数据集，按需从磁盘加载）
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 legged_gym/legged_gym/scripts/train.py \
+    --task g1_stu_future \
+    --proj_name g1_stu_future \
+    --exptid 0116_student_lazyload \
+    --teacher_exptid 0106_teacher \
+    --num_envs 4096 --max_iterations 100000 \
+    --lazy_load \
+    --cpu_cache 100.0 \
+    --motion.storage_dtype float16 \
+    --motion.motion_file /path/to/huge_dataset.yaml
+```
+
+### 内存优化组合建议
+
+| 场景 | 推荐配置 |
+|------|---------|
+| 中等数据集（~100GB） | `--motion.storage_dtype float16` |
+| 大型数据集（~200GB） | `--motion.storage_dtype float16 --gpu_cache 8.0` |
+| 超大数据集（>200GB） | `--lazy_load --cpu_cache 100.0 --motion.storage_dtype float16` |

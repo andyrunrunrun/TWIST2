@@ -196,6 +196,18 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             # MotionLib GPU cache budget (GiB). Only applies to mimic tasks that have a `motion` cfg block.
             if hasattr(env_cfg, "motion"):
                 setattr(env_cfg.motion, "gpu_cache_gib", float(args.gpu_cache))
+        
+        if getattr(args, "cpu_cache", None) is not None:
+             if hasattr(env_cfg, "motion"):
+                setattr(env_cfg.motion, "cpu_cache_gib", float(args.cpu_cache))
+
+        if getattr(args, "lazy_load", False):
+             if hasattr(env_cfg, "motion"):
+                setattr(env_cfg.motion, "lazy_load", True)
+        elif getattr(args, "no_lazy_load", False):
+             if hasattr(env_cfg, "motion"):
+                setattr(env_cfg.motion, "lazy_load", False)
+
         # num envs
         if args.num_envs is not None:
             env_cfg.env.num_envs = args.num_envs
@@ -249,6 +261,18 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
         print("Applying config overrides:")
         for config_path, value in args.config_overrides.items():
             try:
+                # Handle aliases for motion config attributes
+                # motion.gpu_cache -> motion.gpu_cache_gib
+                # motion.cpu_cache -> motion.cpu_cache_gib
+                alias_map = {
+                    "motion.gpu_cache": "motion.gpu_cache_gib",
+                    "motion.cpu_cache": "motion.cpu_cache_gib",
+                    "env.motion.gpu_cache": "env.motion.gpu_cache_gib",
+                    "env.motion.cpu_cache": "env.motion.cpu_cache_gib",
+                }
+                if config_path in alias_map:
+                    config_path = alias_map[config_path]
+
                 # Try to apply to env_cfg with env. prefix
                 if env_cfg is not None and config_path.startswith('env.'):
                     # Remove 'env.' prefix for env_cfg
@@ -261,6 +285,17 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
                     train_path = config_path[6:]  # Remove 'train.'
                     set_nested_attr(cfg_train, train_path, value)
                     print(f"  cfg_train.{train_path} = {value}")
+                # motion.* parameters should ONLY apply to env_cfg, never to cfg_train
+                elif config_path.startswith('motion.'):
+                    if env_cfg is not None:
+                        try:
+                            set_nested_attr(env_cfg, config_path, value)
+                            print(f"  env_cfg.{config_path} = {value}")
+                        except AttributeError as e:
+                            print(f"  Warning: Failed to set env_cfg.{config_path} = {value}: {e}")
+                    else:
+                        # motion config cannot be applied when env_cfg is None (e.g., in make_alg_runner)
+                        print(f"  Info: Skipping {config_path} = {value} (env_cfg not available, will be applied in make_env)")
                 # Default: try env_cfg first, then cfg_train
                 elif env_cfg is not None:
                     try:
@@ -299,6 +334,9 @@ def get_args():
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
         {"name": "--device", "type": str, "default": "cuda:0", "help": 'Device for sim, rl, and graphics'},
         {"name": "--gpu_cache", "type": float, "default": 4.0, "help": "MotionLib VRAM cache budget per process (GiB)."},
+        {"name": "--cpu_cache", "type": float, "default": 50.0, "help": "MotionLib CPU cache budget when lazy_load is True (GiB)."},
+        {"name": "--lazy_load", "action": "store_true", "default": False, "help": "Enable lazy loading of motion data."},
+        {"name": "--no_lazy_load", "action": "store_true", "default": False, "help": "Disable lazy loading of motion data."},
 
         {"name": "--rows", "type": int, "help": "num_rows."},
         {"name": "--cols", "type": int, "help": "num_cols"},

@@ -316,7 +316,7 @@ class HumanoidCharCfg(BaseConfig):
         # Empty string means no filtering.
         motion_ids = ""
         # If True, shuffle the YAML motion list before applying max_motions/motion_ids.
-        shuffle_motions = False
+        shuffle_motions = True
         shuffle_seed = 0
         height_offset = 0.0
         reset_consec_frames = 50
@@ -324,6 +324,12 @@ class HumanoidCharCfg(BaseConfig):
         motion_decompose = False
         motion_smooth = True
         use_adaptive_pose_termination = False  # True: use adaptive termination distance, False: use fixed termination distance
+        
+        # Memory optimization parameters
+        lazy_load = False  # If True, only load metadata at startup; load motion data on-demand
+        cpu_cache_gib = 50.0  # CPU LRU cache budget in GiB when lazy_load=True
+        gpu_cache_gib = 4.0  # GPU cache budget in GiB for active motions
+        storage_dtype = "float32"  # Storage precision: "float32" or "float16" (halves CPU memory)
         
         # Motion Domain Randomization parameters
         motion_dr_enabled = False  # Enable motion domain randomization

@@ -10,12 +10,12 @@ CUDA_VISIBLE_DEVICES=4 python legged_gym/legged_gym/scripts/train.py \
     --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml
 
 # 多卡 DDP（torchrun）
-CUDA_VISIBLE_DEVICES=0,1,2,3,4 torchrun --standalone --nproc_per_node=5 legged_gym/legged_gym/scripts/train.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 legged_gym/legged_gym/scripts/train.py \
     --task g1_priv_mimic \
     --proj_name g1_priv_mimic \
-    --exptid 0121_teacher_ddp_AMASS_w1_EgoBody_numpy123_w1_inter_x_w1_interhuman_numpy123_w1_lafan1_w1_MotionMillion_numpy123_w0.1_OMOMO_w1_twist1_to_twist2_w1_pico_numpy123_w20_v1_v2_v3_g1_w10_CORE4D_Real_numpy123_w1_total1443478 \
+    --exptid dataset_mix_8203b425_total328739 \
     --num_envs 4096 --max_iterations 300000 \
-    --motion.motion_file /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/AMASS_w1_EgoBody_numpy123_w1_inter_x_w1_interhuman_numpy123_w1_lafan1_w1_MotionMillion_numpy123_w0.1_OMOMO_w1_twist1_to_twist2_w1_pico_numpy123_w20_v1_v2_v3_g1_w10_CORE4D_Real_numpy123_w1_total1443478.yaml
+    --motion.motion_file /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/dataset_mix_8203b425_total328739.yaml
 
 # 续训
 
@@ -133,3 +133,49 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 legged_gym
 
    - `float32` → `float16`：显存减少约 40-50%
    - 例如：原本需要 24GB 显存的任务，使用 float16 可能只需 12-15GB
+
+## 内存优化（大型数据集）
+
+当动作数据集过大导致 CPU 内存不足时，可以使用以下参数优化内存使用。
+
+### 参数说明
+
+| 参数 | 默认值 | 说明 | 对应配置项 |
+|------|--------|------|------|
+| `--motion.storage_dtype` | `float32` | 数据存储精度，设为 `float16` 可减少约 50% CPU 内存 | `--motion.storage_dtype` |
+| `--gpu_cache` | `4.0` | GPU 缓存预算（GiB），用于缓存活跃动作 | `--motion.gpu_cache_gib` |
+| `--cpu_cache` | `50.0` | CPU LRU 缓存预算（GiB），配合 lazy_load 使用 | `--motion.cpu_cache_gib` |
+| `--lazy_load` | `False` | 延迟加载模式，启动时只加载元数据，按需加载数据 | `--motion.lazy_load` |
+
+### 使用示例
+
+```bash
+# 使用 float16 存储减少内存（最简单的优化，内存减半）
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 legged_gym/legged_gym/scripts/train.py \
+    --task g1_priv_mimic \
+    --proj_name g1_priv_mimic \
+    --exptid 0123_teacher_lowmem \
+    --num_envs 4096 --max_iterations 300000 \
+    --motion.storage_dtype float16 \
+    --gpu_cache 8.0 \
+    --motion.motion_file /path/to/large_dataset.yaml
+
+# 延迟加载模式（超大数据集，按需从磁盘加载）
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 legged_gym/legged_gym/scripts/train.py \
+    --task g1_priv_mimic \
+    --proj_name g1_priv_mimic \
+    --exptid 0123_teacher_lazyload \
+    --num_envs 4096 --max_iterations 300000 \
+    --lazy_load \
+    --cpu_cache 100.0 \
+    --motion.storage_dtype float16 \
+    --motion.motion_file /path/to/huge_dataset.yaml
+```
+
+### 内存优化组合建议
+
+| 场景 | 推荐配置 |
+|------|---------|
+| 中等数据集（~100GB） | `--motion.storage_dtype float16` |
+| 大型数据集（~200GB） | `--motion.storage_dtype float16 --gpu_cache 8.0` |
+| 超大数据集（>200GB） | `--lazy_load --cpu_cache 100.0 --motion.storage_dtype float16` |

@@ -104,6 +104,10 @@ class HumanoidMimic(HumanoidChar):
             shuffle_seed=getattr(self.cfg.motion, "shuffle_seed", 0),
             hy_feat_cache_motions=getattr(self.cfg.motion, "hy_feat_cache_motions", 0),
             gpu_cache_gib=getattr(self.cfg.motion, "gpu_cache_gib", 4.0),
+            # Memory optimization parameters
+            lazy_load=getattr(self.cfg.motion, "lazy_load", False),
+            cpu_cache_gib=getattr(self.cfg.motion, "cpu_cache_gib", 50.0),
+            storage_dtype=getattr(self.cfg.motion, "storage_dtype", "float32"),
         )
         return
     

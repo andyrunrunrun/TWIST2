@@ -72,7 +72,8 @@ class G1MimicStuFutureCfg(G1MimicPrivCfg):
             only_apply_resistance_when_walking = True # Apply resistance forces against movement
     
     class motion(G1MimicPrivCfg.motion):
-        motion_file = f"{LEGGED_GYM_ROOT_DIR}/motion_data_configs/twist2_pico_clean_np123_w10_twist2_pico_no_clean_np123_w3_total563.yaml"
+        # 使用已经 retargeted 到 G1 skeleton 的数据
+        motion_file = f"{LEGGED_GYM_ROOT_DIR}/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml"
         
         # Ensure motion curriculum is enabled for difficulty adaptation
         motion_curriculum = True
