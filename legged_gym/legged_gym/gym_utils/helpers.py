@@ -208,6 +208,15 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
              if hasattr(env_cfg, "motion"):
                 setattr(env_cfg.motion, "lazy_load", False)
 
+        # Motion resample mode
+        if getattr(args, "motion_resample_interval", 0) > 0:
+            if hasattr(env_cfg, "motion"):
+                setattr(env_cfg.motion, "resample_interval", int(args.motion_resample_interval))
+                setattr(env_cfg.motion, "resample_per_gpu", int(getattr(args, "motion_resample_per_gpu", 15000)))
+                # Auto-enable lazy_load for resample mode
+                setattr(env_cfg.motion, "lazy_load", True)
+                print(f"[Motion Resample] Enabled: interval={args.motion_resample_interval}, per_gpu={args.motion_resample_per_gpu}")
+
         # num envs
         if args.num_envs is not None:
             env_cfg.env.num_envs = args.num_envs
@@ -337,6 +346,9 @@ def get_args():
         {"name": "--cpu_cache", "type": float, "default": 50.0, "help": "MotionLib CPU cache budget when lazy_load is True (GiB)."},
         {"name": "--lazy_load", "action": "store_true", "default": False, "help": "Enable lazy loading of motion data."},
         {"name": "--no_lazy_load", "action": "store_true", "default": False, "help": "Disable lazy loading of motion data."},
+
+        {"name": "--motion_resample_interval", "type": int, "default": 0, "help": "Resample motion subset every N iterations. 0 = disabled (use default cache)."},
+        {"name": "--motion_resample_per_gpu", "type": int, "default": 15000, "help": "Number of motion samples to load per GPU when resampling is enabled."},
 
         {"name": "--rows", "type": int, "help": "num_rows."},
         {"name": "--cols", "type": int, "help": "num_cols"},

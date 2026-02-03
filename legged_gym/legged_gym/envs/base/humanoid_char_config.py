@@ -330,7 +330,11 @@ class HumanoidCharCfg(BaseConfig):
         cpu_cache_gib = 50.0  # CPU LRU cache budget in GiB when lazy_load=True
         gpu_cache_gib = 4.0  # GPU cache budget in GiB for active motions
         storage_dtype = "float32"  # Storage precision: "float32" or "float16" (halves CPU memory)
-        
+
+        # Periodic resample mode: resample motion subset every N iterations
+        resample_interval = 0  # 0 = disabled (use default cache behavior)
+        resample_per_gpu = 15000  # Number of motions to load per GPU when resample is enabled
+
         # Motion Domain Randomization parameters
         motion_dr_enabled = False  # Enable motion domain randomization
         root_position_noise = [0.01, 0.05]  # ±1-5cm noise range for root position [min, max]

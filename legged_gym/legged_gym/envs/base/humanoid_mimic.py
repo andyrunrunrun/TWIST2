@@ -92,6 +92,10 @@ class HumanoidMimic(HumanoidChar):
         self._init_motion_buffers()
         
     def _load_motions(self):
+        # Check if resample mode is enabled (resample_interval > 0)
+        resample_interval = getattr(self.cfg.motion, "resample_interval", 0)
+        skip_ddp_sharding = (resample_interval > 0)
+
         self._motion_lib = MotionLib(
             motion_file=self.cfg.motion.motion_file,
             device=self.device,
@@ -108,6 +112,8 @@ class HumanoidMimic(HumanoidChar):
             lazy_load=getattr(self.cfg.motion, "lazy_load", False),
             cpu_cache_gib=getattr(self.cfg.motion, "cpu_cache_gib", 50.0),
             storage_dtype=getattr(self.cfg.motion, "storage_dtype", "float32"),
+            # Skip DDP sharding in resample mode to allow sampling from full dataset
+            skip_ddp_sharding=skip_ddp_sharding,
         )
         return
     
@@ -135,6 +141,10 @@ class HumanoidMimic(HumanoidChar):
         # compare two tensors are same
         # assert torch.equal(self._key_body_ids, torch.tensor(key_body_ids_motion, device=self.device, dtype=torch.long)), \
         #     f"Key body ids mismatch: {self._key_body_ids} vs {key_body_ids_motion}"
+
+        # Store resample config for training loop to access
+        self._motion_resample_interval = getattr(self.cfg.motion, "resample_interval", 0)
+        self._motion_resample_per_gpu = getattr(self.cfg.motion, "resample_per_gpu", 15000)
     
     def _reset_ref_motion(self, env_ids, motion_ids=None):
         n = len(env_ids)

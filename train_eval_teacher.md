@@ -179,3 +179,70 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 legged_gym
 | 中等数据集（~100GB） | `--motion.storage_dtype float16` |
 | 大型数据集（~200GB） | `--motion.storage_dtype float16 --gpu_cache 8.0` |
 | 超大数据集（>200GB） | `--lazy_load --cpu_cache 100.0 --motion.storage_dtype float16` |
+
+---
+
+## 定期重采样模式（Periodic Resample）
+
+定期重采样模式是一种新的训练策略：**每次只加载部分数据到 GPU，训练一定步数后清空并重新采样新数据**。
+
+### 工作原理
+
+```
+启动 → 采样 N 条 motion → 训练 X 次迭代 → 清空 GPU 缓存
+              ↓                              ↓
+         采样新 motion ← ← ← ← ← ← ← ← ← ← ← ←
+              ↓
+         继续训练 X 次迭代
+              ↓
+         循环...
+```
+
+### 参数说明
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--motion_resample_interval` | `0` | 重采样间隔（迭代次数），`0` 表示禁用该模式 |
+| `--motion_resample_per_gpu` | `15000` | 每张卡加载的 motion 条数 |
+
+### 使用示例
+
+```bash
+# 每 50 次迭代重采样，每卡 15000 条数据（4 卡 = 60000 条）
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 legged_gym/legged_gym/scripts/train.py \
+    --task g1_priv_mimic \
+    --proj_name g1_priv_mimic \
+    --exptid 0203_teacher_resample \
+    --num_envs 4096 --max_iterations 300000 \
+    --motion_resample_interval 100 \
+    --motion_resample_per_gpu 15000 \
+    --motion.motion_file /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/dataset_mix_8203b425_total328739.yaml
+
+# 更激进的重采样：每 20 次迭代重采样，每卡 10000 条
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 legged_gym/legged_gym/scripts/train.py \
+    --task g1_priv_mimic \
+    --proj_name g1_priv_mimic \
+    --exptid 0203_teacher_resample_aggressive \
+    --num_envs 4096 --max_iterations 300000 \
+    --motion_resample_interval 20 \
+    --motion_resample_per_gpu 10000 \
+    --motion.motion_file /path/to/dataset.yaml
+```
+
+### 与原模式的对比
+
+| 特性 | 原缓存模式 | 重采样模式 |
+|------|-----------|-----------|
+| GPU 内存 | 动态 LRU 缓存 | 固定 N 条数据 |
+| CPU 内存 | 大量缓存 | 不需要（lazy_load） |
+| 数据多样性 | 逐步访问全部数据 | 定期重新采样 |
+| 适用场景 | 数据集适中 | 超大数据集 / 想增加数据多样性 |
+
+### 多卡自动计算
+
+重采样模式下，实际加载的 motion 总数 = `motion_resample_per_gpu × GPU 数量`：
+
+| GPU 数 | per_gpu=15000 | per_gpu=10000 |
+|--------|---------------|---------------|
+| 4 卡 | 60000 条 | 40000 条 |
+| 8 卡 | 120000 条 | 80000 条 |

@@ -39,9 +39,9 @@ def smooth(x, box_pts, device):
 
 
 class MotionLib:
-    def __init__(self, motion_file, device, 
-                 motion_decompose=False, 
-                 motion_smooth=True, 
+    def __init__(self, motion_file, device,
+                 motion_decompose=False,
+                 motion_smooth=True,
                  motion_height_adjust=False,
                  sample_ratio=1.0, # only sample a portion of the motion
                  max_motions: int = -1, # for YAML configs: only load first N after filtering
@@ -56,6 +56,7 @@ class MotionLib:
                  lazy_load: bool = False,  # If True, only load metadata at startup; load motion data on-demand
                  cpu_cache_gib: float = 50.0, # CPU LRU cache budget in GiB when lazy_load=True; 0 disables
                  storage_dtype: str = "float32",  # Storage precision: "float32" or "float16" (halves CPU memory)
+                 skip_ddp_sharding: bool = False,  # If True, skip DDP sharding to allow sampling from full dataset
                  ):
         self._device = torch.device(device)
         self._store_on_cpu = bool(store_on_cpu)
@@ -70,6 +71,9 @@ class MotionLib:
             self._storage_dtype = torch.float16
         else:
             self._storage_dtype = torch.float32
+
+        # DDP sharding control (for resample mode)
+        self._skip_ddp_sharding = bool(skip_ddp_sharding)
 
         # motion augmentation by decomposing long motion into short motions
         self._motion_decompose = motion_decompose
@@ -96,7 +100,39 @@ class MotionLib:
         self._cpu_motion_cache: "OrderedDict[int, dict]" = OrderedDict()
         self._cpu_cache_bytes_used = 0
         self._cpu_cache_max_bytes = int(cpu_cache_gib * (1024 ** 3))
-        
+
+        # Periodic resample mode: only use a subset of motions
+        self._resample_mode = False  # Whether resample mode is enabled
+        self._loaded_subset_ids: set = set()  # Current subset of motion IDs
+        self._full_motion_ids = []  # All available motion IDs (for resampling)
+
+        # Resample mode: direct GPU storage (no cache, simple and direct)
+        # Stores motion data directly on GPU, bypassing all cache layers
+        self._resample_gpu_storage: dict = {}  # {motion_id: {root_pos, root_rot, ...}} on GPU
+
+        # Resample mode: merged GPU tensors (optimized for speed)
+        self._gpu_root_pos = None
+        self._gpu_root_rot = None
+        self._gpu_root_vel = None
+        self._gpu_root_ang_vel = None
+        self._gpu_dof_pos = None
+        self._gpu_dof_vel = None
+        self._gpu_local_body_pos = None
+        self._gpu_root_pos_delta_local = None
+        self._gpu_root_rot_delta_local = None
+        self._gpu_root_pos_delta = None  # Per-motion delta
+        self._motion_id_to_frame = {}  # {motion_id: (start_frame, num_frames)}
+        self._motion_id_to_idx = {}  # {motion_id: index_in_subset}
+        self._motion_start_frame = None  # GPU tensor: motion_id -> start_frame
+        self._motion_id_to_idx_tensor = None  # GPU tensor: motion_id -> index
+        self._motion_start_idx_by_id = None  # GPU tensor: motion_id -> start_frame (resample mode)
+        self._resample_D = 0
+        self._resample_B = 0
+        self._resample_total_motions = 0
+        self._resample_total_frames = 0
+        self._motion_num_frames_resample = None  # Resample mode: num_frames per motion
+        self._motion_lengths_resample = None  # Resample mode: length per motion
+
         # load motions
         self._load_motions(motion_file)
         
@@ -291,12 +327,14 @@ class MotionLib:
             self._motion_start_idx = torch.zeros(len(self._motion_weights), dtype=torch.long, device=self._device)
             self._motion_start_idx_cpu = self._motion_start_idx.to("cpu")
             # But we must ensure _motion_root_pos etc are indexable lists (already populated with Nones)
-            
+
         self._motion_num_frames_cpu = self._motion_num_frames.to("cpu")
-        
+
         num_motions = self.num_motions()
         self._motion_ids = torch.arange(num_motions, dtype=torch.long, device=self._device)
-        
+        # Store full list of motion IDs for resample mode
+        self._full_motion_ids = list(range(num_motions))
+
         total_len = self.get_total_length()
         print("Loaded {:d} motions with a total length of {:.3f}s.".format(num_motions, total_len))
 
@@ -388,13 +426,252 @@ class MotionLib:
             "root_rot_delta_local": cast(root_rot_delta_local),
             "root_pos_delta": cast(root_pos_delta) # This is single vector usually, but keep consistent
         }
+
+        # Duplicate code from above (exists in original codebase, keeping for consistency)
         self._motion_num_frames_cpu = self._motion_num_frames.to("cpu")
-        
+
         num_motions = self.num_motions()
         self._motion_ids = torch.arange(num_motions, dtype=torch.long, device=self._device)
-        
+
         total_len = self.get_total_length()
         print("Loaded {:d} motions with a total length of {:.3f}s.".format(num_motions, total_len))
+
+    # ========================================================================
+    # Periodic Resample Mode Methods
+    # ========================================================================
+
+    def enable_resample_mode(self, motion_ids: list):
+        """Enable resample mode with MERGED GPU tensors (optimized for speed).
+
+        Data is loaded DIRECTLY to GPU as merged tensors, avoiding CPU-GPU sync.
+        Bypasses ALL CPU/GPU cache and LRU eviction logic.
+
+        Args:
+            motion_ids: List of motion IDs to load directly to GPU
+        """
+        from tqdm import tqdm
+
+        self._resample_mode = True
+        self._loaded_subset_ids = set(motion_ids)
+
+        # Clear ALL caches (we don't use them in resample mode)
+        if self._lazy_load:
+            self._cpu_motion_cache.clear()
+            self._cpu_cache_bytes_used = 0
+        self._clear_gpu_cache()
+        self._resample_gpu_storage.clear()
+
+        print(f"[MotionLib] Loading {len(motion_ids)} motions to GPU (merged tensors)...")
+
+        # First pass: collect motion info (num_frames per motion)
+        motion_info = []  # [(motion_id, num_frames, data)]
+        total_frames = 0
+
+        for motion_id in tqdm(motion_ids, desc="[MotionLib] Loading metadata", unit="motion"):
+            data = self._load_motion_on_demand(motion_id)
+            num_frames = data["root_pos"].shape[0]
+            motion_info.append({
+                "id": motion_id,
+                "num_frames": num_frames,
+                "start_frame": total_frames,
+                "data": data,  # Keep reference to avoid reloading
+            })
+            total_frames += num_frames
+
+        # Get dimensions from first motion
+        first_data = motion_info[0]["data"]
+        D = first_data["dof_pos"].shape[-1]
+        B = first_data["local_body_pos"].shape[1]
+
+        # Allocate merged tensors on GPU
+        print(f"[MotionLib] Allocating {total_frames} frames on GPU...")
+        self._gpu_root_pos = torch.empty((total_frames, 3), device=self._device, dtype=torch.float32)
+        self._gpu_root_rot = torch.empty((total_frames, 4), device=self._device, dtype=torch.float32)
+        self._gpu_root_vel = torch.empty((total_frames, 3), device=self._device, dtype=torch.float32)
+        self._gpu_root_ang_vel = torch.empty((total_frames, 3), device=self._device, dtype=torch.float32)
+        self._gpu_dof_pos = torch.empty((total_frames, D), device=self._device, dtype=torch.float32)
+        self._gpu_dof_vel = torch.empty((total_frames, D), device=self._device, dtype=torch.float32)
+        self._gpu_local_body_pos = torch.empty((total_frames, B, 3), device=self._device, dtype=torch.float32)
+        self._gpu_root_pos_delta_local = torch.empty((total_frames, 3), device=self._device, dtype=torch.float32)
+        self._gpu_root_rot_delta_local = torch.empty((total_frames, 3), device=self._device, dtype=torch.float32)
+
+        # Create motion_id to frame range mapping
+        self._motion_id_to_frame = {}  # {motion_id: (start_frame, num_frames)}
+
+        # Create motion_id to index mapping for per-motion data (like root_pos_delta)
+        self._motion_id_to_idx = {mid: i for i, mid in enumerate(motion_ids)}
+
+        # Allocate per-motion tensors
+        self._gpu_root_pos_delta = torch.empty((len(motion_ids), 3), device=self._device, dtype=torch.float32)
+
+        # Second pass: fill merged tensors
+        for info in tqdm(motion_info, desc="[MotionLib] Copying to GPU", unit="motion"):
+            motion_id = info["id"]
+            start = info["start_frame"]
+            num_frames = info["num_frames"]
+            end = start + num_frames
+            data = info["data"]
+
+            # Copy to GPU
+            self._gpu_root_pos[start:end] = data["root_pos"].to(self._device)
+            self._gpu_root_rot[start:end] = data["root_rot"].to(self._device)
+            self._gpu_root_vel[start:end] = data["root_vel"].to(self._device)
+            self._gpu_root_ang_vel[start:end] = data["root_ang_vel"].to(self._device)
+            self._gpu_dof_pos[start:end] = data["dof_pos"].to(self._device)
+            self._gpu_dof_vel[start:end] = data["dof_vel"].to(self._device)
+            self._gpu_local_body_pos[start:end] = data["local_body_pos"].to(self._device)
+            self._gpu_root_pos_delta_local[start:end] = data["root_pos_delta_local"].to(self._device)
+            self._gpu_root_rot_delta_local[start:end] = data["root_rot_delta_local"].to(self._device)
+
+            # Per-motion root_pos_delta
+            if not isinstance(self._motion_root_pos_delta[motion_id], type(None)):
+                self._gpu_root_pos_delta[self._motion_id_to_idx[motion_id]] = self._motion_root_pos_delta[motion_id].to(self._device)
+            else:
+                self._gpu_root_pos_delta[self._motion_id_to_idx[motion_id]] = 0.0
+
+            self._motion_id_to_frame[motion_id] = (start, num_frames)
+
+        # Create fast lookup table: motion_id -> start_frame (GPU tensor for no-sync indexing)
+        max_motion_id = max(motion_ids)
+        self._motion_start_frame = torch.zeros(max_motion_id + 1, device=self._device, dtype=torch.long)
+        for mid, (start, _) in self._motion_id_to_frame.items():
+            self._motion_start_frame[mid] = start
+
+        # Create motion_id -> index lookup table (GPU tensor)
+        self._motion_id_to_idx_tensor = torch.full((max_motion_id + 1,), -1, device=self._device, dtype=torch.long)
+        for mid, idx in self._motion_id_to_idx.items():
+            self._motion_id_to_idx_tensor[mid] = idx
+
+        # IMPORTANT: Update _motion_start_idx, _motion_num_frames, _motion_lengths for resample mode
+        # This makes _calc_frame_blend work correctly with the subset data
+        num_motions_subset = len(motion_ids)
+        subset_num_frames = torch.tensor([info["num_frames"] for info in motion_info],
+                                        device=self._device, dtype=torch.long)
+        subset_lengths = torch.tensor([info["num_frames"] / self._motion_fps[self._motion_id_to_idx[mid]]
+                                        for info, mid in zip(motion_info, motion_ids)],
+                                        device=self._device, dtype=torch.float)
+
+        # Store resample-specific data (don't overwrite original)
+        self._motion_num_frames_resample = subset_num_frames
+        self._motion_lengths_resample = subset_lengths
+
+        # Calculate start_idx for each motion in the subset (in subset order, not motion_id order)
+        # motion_info is in the same order as motion_ids
+        lengths_shifted = torch.roll(subset_num_frames, 1)
+        lengths_shifted[0] = 0
+        start_indices = lengths_shifted.cumsum(0)
+
+        # Create mapping from subset index to motion_id
+        # _motion_start_idx[i] = start frame of motion with subset index i
+        self._motion_start_idx = start_indices  # Overwrite with subset start_idx!
+
+        # But we also need to handle motion_id indexing: _motion_start_idx[motion_id]
+        # In resample mode, motion_ids can be arbitrary (not 0..N-1)
+        # So we need a lookup table
+        max_id = max(motion_ids)
+        self._motion_start_idx_by_id = torch.full((max_id + 1,), -1, device=self._device, dtype=torch.long)
+        for i, mid in enumerate(motion_ids):
+            self._motion_start_idx_by_id[mid] = start_indices[i]
+
+        # Cache dimensions
+        self._resample_D = D
+        self._resample_B = B
+        self._resample_total_motions = len(motion_ids)
+        self._resample_total_frames = total_frames
+
+        print(f"[MotionLib] GPU loading complete: {len(motion_ids)} motions, {total_frames} frames")
+        print(f"[MotionLib] Tensor shapes: root_pos={self._gpu_root_pos.shape}, dof_pos={self._gpu_dof_pos.shape}")
+
+    def _motion_ids_to_indices(self, motion_ids: torch.Tensor) -> torch.Tensor:
+        """Convert motion_ids to indices in the resample subset.
+
+        Args:
+            motion_ids: Tensor of motion IDs [n]
+
+        Returns:
+            Tensor of indices [n] for indexing into per-motion tensors
+        """
+        return self._motion_id_to_idx_tensor[motion_ids]
+
+    def _preload_subset_cache(self, motion_ids: list):
+        """NO-OP in resample mode (data is loaded directly to GPU).
+
+        In resample mode, enable_resample_mode() loads data DIRECTLY to GPU,
+        bypassing CPU cache entirely. This method is kept for compatibility
+        but does nothing.
+
+        Args:
+            motion_ids: List of motion IDs (ignored)
+        """
+        # NO-OP: In resample mode, data is already on GPU via enable_resample_mode()
+        pass
+
+    def resample_subset(self, num_motions: int, seed: Optional[int] = None, motion_difficulty=None, preload=False):
+        """Resample a new subset of motions and load DIRECTLY to GPU.
+
+        Args:
+            num_motions: Number of motions to sample
+            seed: Random seed for reproducibility
+            motion_difficulty: Optional difficulty weights for sampling
+            preload: IGNORED (kept for compatibility). Data is always loaded directly to GPU.
+
+        Returns:
+            List of sampled motion IDs
+        """
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        num_total = len(self._full_motion_ids)
+
+        # If requesting more motions than available, use all
+        if num_motions >= num_total:
+            sampled_ids = self._full_motion_ids.copy()
+            print(f"[MotionLib] Requested {num_motions} motions, but only {num_total} available. Using all.")
+        else:
+            # Use the same sampling logic as sample_motions (weighted by motion_weights and difficulty)
+            if motion_difficulty is not None:
+                motion_prob = self._motion_weights * motion_difficulty
+            else:
+                motion_prob = self._motion_weights
+
+            # Sample with replacement if num_motions > num_total, without replacement otherwise
+            replacement = num_motions > num_total
+            sampled_tensor = torch.multinomial(
+                motion_prob,
+                num_samples=num_motions,
+                replacement=replacement
+            )
+            sampled_ids = sampled_tensor.cpu().tolist()
+
+        # Enable resample mode with new subset (loads DIRECTLY to GPU)
+        self.enable_resample_mode(sampled_ids)
+
+        return sampled_ids
+
+    def _clear_gpu_cache(self):
+        """Clear the GPU cache."""
+        if not self._gpu_cache_enabled:
+            return
+
+        self._cache_frames_used = 0
+        self._cache_free = []
+        self._cache_meta = {}
+        self._cache_lru = OrderedDict()
+
+        if hasattr(self, '_cache_offset'):
+            self._cache_offset.fill_(-1)
+        if hasattr(self, '_cache_len'):
+            self._cache_len.fill_(0)
+
+    def _is_motion_in_subset(self, motion_id: int) -> bool:
+        """Check if a motion ID is in the current loaded subset."""
+        if not self._resample_mode:
+            return True  # If not in resample mode, all motions are available
+        return motion_id in self._loaded_subset_ids
+
+    # ========================================================================
+    # End of Periodic Resample Mode Methods
+    # ========================================================================
 
     def _add_motions(self, root_pos, root_rot, dof_pos, local_body_pos, fps, curr_weight, curr_file):
         dt = 1.0 / fps
@@ -813,7 +1090,55 @@ class MotionLib:
         motion_times -= motion_loop_num * self._motion_lengths[motion_ids]
 
         frame_idx0, frame_idx1, frame_idx0_local, frame_idx1_local, blend = self._calc_frame_blend(motion_ids, motion_times)
-        
+
+        # =====================================================================
+        # RESAMPLE MODE: Merged GPU tensors (same logic as official, no CPU-GPU sync)
+        # =====================================================================
+        if self._resample_mode:
+            # Use the same logic as official implementation
+            # frame_idx0/1 are already absolute indices (computed by _calc_frame_blend)
+
+            root_pos0 = self._gpu_root_pos[frame_idx0]
+            root_pos1 = self._gpu_root_pos[frame_idx1]
+
+            root_rot0 = self._gpu_root_rot[frame_idx0]
+            root_rot1 = self._gpu_root_rot[frame_idx1]
+
+            root_vel = self._gpu_root_vel[frame_idx0]
+            root_ang_vel = self._gpu_root_ang_vel[frame_idx0]
+
+            dof_pos0 = self._gpu_dof_pos[frame_idx0]
+            dof_pos1 = self._gpu_dof_pos[frame_idx1]
+
+            local_key_body_pos0 = self._gpu_local_body_pos[frame_idx0]
+            local_key_body_pos1 = self._gpu_local_body_pos[frame_idx1]
+
+            dof_vel = self._gpu_dof_vel[frame_idx0]
+
+            blend_unsqueeze = blend.unsqueeze(-1)
+            root_pos = (1.0 - blend_unsqueeze) * root_pos0 + blend_unsqueeze * root_pos1
+            # Get root_pos_delta per motion
+            motion_indices = self._motion_ids_to_indices(motion_ids)
+            root_pos += motion_loop_num.unsqueeze(-1) * self._gpu_root_pos_delta[motion_indices]
+            root_rot = slerp(root_rot0, root_rot1, blend)
+
+            dof_pos = (1.0 - blend_unsqueeze) * dof_pos0 + blend_unsqueeze * dof_pos1
+
+            local_key_body_pos = (1.0 - blend_unsqueeze.unsqueeze(1)) * local_key_body_pos0 + blend_unsqueeze.unsqueeze(1) * local_key_body_pos1
+
+            root_pos_delta_local0 = self._gpu_root_pos_delta_local[frame_idx0]
+            root_pos_delta_local1 = self._gpu_root_pos_delta_local[frame_idx1]
+            root_pos_delta_local = (1.0 - blend_unsqueeze) * root_pos_delta_local0 + blend_unsqueeze * root_pos_delta_local1
+
+            root_rot_delta_local0 = self._gpu_root_rot_delta_local[frame_idx0]
+            root_rot_delta_local1 = self._gpu_root_rot_delta_local[frame_idx1]
+            root_rot_delta_local = (1.0 - blend_unsqueeze) * root_rot_delta_local0 + blend_unsqueeze * root_rot_delta_local1
+
+            return root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, local_key_body_pos, root_pos_delta_local, root_rot_delta_local
+
+        # =====================================================================
+        # ORIGINAL MODE: CPU/GPU cache path
+        # =====================================================================
         # Ensure motions are loaded if using lazy load (must happen before gathering, cache or not)
         if self._lazy_load:
             # Gather unique IDs on CPU to avoid devicesync if possible, but IDs are on GPU.
@@ -1194,32 +1519,63 @@ class MotionLib:
     def get_total_length(self):
         return torch.sum(self._motion_lengths).item()
     
-    def sample_motions(self, n, motion_difficulty=None, max_key_body_error=None, 
-                      use_error_aware_sampling=False, error_sampling_power=5.0, 
+    def sample_motions(self, n, motion_difficulty=None, max_key_body_error=None,
+                      use_error_aware_sampling=False, error_sampling_power=5.0,
                       error_sampling_threshold=0.15):
-        if motion_difficulty is not None:
-            if use_error_aware_sampling and max_key_body_error is not None:
-                # Apply error aware sampling formula
-                error_aware_prob = torch.ones_like(motion_difficulty)
-                
-                # Apply error aware probability only when motion_difficulty == 1
-                difficulty_one_mask = (motion_difficulty == 1.0)
-                if difficulty_one_mask.any():
-                    normalized_error = torch.clamp(max_key_body_error / error_sampling_threshold, max=1.0)
-                    error_prob = normalized_error ** error_sampling_power
-                    error_aware_prob[difficulty_one_mask] = error_prob[difficulty_one_mask]
-                
-                # For motion_difficulty > 1, use original difficulty
-                difficulty_gt_one_mask = (motion_difficulty > 1.0)
-                error_aware_prob[difficulty_gt_one_mask] = motion_difficulty[difficulty_gt_one_mask]
-                
-                motion_prob = self._motion_weights * error_aware_prob
+        # In resample mode, only sample from the loaded subset
+        if self._resample_mode and self._loaded_subset_ids:
+            # Get subset IDs as a tensor
+            subset_ids = torch.tensor(list(self._loaded_subset_ids), device=self._device, dtype=torch.long)
+            subset_weights = self._motion_weights[subset_ids]
+
+            # Apply difficulty if provided
+            if motion_difficulty is not None:
+                subset_difficulty = motion_difficulty[subset_ids]
+                if use_error_aware_sampling and max_key_body_error is not None:
+                    # Apply error aware sampling formula
+                    error_aware_prob = torch.ones_like(subset_difficulty)
+                    difficulty_one_mask = (subset_difficulty == 1.0)
+                    if difficulty_one_mask.any():
+                        subset_error = max_key_body_error[subset_ids]
+                        normalized_error = torch.clamp(subset_error / error_sampling_threshold, max=1.0)
+                        error_prob = normalized_error ** error_sampling_power
+                        error_aware_prob[difficulty_one_mask] = error_prob[difficulty_one_mask]
+                    difficulty_gt_one_mask = (subset_difficulty > 1.0)
+                    error_aware_prob[difficulty_gt_one_mask] = subset_difficulty[difficulty_gt_one_mask]
+                    subset_prob = subset_weights * error_aware_prob
+                else:
+                    subset_prob = subset_weights * subset_difficulty
             else:
-                motion_prob = self._motion_weights * motion_difficulty
+                subset_prob = subset_weights
+
+            # Sample from subset
+            subset_indices = torch.multinomial(subset_prob, num_samples=n, replacement=True)
+            motion_ids = subset_ids[subset_indices]
         else:
-            motion_prob = self._motion_weights
-        
-        motion_ids = torch.multinomial(motion_prob, num_samples=n, replacement=True)
+            # Original sampling logic (non-resample mode)
+            if motion_difficulty is not None:
+                if use_error_aware_sampling and max_key_body_error is not None:
+                    # Apply error aware sampling formula
+                    error_aware_prob = torch.ones_like(motion_difficulty)
+
+                    # Apply error aware probability only when motion_difficulty == 1
+                    difficulty_one_mask = (motion_difficulty == 1.0)
+                    if difficulty_one_mask.any():
+                        normalized_error = torch.clamp(max_key_body_error / error_sampling_threshold, max=1.0)
+                        error_prob = normalized_error ** error_sampling_power
+                        error_aware_prob[difficulty_one_mask] = error_prob[difficulty_one_mask]
+
+                    # For motion_difficulty > 1, use original difficulty
+                    difficulty_gt_one_mask = (motion_difficulty > 1.0)
+                    error_aware_prob[difficulty_gt_one_mask] = motion_difficulty[difficulty_gt_one_mask]
+
+                    motion_prob = self._motion_weights * error_aware_prob
+                else:
+                    motion_prob = self._motion_weights * motion_difficulty
+            else:
+                motion_prob = self._motion_weights
+
+            motion_ids = torch.multinomial(motion_prob, num_samples=n, replacement=True)
         return motion_ids
     
     def sample_time(self, motion_ids):
@@ -1303,11 +1659,12 @@ class MotionLib:
             # DDP: shard motion list across ranks to avoid each process loading the full dataset.
             # Sharding happens after motion_ids/shuffle/max_motions so every rank applies the same
             # deterministic preprocessing before splitting.
+            # NOTE: Skip DDP sharding if skip_ddp_sharding=True (resample mode) to allow sampling from full dataset.
             try:
                 import torch.distributed as dist
                 if dist.is_available() and dist.is_initialized():
                     world_size = dist.get_world_size()
-                    if world_size > 1:
+                    if world_size > 1 and not self._skip_ddp_sharding:
                         rank = dist.get_rank()
 
                         # In DDP, random subsampling during loading makes each rank load a different
@@ -1327,6 +1684,11 @@ class MotionLib:
 
                         # Strided sharding (rank, rank+W, ...).
                         motion_list = motion_list[rank::world_size]
+                    elif world_size > 1 and self._skip_ddp_sharding:
+                        # In resample mode, skip DDP sharding so each rank can sample from full dataset
+                        # Each rank will load all metadata and sample independently during resample
+                        if dist.get_rank() == 0:
+                            print(f"[MotionLib] Skipping DDP sharding: each rank loads full dataset for resampling")
             except Exception:
                 pass
 
@@ -1520,19 +1882,34 @@ class MotionLib:
         return out
     
     def _calc_frame_blend(self, motion_ids, times):
-        num_frames = self._motion_num_frames[motion_ids]
-        
-        phase = times / self._motion_lengths[motion_ids]
+        # In resample mode, use resample-specific data
+        if self._resample_mode:
+            # CRITICAL: motion_ids are original IDs (0-562), but _motion_num_frames_resample
+            # is indexed by subset position (0-49). Need to map via _motion_id_to_idx_tensor.
+            subset_indices = self._motion_id_to_idx_tensor[motion_ids]
+            num_frames = self._motion_num_frames_resample[subset_indices]
+            # motion_lengths is still from full dataset (indexed by original motion_ids)
+            motion_lengths = self._motion_lengths
+        else:
+            num_frames = self._motion_num_frames[motion_ids]
+            motion_lengths = self._motion_lengths
+
+        phase = times / motion_lengths[motion_ids]
         phase = torch.clip(phase, 0.0, 1.0)
-        
+
         frame_idx0_local = (phase * (num_frames - 1)).long()
         frame_idx1_local = torch.min(frame_idx0_local + 1, num_frames - 1)
         blend = phase * (num_frames - 1) - frame_idx0_local.float()
-        
-        frame_start_idx = self._motion_start_idx[motion_ids]
+
+        # In resample mode, use _motion_start_idx_by_id (maps motion_id -> start_frame)
+        if self._resample_mode:
+            frame_start_idx = self._motion_start_idx_by_id[motion_ids]
+        else:
+            frame_start_idx = self._motion_start_idx[motion_ids]
+
         frame_idx0 = frame_idx0_local + frame_start_idx
         frame_idx1 = frame_idx1_local + frame_start_idx
-        
+
         return frame_idx0, frame_idx1, frame_idx0_local, frame_idx1_local, blend
         
 

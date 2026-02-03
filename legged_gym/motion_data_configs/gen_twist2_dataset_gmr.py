@@ -49,11 +49,12 @@ SELECTED_FOLDERS = [
     "AMASS_numpy123",                        # AMASS 数据集
     "CORE4D_Real_numpy123",                  # CORE4D Real 数据集
     "EgoBody_g1_GMR_30fps_numpy123",         # EgoBody 数据集
-    # "MotionMillion_g1_GMR_30fps_numpy123",   # MotionMillion 数据集
+    "HuMMan_numpy123",                       # HuMMan 数据集
+    "MotionMillion_g1_GMR_30fps_numpy123",   # MotionMillion 数据集
+    "MotionMillion_g1_GMR_30fps_numpy123_mirror",
     "embody3d_numpy123",                     # Embody3D 数据集
     "OMOMO_numpy123",                        # OMOMO 数据集
     "inter_x_gmr_120fps_numpy123",                    # Inter-X 数据集 (120fps)
-    "HuMMan_numpy123",                             # HuMMan 数据集
     "interhuman_numpy123",                   # InterHuman 数据集
     "lafan1_numpy123",                       # LaFAN1 数据集
     "pico_numpy123",                         # TWIST2 Pico 清洗后数据
@@ -69,6 +70,7 @@ SPECIAL_WEIGHTS = {
     "pico_numpy123": 30,
     "ViMoGen_228K_20fps_for_gmr_numpy123": 0.2,
     "MotionMillion_g1_GMR_30fps_numpy123": 0.05,
+    "MotionMillion_g1_GMR_30fps_numpy123_mirror": 0.05,
 }
 DEFAULT_WEIGHT = 1
 
