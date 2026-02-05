@@ -113,12 +113,12 @@ CUDA_VISIBLE_DEVICES=0,7 torchrun --standalone --nproc_per_node=2 legged_gym/leg
 cd legged_gym/legged_gym/scripts
 
 python play.py \
-  --task g1_stu_future --proj_name g1_stu_future --exptid 0116_student_ddp \
+  --task g1_stu_future --proj_name g1_stu_future --exptid weiji_65000backup \
   --device cuda:0 --num_envs 1 \
   --headless --record_video \
   --checkpoint -1 \
   --eval_student \
-  --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml \
+  --motion.motion_file /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/test.yaml \
   --motion.max_motions 8 --record_num_motions 8 --random
 ```
 
