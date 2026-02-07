@@ -57,13 +57,10 @@ python legged_gym/legged_gym/scripts/train.py \
   --teacher_exptid <teacher_exptid> --teacher_checkpoint -1
 ```
 
-### Memory/Precision Optimization
+### Memory Optimization
 
 For large datasets or limited GPU memory:
 ```bash
-# Mixed precision training (reduces VRAM ~50%)
---train.precision bfloat16  # or float16
-
 # Memory optimization for large motion datasets
 --motion.storage_dtype float16 --gpu_cache 8.0
 --lazy_load --cpu_cache 100.0  # for very large datasets
@@ -133,7 +130,6 @@ python play.py --task g1_stu_future --proj_name g1_stu_future --exptid <exptid> 
 - Use `generate_yaml.py` to create new configs
 
 **Key config parameters:**
-- `train.precision`: `float32`, `float16`, or `bfloat16`
 - `motion.storage_dtype`: `float32` or `float16` (memory savings)
 - `num_envs`: Parallel environment count (typically 4096)
 - `history_len`: Observation history length (default 10)
@@ -181,6 +177,6 @@ legged_gym/logs/g1_priv_mimic/<teacher_exptid>/model_<checkpoint>.pt
 
 - **Isaac Gym import error**: Ensure conda env `twist2` is active and Isaac Gym is installed
 - **Redis connection**: Check `redis-server` is running and config allows connections
-- **GPU memory**: Use `--train.precision bfloat16` or reduce `--num_envs`
+- **GPU memory**: Reduce `--num_envs` or use `--motion.storage_dtype float16`
 - **Large dataset OOM**: Add `--motion.storage_dtype float16 --lazy_load`
 - **Unitree connection**: Verify network interface (edit `net=` in `sim2real.sh`), ping `192.168.123.164`

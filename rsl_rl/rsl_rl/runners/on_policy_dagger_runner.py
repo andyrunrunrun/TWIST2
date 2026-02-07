@@ -203,14 +203,109 @@ class OnPolicyDaggerRunner:
             )
 
         self.learn = self.learn_RL
-            
+
         # Log
         self.log_dir = log_dir
+        if self.log_dir is not None:
+            self.env.log_dir = self.log_dir
         self.writer = None
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
-        
+
+        # Set rank info for environment (for multi-GPU CSV saving)
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                self.env.rank = dist.get_rank()
+                self.env.world_size = dist.get_world_size()
+            else:
+                self.env.rank = 0
+                self.env.world_size = 1
+        except:
+            self.env.rank = 0
+            self.env.world_size = 1
+
+        # Motion resample mode initialization
+        self._motion_resample_interval = getattr(self.env, "_motion_resample_interval", 0)
+        self._motion_resample_per_gpu = getattr(self.env, "_motion_resample_per_gpu", 15000)
+        self._resample_counter = 0
+
+        # Initialize resample mode if enabled
+        if self._motion_resample_interval > 0:
+            self._init_resample_mode()
+
+    def _init_resample_mode(self):
+        """Initialize motion resample mode with a subset of motions."""
+        try:
+            import torch.distributed as dist
+            world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        except:
+            world_size = 1
+            rank = 0
+
+        # Each rank samples per_gpu motions (different random seed per rank)
+        num_motions = self._motion_resample_per_gpu
+        # Use rank-dependent seed to ensure each rank samples different subset
+        seed = self.current_learning_iteration + getattr(self.env.cfg, "seed", 0) + rank * 10000
+
+        # Get motion difficulty for consistent sampling
+        motion_difficulty = getattr(self.env, "motion_difficulty", None)
+
+        print(f"[Motion Resample] Rank {rank}/{world_size}: sampling {num_motions} motions")
+        sampled_ids = self.env._motion_lib.resample_subset(
+            num_motions=num_motions,
+            seed=seed,
+            motion_difficulty=motion_difficulty,  # Use difficulty for sampling
+            preload=True  # Preload with progress bar
+        )
+        print(f"[Motion Resample] Rank {rank}/{world_size}: ready with {len(sampled_ids)} motions")
+
+        # Re-sample environment motion_ids to match the current rank's subset
+        # This ensures env._motion_ids are all in _resample_gpu_storage
+        print(f"[Motion Resample] Rank {rank}/{world_size}: re-sampling environment motion IDs...")
+        self.env.reset_idx(torch.arange(self.env.num_envs, device=self.env.device))
+        print(f"[Motion Resample] Rank {rank}/{world_size}: environment motion IDs re-sampled")
+
+    def _maybe_resample_motions(self, iteration):
+        """Check if we need to resample motions and do it if needed."""
+        if self._motion_resample_interval <= 0:
+            return
+
+        self._resample_counter += 1
+        if self._resample_counter >= self._motion_resample_interval:
+            self._resample_counter = 0
+
+            try:
+                import torch.distributed as dist
+                world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+                rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            except:
+                world_size = 1
+                rank = 0
+
+            # Each rank samples per_gpu motions (different random seed per rank)
+            num_motions = self._motion_resample_per_gpu
+            # Use rank-dependent seed to ensure each rank samples different subset
+            seed = iteration + getattr(self.env.cfg, "seed", 0) + rank * 10000
+
+            # Get motion difficulty if available
+            motion_difficulty = getattr(self.env, "motion_difficulty", None)
+
+            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: resampling {num_motions} motions...")
+            sampled_ids = self.env._motion_lib.resample_subset(
+                num_motions=num_motions,
+                seed=seed,
+                motion_difficulty=motion_difficulty,
+                preload=True  # Preload with progress bar
+            )
+            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: resample complete with {len(sampled_ids)} motions")
+
+            # Re-sample environment motion_ids to match the new subset
+            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: re-sampling environment motion IDs...")
+            self.env.reset_idx(torch.arange(self.env.num_envs, device=self.env.device))
+            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: environment motion IDs re-sampled")
 
     def learn_RL(self, num_learning_iterations, init_at_random_ep_len=False):
         mean_value_loss = 0.
@@ -255,8 +350,12 @@ class OnPolicyDaggerRunner:
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
             hist_encoding = it % self.dagger_update_freq == 0
+
+            # Motion resample: check and resample if needed
+            self._maybe_resample_motions(it)
+
             # Rollout
-            with torch.inference_mode():
+            with torch.no_grad():
                 for i in range(self.num_steps_per_env):
                     # if it < self.warm_iters:
                     #     actions = self.teacher_actor(critic_obs)

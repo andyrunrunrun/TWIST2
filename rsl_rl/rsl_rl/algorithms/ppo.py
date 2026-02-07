@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# 
+#
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
 #
@@ -32,7 +32,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from torch.amp import autocast, GradScaler
 
 from rsl_rl.modules import ActorCritic
 from rsl_rl.storage import RolloutStorage, ReplayBuffer
@@ -43,7 +42,7 @@ import time
 
 class PPO:
     def __init__(self,
-                 env, 
+                 env,
                  actor_critic,
                  num_learning_epochs=1,
                  num_mini_batches=1,
@@ -63,25 +62,12 @@ class PPO:
                  grad_penalty_coef_schedule = [0.0, 0.0, 10, 10],
                  std_schedule = [1.0, 1.0, 10, 10],
                  num_hist=10,
-                 precision="float32",
                  **kwargs
                  ):
 
         self.env = env
         self.device = device
         self.num_hist = num_hist
-        
-        # AMP (Automatic Mixed Precision) 配置
-        self.precision = precision
-        self.use_amp = precision in ("float16", "bfloat16")
-        if precision == "float16":
-            self.amp_dtype = torch.float16
-        elif precision == "bfloat16":
-            self.amp_dtype = torch.bfloat16
-        else:
-            self.amp_dtype = None
-        # float16 需要 GradScaler 防止梯度下溢，bfloat16 动态范围更大不需要
-        self.scaler = GradScaler('cuda', enabled=(self.use_amp and precision == "float16"))
 
         self.desired_kl = desired_kl
         self.schedule = schedule
@@ -92,6 +78,7 @@ class PPO:
         # If wrapped (e.g. DDP), the module is already placed on the correct device.
         if not hasattr(self.actor_critic, "module"):
             self.actor_critic.to(self.device)
+
         self.storage = None # initialized later
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
         self.transition = RolloutStorage.Transition()
@@ -110,7 +97,7 @@ class PPO:
         # Adaptation
         self.gradient_penalty_coef_schedule = grad_penalty_coef_schedule
         self.counter = 0
-        
+
         # Action std
         self.fix_std = self.actor_critic.if_fix_std()
         self.std_schedule = std_schedule
@@ -166,26 +153,24 @@ class PPO:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-            
+
         for sample in generator:
                 obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
                 old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch = sample
                 obs_est_batch = obs_batch.clone()
-                
-                # 使用 autocast 进行混合精度前向传播
-                with autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
-                    # Use module forward (model(...)) so DDP forward hooks are triggered.
-                    _, actions_log_prob_batch, value_batch, mu_batch, sigma_batch, entropy_batch = self.actor_critic(
-                        obs_est_batch,
-                        critic_obs_batch,
-                        actions_batch,
-                        masks=masks_batch,
-                        hidden_states=hid_states_batch,
-                    )
-                
+
+                # Use module forward (model(...)) so DDP forward hooks are triggered.
+                _, actions_log_prob_batch, value_batch, mu_batch, sigma_batch, entropy_batch = self.actor_critic(
+                    obs_est_batch,
+                    critic_obs_batch,
+                    actions_batch,
+                    masks=masks_batch,
+                    hidden_states=hid_states_batch,
+                )
+
                 # KL
                 if self.desired_kl != None and self.schedule == 'adaptive':
-                    with torch.inference_mode():
+                    with torch.no_grad():
                         kl = torch.sum(
                             torch.log(sigma_batch / old_sigma_batch + 1.e-5) + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) / (2.0 * torch.square(sigma_batch)) - 0.5, axis=-1)
                         kl_mean = torch.mean(kl)
@@ -194,7 +179,7 @@ class PPO:
                             self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
                             self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-                        
+
                         for param_group in self.optimizer.param_groups:
                             param_group['lr'] = self.learning_rate
 
@@ -219,39 +204,29 @@ class PPO:
                 loss = surrogate_loss + \
                        self.value_loss_coef * value_loss - \
                        self.entropy_coef * entropy_batch.mean()
-                # loss = self.teacher_alpha * imitation_loss + (1 - self.teacher_alpha) * loss
 
-                # Gradient step with AMP support
+                # Gradient step
                 self.optimizer.zero_grad()
-                if self.use_amp and self.precision == "float16":
-                    # float16 使用 GradScaler 进行梯度缩放
-                    self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(self.optimizer)
-                    nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    # float32 或 bfloat16 直接反向传播
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+                self.optimizer.step()
 
                 mean_value_loss += value_loss.item()
                 mean_surrogate_loss += surrogate_loss.item()
                 mean_priv_reg_loss += 0
-                
+
                 # update action std (if fixed)
                 if self.fix_std:
                     std_stage = min(max((self.counter - self.std_schedule[2]), 0) / self.std_schedule[3], 1)
                     std_coef = std_stage * (self.std_schedule[1] - self.std_schedule[0]) + self.std_schedule[0]
                     self.actor_critic.update_std(std_coef)
-                
+
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_priv_reg_loss /= num_updates
-        
+
         self.storage.clear()
         # self.update_counter()
         return mean_value_loss, mean_surrogate_loss, mean_priv_reg_loss, 0, 0, 0
@@ -264,11 +239,11 @@ class PPO:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
             old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch in generator:
-                with torch.inference_mode():
+                with torch.no_grad():
                     self.actor_critic.act(obs_batch, hist_encoding=True, masks=masks_batch, hidden_states=hid_states_batch[0])
 
                 # Adaptation module update
-                with torch.inference_mode():
+                with torch.no_grad():
                     priv_latent_batch = self.actor_critic.actor.infer_priv_latent(obs_batch)
                 hist_latent_batch = self.actor_critic.actor.infer_hist_latent(obs_batch)
                 hist_latent_loss = (priv_latent_batch.detach() - hist_latent_batch).norm(p=2, dim=1).mean()

@@ -10,24 +10,6 @@ from legged_gym.envs.base.legged_robot import euler_from_quaternion
 from legged_gym.envs.base.humanoid_char import convert_to_local_root_body_pos, convert_to_global_root_body_pos
 
 
-# Helper functions to bypass PyTorch inference mode restrictions (needed for mixed precision training)
-def _get_data(tensor):
-    """Get the underlying tensor data to bypass inference mode restrictions."""
-    if hasattr(tensor, 'data'):
-        return tensor.data
-    return tensor
-
-
-def _idx_set(tensor, env_ids, values):
-    """Set tensor[env_ids] = values in a way that bypasses inference mode."""
-    _get_data(tensor)[env_ids] = values
-
-
-def _slice_set(tensor, values):
-    """Set tensor[:] = values in a way that bypasses inference mode."""
-    _get_data(tensor)[:] = values
-
-
 
 
 class G1MimicDistill(HumanoidMimic):
@@ -108,9 +90,8 @@ class G1MimicDistill(HumanoidMimic):
         else:
             motion_times = torch.zeros(motion_ids.shape, device=self.device, dtype=torch.float)
 
-        # Use .data accessor to bypass inference mode
-        _idx_set(self._motion_ids, env_ids, motion_ids)
-        _idx_set(self._motion_time_offsets, env_ids, motion_times)
+        self._motion_ids[env_ids] = motion_ids
+        self._motion_time_offsets[env_ids] = motion_times
 
         if hasattr(self._motion_lib, "prefetch"):
             self._motion_lib.prefetch(motion_ids)
@@ -118,16 +99,15 @@ class G1MimicDistill(HumanoidMimic):
         root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, body_pos, root_pos_delta_local, root_rot_delta_local = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
         root_pos[:, 2] += self.cfg.motion.height_offset
 
-        # Use .data accessor to bypass inference mode
-        _idx_set(self._ref_root_pos, env_ids, root_pos)
-        _idx_set(self._ref_root_rot, env_ids, root_rot)
-        _idx_set(self._ref_root_vel, env_ids, root_vel)
-        _idx_set(self._ref_root_ang_vel, env_ids, root_ang_vel)
-        _idx_set(self._ref_dof_pos, env_ids, dof_pos)
-        _idx_set(self._ref_dof_vel, env_ids, dof_vel)
-        _idx_set(self._ref_root_pos_delta_local, env_ids, self._scale_ref_root_pos_delta_local(motion_ids, root_pos_delta_local))
-        _idx_set(self._ref_root_rot_delta_local, env_ids, root_rot_delta_local)
-        _idx_set(self._ref_body_pos, env_ids, convert_to_global_root_body_pos(root_pos=root_pos, root_rot=root_rot, body_pos=body_pos))
+        self._ref_root_pos[env_ids] = root_pos
+        self._ref_root_rot[env_ids] = root_rot
+        self._ref_root_vel[env_ids] = root_vel
+        self._ref_root_ang_vel[env_ids] = root_ang_vel
+        self._ref_dof_pos[env_ids] = dof_pos
+        self._ref_dof_vel[env_ids] = dof_vel
+        self._ref_root_pos_delta_local[env_ids] = self._scale_ref_root_pos_delta_local(motion_ids, root_pos_delta_local)
+        self._ref_root_rot_delta_local[env_ids] = root_rot_delta_local
+        self._ref_body_pos[env_ids] = convert_to_global_root_body_pos(root_pos=root_pos, root_rot=root_rot, body_pos=body_pos)
 
 
     def _update_ref_motion(self):
@@ -139,16 +119,15 @@ class G1MimicDistill(HumanoidMimic):
         root_pos[:, 2] += self.cfg.motion.height_offset
         root_pos[:, :2] += self.episode_init_origin[:, :2]
 
-        # Use .data accessor to bypass inference mode
-        _slice_set(self._ref_root_pos, root_pos)
-        _slice_set(self._ref_root_rot, root_rot)
-        _slice_set(self._ref_root_vel, root_vel)
-        _slice_set(self._ref_root_ang_vel, root_ang_vel)
-        _slice_set(self._ref_dof_pos, dof_pos)
-        _slice_set(self._ref_dof_vel, dof_vel)
-        _slice_set(self._ref_root_pos_delta_local, self._scale_ref_root_pos_delta_local(motion_ids, root_pos_delta_local))
-        _slice_set(self._ref_root_rot_delta_local, root_rot_delta_local)
-        _slice_set(self._ref_body_pos, convert_to_global_root_body_pos(root_pos=root_pos, root_rot=root_rot, body_pos=body_pos))
+        self._ref_root_pos[:] = root_pos
+        self._ref_root_rot[:] = root_rot
+        self._ref_root_vel[:] = root_vel
+        self._ref_root_ang_vel[:] = root_ang_vel
+        self._ref_dof_pos[:] = dof_pos
+        self._ref_dof_vel[:] = dof_vel
+        self._ref_root_pos_delta_local[:] = self._scale_ref_root_pos_delta_local(motion_ids, root_pos_delta_local)
+        self._ref_root_rot_delta_local[:] = root_rot_delta_local
+        self._ref_body_pos[:] = convert_to_global_root_body_pos(root_pos=root_pos, root_rot=root_rot, body_pos=body_pos)
         
     def _update_motion_difficulty(self, env_ids):
         if self.obs_type == 'priv':
@@ -220,29 +199,26 @@ class G1MimicDistill(HumanoidMimic):
     def _reset_buffers_extra(self, env_ids):
         if not self._limb_weights_enabled():
             return
-        # Use .data accessor to bypass inference mode
         fixed = getattr(self.cfg.env, "limb_weights_fixed", None)
         fixed = self._parse_limb_weights_value(fixed)
         if fixed is not None:
             if len(fixed) != 4:
                 raise ValueError(f"limb_weights_fixed must have 4 values, got: {fixed}")
             lw = torch.tensor(fixed, device=self.device, dtype=torch.float).view(1, 4).clamp(0.0, 1.0)
-            _idx_set(self.limb_weights, env_ids, lw.expand(len(env_ids), -1))
+            self.limb_weights[env_ids] = lw.expand(len(env_ids), -1)
         else:
-            _idx_set(self.limb_weights, env_ids, torch.rand((len(env_ids), 4), device=self.device, dtype=torch.float))
+            self.limb_weights[env_ids] = torch.rand((len(env_ids), 4), device=self.device, dtype=torch.float)
         self._update_dof_err_w(env_ids)
 
     def _update_dof_err_w(self, env_ids):
         if (not self._limb_weights_enabled()) or self._dof_err_w_base is None:
             return
         lw = self.limb_weights[env_ids]  # (M, 4) in order [L_arm, R_arm, L_leg, R_leg]
-        # Use .data accessor to bypass inference mode
-        data = _get_data(self._dof_err_w)
-        data[env_ids] = self._dof_err_w_base.unsqueeze(0)
-        data[env_ids][:, self._g1_dof_ids_l_arm] *= lw[:, 0:1]
-        data[env_ids][:, self._g1_dof_ids_r_arm] *= lw[:, 1:2]
-        data[env_ids][:, self._g1_dof_ids_l_leg] *= lw[:, 2:3]
-        data[env_ids][:, self._g1_dof_ids_r_leg] *= lw[:, 3:4]
+        self._dof_err_w[env_ids] = self._dof_err_w_base.unsqueeze(0)
+        self._dof_err_w[env_ids][:, self._g1_dof_ids_l_arm] *= lw[:, 0:1]
+        self._dof_err_w[env_ids][:, self._g1_dof_ids_r_arm] *= lw[:, 1:2]
+        self._dof_err_w[env_ids][:, self._g1_dof_ids_l_leg] *= lw[:, 2:3]
+        self._dof_err_w[env_ids][:, self._g1_dof_ids_r_leg] *= lw[:, 3:4]
     
     def _get_noise_scale_vec(self, cfg):
         noise_scale_vec = torch.zeros(1, self.cfg.env.n_proprio, device=self.device)

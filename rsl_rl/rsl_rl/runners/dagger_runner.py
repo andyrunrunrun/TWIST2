@@ -136,13 +136,28 @@ class DAggerRunner:
         )
 
         self.learn = self.learn_DAgger
-            
+
         # Log
         self.log_dir = log_dir
+        if self.log_dir is not None:
+            self.env.log_dir = self.log_dir
         self.writer = None
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
+
+        # Set rank info for environment (for multi-GPU CSV saving)
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                self.env.rank = dist.get_rank()
+                self.env.world_size = dist.get_world_size()
+            else:
+                self.env.rank = 0
+                self.env.world_size = 1
+        except:
+            self.env.rank = 0
+            self.env.world_size = 1
         
     def learn_DAgger(self, num_learning_iterations, init_at_random_ep_len=False):
         mean_dagger_loss = 0.
@@ -170,7 +185,7 @@ class DAggerRunner:
         
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
-            with torch.inference_mode():
+            with torch.no_grad():
                 for i in range(self.num_steps_per_env):
                     if it < self.warm_iters:
                         actions = self.teacher_actor(critic_obs)

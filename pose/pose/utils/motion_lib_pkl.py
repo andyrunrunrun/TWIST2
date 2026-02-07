@@ -1922,4 +1922,48 @@ class MotionLib:
     
     def get_motion_names(self):
         return self._motion_names
-        
+
+    def save_difficulty_to_csv(self, log_dir, iteration, motion_difficulty, rank=0):
+        """
+        Save motion difficulty values to a CSV file.
+
+        Args:
+            log_dir: Directory where the difficulty folder will be created
+            iteration: Current training iteration (used in filename)
+            motion_difficulty: Tensor of difficulty values (1-10 scale, or 100.0 for initial)
+            rank: Process rank for multi-GPU training (used in filename)
+        """
+        import csv
+
+        # Create difficulty directory
+        difficulty_dir = os.path.join(log_dir, "difficulty")
+        os.makedirs(difficulty_dir, exist_ok=True)
+
+        # Prepare CSV file path (include rank in filename for multi-GPU)
+        csv_file = os.path.join(difficulty_dir, f"difficulty_iter_{iteration:07d}_rank{rank}.csv")
+
+        # Get motion names and difficulties
+        motion_names = self.get_motion_names()
+        difficulties_cpu = motion_difficulty.cpu().numpy()
+
+        # Map to 0-100 scale
+        # Note: initial value is 100.0, after updates it's clamped to 1-10 range
+        # For initial 100.0, treat as 0 (not yet trained)
+        # For 1-10 range, map to 0-100: (x - 1) / 9 * 100
+        difficulties_0_100 = []
+        for d in difficulties_cpu:
+            if d >= 50.0:  # Initial value (100.0) or similar
+                difficulties_0_100.append(0.0)
+            else:
+                difficulties_0_100.append((d - 1.0) / 9.0 * 100.0)
+        difficulties_0_100 = np.array(difficulties_0_100)
+
+        # Write to CSV
+        with open(csv_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['motion_idx', 'motion_name', 'difficulty_0_100', 'difficulty_raw'])
+            for idx, (name, diff_0_100, diff_raw) in enumerate(zip(motion_names, difficulties_0_100, difficulties_cpu)):
+                writer.writerow([idx, str(name), f"{diff_0_100:.2f}", f"{diff_raw:.4f}"])
+
+        print(f"[MotionLib] Saved motion difficulty to {csv_file}")
+

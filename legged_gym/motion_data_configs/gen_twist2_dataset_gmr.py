@@ -46,19 +46,19 @@ def generate_output_filename(selected_folders, special_weights, default_weight, 
 # ============================================================
 SELECTED_FOLDERS = [
     # "AAAaaaaaaaatest",                    # 测试文件夹
-    # "AMASS_numpy123",                        # AMASS 数据集
-    # "CORE4D_Real_numpy123",                  # CORE4D Real 数据集
-    # "EgoBody_g1_GMR_30fps_numpy123",         # EgoBody 数据集
-    # "HuMMan_numpy123",                       # HuMMan 数据集
+    "AMASS_numpy123",                        # AMASS 数据集
+    "CORE4D_Real_numpy123",                  # CORE4D Real 数据集
+    "EgoBody_g1_GMR_30fps_numpy123",         # EgoBody 数据集
+    "HuMMan_numpy123",                       # HuMMan 数据集
     # "MotionMillion_g1_GMR_30fps_numpy123",   # MotionMillion 数据集
     # "MotionMillion_g1_GMR_30fps_numpy123_mirror",
     "embody3d_numpy123",                     # Embody3D 数据集
-    # "OMOMO_numpy123",                        # OMOMO 数据集
-    # "inter_x_gmr_120fps_numpy123",                    # Inter-X 数据集 (120fps)
-    # "interhuman_numpy123",                   # InterHuman 数据集
-    # "lafan1_numpy123",                       # LaFAN1 数据集
+    "OMOMO_numpy123",                        # OMOMO 数据集
+    "inter_x_gmr_120fps_numpy123",                    # Inter-X 数据集 (120fps)
+    "interhuman_numpy123",                   # InterHuman 数据集
+    "lafan1_numpy123",                       # LaFAN1 数据集
     "pico_numpy123",                         # TWIST2 Pico 清洗后数据
-    # "twist1_to_twist2_numpy123",             # TWIST1 转换数据
+    "twist1_to_twist2_numpy123",             # TWIST1 转换数据
     "v1_v2_v3_g1_numpy123",                  # V1/V2/V3 G1 数据
     # "ViMoGen_228K_20fps_for_gmr_numpy123"
 ]

@@ -131,13 +131,30 @@ class OnPolicyRunnerMimic:
             )
 
         self.learn = self.learn_RL
-            
+
         # Log
         self.log_dir = log_dir
+        if self.log_dir is not None:
+            self.env.log_dir = self.log_dir
         self.writer = None
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
+
+        # Set is_root flag and rank for environment to control logging
+        root_only = (not enable_mp()) or is_root_proc()
+        self.env.is_root = root_only
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                self.env.rank = dist.get_rank()
+                self.env.world_size = dist.get_world_size()
+            else:
+                self.env.rank = 0
+                self.env.world_size = 1
+        except:
+            self.env.rank = 0
+            self.env.world_size = 1
 
         # Motion resample mode initialization
         self._motion_resample_interval = getattr(self.env, "_motion_resample_interval", 0)
@@ -268,7 +285,7 @@ class OnPolicyRunnerMimic:
             self._maybe_resample_motions(it)
 
             # Rollout
-            with torch.inference_mode():
+            with torch.no_grad():
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs, infos, hist_encoding)
                     obs, privileged_obs, rewards, dones, infos = self.env.step(actions)  # obs has changed to next_obs !! if done obs has been reset

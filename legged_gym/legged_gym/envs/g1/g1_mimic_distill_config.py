@@ -269,7 +269,7 @@ class G1MimicPrivCfg(HumanoidMimicCfg):
         # =========================
         termination_roll = 4.0
         termination_pitch = 4.0
-        root_height_diff_threshold = 0.3
+        root_height_diff_threshold = 0.4 # 稍微增大一点阈值 
         
 
     class evaluations:
@@ -365,7 +365,6 @@ class G1MimicStuRLCfg(G1MimicPrivCfg):
 
 class G1MimicPrivCfgPPO(HumanoidMimicCfgPPO):
     seed = 1
-    precision = 'float32'
     class runner(HumanoidMimicCfgPPO.runner):
         policy_class_name = 'ActorCriticMimic'
         algorithm_class_name = 'PPO'

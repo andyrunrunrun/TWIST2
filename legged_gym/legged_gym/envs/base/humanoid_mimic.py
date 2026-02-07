@@ -13,36 +13,6 @@ from pose.utils import torch_utils
 from pose.utils.motion_lib_pkl import MotionLib
 from legged_gym.gym_utils.helpers import class_to_dict
 
-
-def _get_data(tensor):
-    """Get the underlying tensor data to bypass inference mode restrictions.
-    The .data accessor bypasses PyTorch's inference mode checks.
-    """
-    if hasattr(tensor, 'data'):
-        return tensor.data
-    return tensor
-
-
-# All indexed assignments can use the .data accessor
-def _idx(tensor, env_ids):
-    """Get tensor[env_ids] in a way that bypasses inference mode."""
-    return _get_data(tensor)[env_ids]
-
-
-def _idx_set(tensor, env_ids, values):
-    """Set tensor[env_ids] = values in a way that bypasses inference mode."""
-    _get_data(tensor)[env_ids] = values
-
-
-def _idx_set_2d(tensor, env_ids, col, values):
-    """Set tensor[env_ids, col] = values in a way that bypasses inference mode."""
-    _get_data(tensor)[env_ids, col] = values
-
-
-def _slice_set(tensor, values):
-    """Set tensor[:] = values in a way that bypasses inference mode."""
-    _get_data(tensor)[:] = values
-
 import time
 from termcolor import cprint
 import os
@@ -92,7 +62,6 @@ class HumanoidMimic(HumanoidChar):
         self.episode_length = torch.zeros((self.num_envs), device=self.device)
         self.feet_height = torch.zeros((self.num_envs, 2), device=self.device)
         num_motions = self._motion_lib.num_motions()
-        # Initialize as regular float tensors (not inference tensors) to avoid issues with mixed precision training
         self.motion_difficulty = torch.ones((num_motions), device=self.device, dtype=torch.float32, requires_grad=False) * 100.0
         self.mean_motion_difficulty = 100.
         self.motion_termination_dist = torch.ones((num_motions), device=self.device, dtype=torch.float32, requires_grad=False) * self._pose_termination_dist
@@ -199,9 +168,8 @@ class HumanoidMimic(HumanoidChar):
         else:
             motion_times = torch.zeros(motion_ids.shape, device=self.device, dtype=torch.float)
 
-        # Use .data accessor to bypass inference mode
-        _idx_set(self._motion_ids, env_ids, motion_ids)
-        _idx_set(self._motion_time_offsets, env_ids, motion_times)
+        self._motion_ids[env_ids] = motion_ids
+        self._motion_time_offsets[env_ids] = motion_times
 
         if hasattr(self._motion_lib, "prefetch"):
             self._motion_lib.prefetch(motion_ids)
@@ -209,14 +177,13 @@ class HumanoidMimic(HumanoidChar):
         root_pos, root_rot, root_vel, root_ang_vel, dof_pos, dof_vel, body_pos, root_pos_delta_local, root_rot_delta_local = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
         root_pos[:, 2] += self.cfg.motion.height_offset
 
-        # Use .data accessor to bypass inference mode
-        _idx_set(self._ref_root_pos, env_ids, root_pos)
-        _idx_set(self._ref_root_rot, env_ids, root_rot)
-        _idx_set(self._ref_root_vel, env_ids, root_vel)
-        _idx_set(self._ref_root_ang_vel, env_ids, root_ang_vel)
-        _idx_set(self._ref_dof_pos, env_ids, dof_pos)
-        _idx_set(self._ref_dof_vel, env_ids, dof_vel)
-        _idx_set(self._ref_body_pos, env_ids, convert_to_global_root_body_pos(root_pos=root_pos, root_rot=root_rot, body_pos=body_pos))
+        self._ref_root_pos[env_ids] = root_pos
+        self._ref_root_rot[env_ids] = root_rot
+        self._ref_root_vel[env_ids] = root_vel
+        self._ref_root_ang_vel[env_ids] = root_ang_vel
+        self._ref_dof_pos[env_ids] = dof_pos
+        self._ref_dof_vel[env_ids] = dof_vel
+        self._ref_body_pos[env_ids] = convert_to_global_root_body_pos(root_pos=root_pos, root_rot=root_rot, body_pos=body_pos)
         
     
     def _get_motion_times(self, env_ids=None):
@@ -227,10 +194,8 @@ class HumanoidMimic(HumanoidChar):
         return motion_times
 
     def _reset_dofs(self, env_ids, dof_pos, dof_vel):
-        """Override parent to handle inference mode issues with mixed precision training."""
-        # Use .data accessor to bypass inference mode
-        _idx_set(self.dof_pos, env_ids, dof_pos[env_ids] * torch_rand_float(0.8, 1.2, (len(env_ids), self.num_dof), device=self.device))
-        _idx_set(self.dof_vel, env_ids, dof_vel[env_ids])
+        self.dof_pos[env_ids] = dof_pos[env_ids] * torch_rand_float(0.8, 1.2, (len(env_ids), self.num_dof), device=self.device)
+        self.dof_vel[env_ids] = dof_vel[env_ids]
 
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_dof_state_tensor_indexed(self.sim,
@@ -246,14 +211,13 @@ class HumanoidMimic(HumanoidChar):
         root_pos[:, 2] += self.cfg.motion.height_offset
         root_pos[:, :2] += self.episode_init_origin[:, :2]
 
-        # Use .data accessor to bypass inference mode
-        _slice_set(self._ref_root_pos, root_pos)
-        _slice_set(self._ref_root_rot, root_rot)
-        _slice_set(self._ref_root_vel, root_vel)
-        _slice_set(self._ref_root_ang_vel, root_ang_vel)
-        _slice_set(self._ref_dof_pos, dof_pos)
-        _slice_set(self._ref_dof_vel, dof_vel)
-        _slice_set(self._ref_body_pos, convert_to_global_root_body_pos(root_pos=root_pos, root_rot=root_rot, body_pos=body_pos))
+        self._ref_root_pos[:] = root_pos
+        self._ref_root_rot[:] = root_rot
+        self._ref_root_vel[:] = root_vel
+        self._ref_root_ang_vel[:] = root_ang_vel
+        self._ref_dof_pos[:] = dof_pos
+        self._ref_dof_vel[:] = dof_vel
+        self._ref_body_pos[:] = convert_to_global_root_body_pos(root_pos=root_pos, root_rot=root_rot, body_pos=body_pos)
             
     def _reset_root_states(self, env_ids, root_vel=None, root_quat=None, root_pos=None, root_ang_vel=None):
         """ Resets ROOT states position and velocities of selected environmments
@@ -262,36 +226,32 @@ class HumanoidMimic(HumanoidChar):
         Args:
             env_ids (List[int]): Environemnt ids
         """
-        # Use .data accessor to bypass inference mode
-        data = _get_data(self.root_states)
-        episode_data = _get_data(self.episode_init_origin)
-
         # base position
         if self.custom_origins:
-            data[env_ids] = self.base_init_state
-            data[env_ids, :3] += self.env_origins[env_ids]
+            self.root_states[env_ids] = self.base_init_state
+            self.root_states[env_ids, :3] += self.env_origins[env_ids]
             if self.cfg.env.randomize_start_pos:
                 rand_pos = torch_rand_float(-0.3, 0.3, (len(env_ids), 2), device=self.device)
-                data[env_ids, :2] += rand_pos # xy position within 1m of the center
-                episode_data[env_ids, :2] = self.env_origins[env_ids, :2] + rand_pos
+                self.root_states[env_ids, :2] += rand_pos # xy position within 1m of the center
+                self.episode_init_origin[env_ids, :2] = self.env_origins[env_ids, :2] + rand_pos
             if self.cfg.env.randomize_start_yaw:
                 rand_yaw = torch_rand_float(-1, 1, (len(env_ids), 1), device=self.device).squeeze(1)
                 quat = quat_from_euler_xyz(0*rand_yaw, 0*rand_yaw, rand_yaw)
-                data[env_ids, 3:7] = quat[:, :]
+                self.root_states[env_ids, 3:7] = quat[:, :]
 
             if root_vel is not None:
-                data[env_ids, 7:10] = root_vel[env_ids, :]
+                self.root_states[env_ids, 7:10] = root_vel[env_ids, :]
             if root_quat is not None:
-                data[env_ids, 3:7] = root_quat[env_ids, :]
+                self.root_states[env_ids, 3:7] = root_quat[env_ids, :]
 
             if root_pos is not None:
-                data[env_ids, 2] = root_pos[env_ids, 2] + 0.05 # always higher a bit to avoid foot penetration
-                data[env_ids, :2] += root_pos[env_ids, :2]
+                self.root_states[env_ids, 2] = root_pos[env_ids, 2] + 0.05 # always higher a bit to avoid foot penetration
+                self.root_states[env_ids, :2] += root_pos[env_ids, :2]
             if root_ang_vel is not None:
-                data[env_ids, 10:13] = root_ang_vel[env_ids, :]
+                self.root_states[env_ids, 10:13] = root_ang_vel[env_ids, :]
         else:
-            data[env_ids] = self.base_init_state
-            data[env_ids, :3] += self.env_origins[env_ids]
+            self.root_states[env_ids] = self.base_init_state
+            self.root_states[env_ids, :3] += self.env_origins[env_ids]
 
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
@@ -307,11 +267,11 @@ class HumanoidMimic(HumanoidChar):
         for key in self.episode_sums.keys():
             self.extras["episode"]['metric_' + key] = torch.mean(self.episode_sums[key][env_ids] / self._motion_lib.get_motion_length(self._motion_ids[env_ids]))
             self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids] * self.reward_scales[key] / self._motion_lib.get_motion_length(self._motion_ids[env_ids]))
-            _idx_set(self.episode_sums[key], env_ids, 0.)
+            self.episode_sums[key][env_ids] = 0.
 
         for key in self.episode_means.keys():
             self.extras["episode"]['error_' + key] = torch.mean(self.episode_means[key][env_ids])
-            _idx_set(self.episode_means[key], env_ids, 0.)
+            self.episode_means[key][env_ids] = 0.
 
         if self.cfg.motion.motion_curriculum:
             self._update_motion_difficulty(env_ids)
@@ -330,22 +290,22 @@ class HumanoidMimic(HumanoidChar):
         self.gym.fetch_results(self.sim, True)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
 
-        # reset buffers - use .data accessor to bypass inference mode
-        _idx_set(self.last_actions, env_ids, 0.)
-        _idx_set(self.last_dof_vel, env_ids, 0.)
-        _idx_set(self.last_torques, env_ids, 0.)
-        _get_data(self.last_root_vel)[:] = 0.
-        _idx_set(self.feet_air_time, env_ids, 0.)
-        _idx_set(self.reset_buf, env_ids, 1)
-        _idx_set(self.obs_history_buf, env_ids, torch.zeros((len(env_ids), self.obs_history_buf.shape[1], self.obs_history_buf.shape[2]), device=self.device, dtype=self.obs_history_buf.dtype))
-        _idx_set(self.contact_buf, env_ids, torch.zeros((len(env_ids), self.contact_buf.shape[1], self.contact_buf.shape[2]), device=self.device, dtype=self.contact_buf.dtype))
-        _idx_set(self.action_history_buf, env_ids, torch.zeros((len(env_ids), self.action_history_buf.shape[1], self.action_history_buf.shape[2]), device=self.device, dtype=self.action_history_buf.dtype))
-        _idx_set(self.feet_land_time, env_ids, 0.)
-        _idx_set(self.deviate_tracking_frames, env_ids, 0.)
-        _idx_set(self.deviate_vel_tracking_frames, env_ids, 0.)
+        # reset buffers
+        self.last_actions[env_ids] = 0.
+        self.last_dof_vel[env_ids] = 0.
+        self.last_torques[env_ids] = 0.
+        self.last_root_vel[:] = 0.
+        self.feet_air_time[env_ids] = 0.
+        self.reset_buf[env_ids] = 1
+        self.obs_history_buf[env_ids, :, :] = 0.  # reset obs history buffer TODO no 0s
+        self.contact_buf[env_ids, :, :] = 0.
+        self.action_history_buf[env_ids, :, :] = 0.
+        self.feet_land_time[env_ids] = 0.
+        self.deviate_tracking_frames[env_ids] = 0.
+        self.deviate_vel_tracking_frames[env_ids] = 0.
         self._reset_buffers_extra(env_ids)
 
-        _idx_set(self.episode_length_buf, env_ids, 0)
+        self.episode_length_buf[env_ids] = 0
 
         # send timeout info to the algorithm
         if self.cfg.env.send_timeouts:
@@ -355,7 +315,7 @@ class HumanoidMimic(HumanoidChar):
             self.mean_motion_difficulty = torch.mean(self.motion_difficulty)
 
         _, _, y = euler_from_quaternion(self.root_states[:, 3:7])
-        _idx_set(self.init_yaw, env_ids, y[env_ids])
+        self.init_yaw[env_ids] = y[env_ids]
         return
     
     def _hard_sync_motion_loop(self):
@@ -407,9 +367,7 @@ class HumanoidMimic(HumanoidChar):
         sub_idx = (motion_completion_rate >= 0.95) & (motion_completion_rate < 0.99)
         # If completion rate is high (≥ 0.99), decrease difficulty 4 times
         super_sub_idx = motion_completion_rate >= 0.99
-        
-        # Use torch.where to avoid inference mode errors with mixed precision training
-        # This creates a new tensor instead of in-place modification
+
         gamma = self.cfg.motion.motion_curriculum_gamma
 
         # Create new difficulty tensor based on conditions
@@ -438,31 +396,32 @@ class HumanoidMimic(HumanoidChar):
         self.motion_termination_dist = (self._pose_termination_dist - 0.2) * motion_difficulty_ratio + 0.2 # (num_motions)
         # use min to avoid jittering of motion termination distance
         # self.motion_termination_dist = torch.min(new_motion_termination_dist, self.motion_termination_dist) # (num_motions)
-        
-        # Log motion difficulties every 10k steps
-        if not hasattr(self, '_difficulty_log_counter'):
-            self._difficulty_log_counter = 0
-        self._difficulty_log_counter += 1
-        
-        if self._difficulty_log_counter % (2000*24) == 0:
-            # Get motion names and difficulties
-            motion_names = self._motion_lib.get_motion_names()
-            high_difficulty_motions = [(name, diff.item()) for name, diff in zip(motion_names, self.motion_difficulty) if diff > MOTION_DIFFICULTY_MIN*2]
-            
-            if high_difficulty_motions:
-                # Create log directory if it doesn't exist
-                base_log_dir = "../../logs"
-                if not os.path.exists(base_log_dir):
-                    os.makedirs(base_log_dir, exist_ok=True)
-                log_dir = os.path.join(base_log_dir, "logs_motion_difficulty")
-                if not os.path.exists(log_dir):
-                    os.makedirs(log_dir, exist_ok=True)
-                # Write to file
-                log_file = os.path.join(log_dir, f"{str(self._difficulty_log_counter//24)}.txt")
-                with open(log_file, 'w') as f:
-                    f.write("Motions with difficulty > 5:\n")
-                    for name, diff in high_difficulty_motions:
-                        f.write(f"Motion: {name}, Difficulty: {diff:.2f}\n")
+
+        # Save motion difficulties to CSV every N iterations
+        # Use global_counter to track actual iterations (not number of resets)
+        current_iter = self.global_counter // 24
+        save_interval_iters = getattr(self.cfg.motion, 'difficulty_save_interval', 2500)
+
+        # Get rank info for multi-GPU training
+        rank = getattr(self, 'rank', 0)
+        world_size = getattr(self, 'world_size', 1)
+
+        if hasattr(self, 'log_dir') and self.log_dir is not None:
+            # Only save once per iteration (use a flag to avoid duplicate saves)
+            if not hasattr(self, '_last_saved_iter'):
+                self._last_saved_iter = -1
+
+            should_save = False
+            # Save at the beginning (iteration 0)
+            if current_iter == 0 and self._last_saved_iter != 0:
+                should_save = True
+            # Save when current iteration is a multiple of save_interval
+            elif current_iter > 0 and current_iter % save_interval_iters == 0 and current_iter != self._last_saved_iter:
+                should_save = True
+
+            if should_save:
+                self._motion_lib.save_difficulty_to_csv(self.log_dir, current_iter, self.motion_difficulty, rank)
+                self._last_saved_iter = current_iter
     
     def _post_physics_step_callback(self):
         """ Callback called before computing terminations, rewards, and observations
@@ -512,7 +471,7 @@ class HumanoidMimic(HumanoidChar):
         
         self.reset_buf |= self.time_out_buf
         
-        vel_too_large = torch.norm(self.root_states[:, 7:10], dim=-1) > 5.
+        vel_too_large = torch.norm(self.root_states[:, 7:10], dim=-1) > 6.5
         self.reset_buf |= vel_too_large
         
         if self._pose_termination:

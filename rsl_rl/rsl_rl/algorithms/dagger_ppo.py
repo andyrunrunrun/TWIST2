@@ -108,7 +108,7 @@ class DaggerPPO:
         if not hasattr(self.actor_critic, "module"):
             self.actor_critic.to(self.device)
         self.teacher_actor_critic = teacher_actor_critic
-        self.teacher_actor_critic.to(self.device)
+        # Teacher is already on device from runner, no need to move again
         self.teacher_loaded = teacher_loaded
         self.storage = None # initialized later
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
@@ -209,7 +209,7 @@ class DaggerPPO:
                 
                 # KL
                 if self.desired_kl != None and self.schedule == 'adaptive':
-                    with torch.inference_mode():
+                    with torch.no_grad():
                         kl = torch.sum(
                             torch.log(sigma_batch / old_sigma_batch + 1.e-5) + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) / (2.0 * torch.square(sigma_batch)) - 0.5, axis=-1)
                         kl_mean = torch.mean(kl)
