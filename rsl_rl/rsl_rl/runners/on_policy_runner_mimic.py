@@ -167,6 +167,7 @@ class OnPolicyRunnerMimic:
 
     def _init_resample_mode(self):
         """Initialize motion resample mode with a subset of motions."""
+        import sys
         try:
             import torch.distributed as dist
             world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
@@ -175,28 +176,35 @@ class OnPolicyRunnerMimic:
             world_size = 1
             rank = 0
 
-        # Each rank samples per_gpu motions (different random seed per rank)
-        num_motions = self._motion_resample_per_gpu
+        # Get GPU memory budget if specified (overrides num_motions)
+        gpu_memory_budget_gb = getattr(self.env, "_motion_resample_gpu_memory_gb", None)
+
         # Use rank-dependent seed to ensure each rank samples different subset
         seed = self.current_learning_iteration + getattr(self.env.cfg, "seed", 0) + rank * 10000
 
         # Get motion difficulty for consistent sampling
         motion_difficulty = getattr(self.env, "motion_difficulty", None)
 
-        print(f"[Motion Resample] Rank {rank}/{world_size}: sampling {num_motions} motions")
+        # Print which mode we're using
+        if gpu_memory_budget_gb is not None:
+            print(f"[Motion Resample] Rank {rank}/{world_size}: using GPU memory budget {gpu_memory_budget_gb}GB", file=sys.stderr, flush=True)
+        else:
+            print(f"[Motion Resample] Rank {rank}/{world_size}: sampling {self._motion_resample_per_gpu} motions", flush=True)
+
         sampled_ids = self.env._motion_lib.resample_subset(
-            num_motions=num_motions,
+            num_motions=self._motion_resample_per_gpu,  # Fallback if gpu_memory_budget_gb fails
             seed=seed,
             motion_difficulty=motion_difficulty,  # Use difficulty for sampling
-            preload=True  # Preload with progress bar
+            preload=True,  # Preload with progress bar
+            gpu_memory_budget_gb=gpu_memory_budget_gb  # Use GPU budget instead of num_motions
         )
-        print(f"[Motion Resample] Rank {rank}/{world_size}: ready with {len(sampled_ids)} motions")
+        print(f"[Motion Resample] Rank {rank}/{world_size}: ready with {len(sampled_ids)} motions", flush=True)
 
         # Re-sample environment motion_ids to match the current rank's subset
         # This ensures env._motion_ids are all in _resample_gpu_storage
-        print(f"[Motion Resample] Rank {rank}/{world_size}: re-sampling environment motion IDs...")
+        print(f"[Motion Resample] Rank {rank}/{world_size}: re-sampling environment motion IDs...", flush=True)
         self.env.reset_idx(torch.arange(self.env.num_envs, device=self.env.device))
-        print(f"[Motion Resample] Rank {rank}/{world_size}: environment motion IDs re-sampled")
+        print(f"[Motion Resample] Rank {rank}/{world_size}: environment motion IDs re-sampled", flush=True)
 
     def _maybe_resample_motions(self, iteration):
         """Check if we need to resample motions and do it if needed."""
@@ -215,27 +223,34 @@ class OnPolicyRunnerMimic:
                 world_size = 1
                 rank = 0
 
-            # Each rank samples per_gpu motions (different random seed per rank)
-            num_motions = self._motion_resample_per_gpu
+            # Get GPU memory budget if specified (overrides num_motions)
+            gpu_memory_budget_gb = getattr(self.env, "_motion_resample_gpu_memory_gb", None)
+
             # Use rank-dependent seed to ensure each rank samples different subset
             seed = iteration + getattr(self.env.cfg, "seed", 0) + rank * 10000
 
             # Get motion difficulty if available
             motion_difficulty = getattr(self.env, "motion_difficulty", None)
 
-            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: resampling {num_motions} motions...")
+            # Print which mode we're using
+            if gpu_memory_budget_gb is not None:
+                print(f"[Iteration {iteration}] Rank {rank}/{world_size}: resampling with GPU budget {gpu_memory_budget_gb}GB...", flush=True)
+            else:
+                print(f"[Iteration {iteration}] Rank {rank}/{world_size}: resampling {self._motion_resample_per_gpu} motions...", flush=True)
+
             sampled_ids = self.env._motion_lib.resample_subset(
-                num_motions=num_motions,
+                num_motions=self._motion_resample_per_gpu,  # Fallback if gpu_memory_budget_gb fails
                 seed=seed,
                 motion_difficulty=motion_difficulty,
-                preload=True  # Preload with progress bar
+                preload=True,  # Preload with progress bar
+                gpu_memory_budget_gb=gpu_memory_budget_gb  # Use GPU budget instead of num_motions
             )
-            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: resample complete with {len(sampled_ids)} motions")
+            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: resample complete with {len(sampled_ids)} motions", flush=True)
 
             # Re-sample environment motion_ids to match the new subset
-            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: re-sampling environment motion IDs...")
+            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: re-sampling environment motion IDs...", flush=True)
             self.env.reset_idx(torch.arange(self.env.num_envs, device=self.env.device))
-            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: environment motion IDs re-sampled")
+            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: environment motion IDs re-sampled", flush=True)
 
     def learn_RL(self, num_learning_iterations, init_at_random_ep_len=False):
         mean_value_loss = 0.

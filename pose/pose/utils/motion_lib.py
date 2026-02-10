@@ -215,7 +215,7 @@ class MotionLib():
             log_dir: Directory where the difficulty folder will be created
             iteration: Current training iteration (used in filename)
             motion_difficulty: Tensor of difficulty values (1-10 scale, or 100.0 for initial)
-            rank: Process rank for multi-GPU training (used in filename)
+            rank: Process rank for multi-GPU training (used in filename). None = no suffix.
         """
         import csv
 
@@ -223,8 +223,11 @@ class MotionLib():
         difficulty_dir = os.path.join(log_dir, "difficulty")
         os.makedirs(difficulty_dir, exist_ok=True)
 
-        # Prepare CSV file path (include rank in filename for multi-GPU)
-        csv_file = os.path.join(difficulty_dir, f"difficulty_iter_{iteration:07d}_rank{rank}.csv")
+        # Prepare CSV file path (include rank in filename only if specified)
+        if rank is not None:
+            csv_file = os.path.join(difficulty_dir, f"difficulty_iter_{iteration:07d}_rank{rank}.csv")
+        else:
+            csv_file = os.path.join(difficulty_dir, f"difficulty_iter_{iteration:07d}.csv")
 
         # Get motion names and difficulties
         motion_names = self.get_motion_names()

@@ -145,6 +145,14 @@ class HumanoidMimic(HumanoidChar):
         # Store resample config for training loop to access
         self._motion_resample_interval = getattr(self.cfg.motion, "resample_interval", 0)
         self._motion_resample_per_gpu = getattr(self.cfg.motion, "resample_per_gpu", 15000)
+        # GPU memory budget for resample (in GB). If specified, overrides resample_per_gpu
+        self._motion_resample_gpu_memory_gb = getattr(self.cfg.motion, "resample_gpu_memory_gb", None)
+
+        # Debug: print loaded config values
+        if self._motion_resample_interval > 0:
+            from termcolor import cprint
+            cprint(f"[HumanoidMimic] Resample config loaded: interval={self._motion_resample_interval}, "
+                   f"per_gpu={self._motion_resample_per_gpu}, gpu_memory_budget={self._motion_resample_gpu_memory_gb}", "cyan")
     
     def _reset_ref_motion(self, env_ids, motion_ids=None):
         n = len(env_ids)
@@ -335,23 +343,42 @@ class HumanoidMimic(HumanoidChar):
     def _update_motion_difficulty(self, env_ids):
         """
         Update the difficulty of motions for adaptive curriculum learning.
-        
+
         This function adjusts the difficulty of each motion based on how well the robot can track it.
         Motions that are harder to complete will have their difficulty increased, while motions that
         are easy to complete will have their difficulty decreased.
-        
+
         Args:
             env_ids (torch.Tensor): Indices of environments being reset
         """
+        # Debug mode: enable via DEBUG_DIFFICULTY=1 environment variable
+        debug_difficulty = os.environ.get('DEBUG_DIFFICULTY', '0') == '1'
+        rank = getattr(self, 'rank', 0)
+
+        # Store old difficulty for comparison
+        if debug_difficulty:
+            old_difficulty = self.motion_difficulty.clone()
+            old_mean = torch.mean(old_difficulty).item()
+
         # Get motion IDs of environments being reset
         reset_motion_ids = self._motion_ids[env_ids]
-        
+
+        # Safety check: ensure motion IDs are within valid range
+        num_motions = self._motion_lib.num_motions()
+        if torch.any(reset_motion_ids >= num_motions) or torch.any(reset_motion_ids < 0):
+            import warnings
+            warnings.warn(f"Motion ID out of bounds: motion_ids in [0, {num_motions-1}], "
+                         f"but got min={reset_motion_ids.min()}, max={reset_motion_ids.max()}. "
+                         f"This may indicate a bug in DDP sharding or resample mode.")
+            # Clamp to valid range to prevent crash
+            reset_motion_ids = torch.clamp(reset_motion_ids, 0, num_motions - 1)
+
         # Calculate completion rate for each environment (how far the robot got through the motion)
         completion_rate = self.episode_length_buf[env_ids] * self.dt / self._motion_lib.get_motion_length(reset_motion_ids)
-        
+
         # Aggregate completion rates for each unique motion
-        motion_completion_rate_sum = torch.zeros(self._motion_lib.num_motions(), device=self.device, dtype=torch.float).scatter_add(0, reset_motion_ids, completion_rate)
-        motion_completion_rate_count = torch.zeros(self._motion_lib.num_motions(), device=self.device, dtype=torch.float).scatter_add(0, reset_motion_ids, torch.ones_like(completion_rate, dtype=torch.float))
+        motion_completion_rate_sum = torch.zeros(num_motions, device=self.device, dtype=torch.float).scatter_add(0, reset_motion_ids, completion_rate)
+        motion_completion_rate_count = torch.zeros(num_motions, device=self.device, dtype=torch.float).scatter_add(0, reset_motion_ids, torch.ones_like(completion_rate, dtype=torch.float))
         
         # Calculate mean completion rate for each motion
         motion_completion_rate = motion_completion_rate_sum / torch.clamp(motion_completion_rate_count, min=1)
@@ -381,7 +408,11 @@ class HumanoidMimic(HumanoidChar):
         MOTION_DIFFICULTY_MAX = 10.
         MOTION_DIFFICULTY_MIN = 1.
         self.motion_difficulty = torch.clamp(new_difficulty, min=MOTION_DIFFICULTY_MIN, max=MOTION_DIFFICULTY_MAX)
-        
+
+        # NOTE: motion_difficulty synchronization is now done during resample, not here.
+        # This avoids deadlock when different ranks call _update_motion_difficulty different times.
+        # The sync is handled in _sync_motion_difficulty() which is called during resample.
+
         # way 1: Calculate motion difficulty ratio (normalized to 0-1 range)
         # motion_difficulty_ratio = self.motion_difficulty / 100.
         motion_difficulty_ratio = self.motion_difficulty / MOTION_DIFFICULTY_MAX
@@ -420,9 +451,47 @@ class HumanoidMimic(HumanoidChar):
                 should_save = True
 
             if should_save:
-                self._motion_lib.save_difficulty_to_csv(self.log_dir, current_iter, self.motion_difficulty, rank)
+                # Check if in resample mode using skip_ddp_sharding flag
+                is_resample_mode = getattr(self._motion_lib, '_skip_ddp_sharding', False)
+
+                if is_resample_mode and world_size > 1:
+                    # Resample mode: all ranks have the same synced data, only rank0 saves
+                    if rank == 0:
+                        self._motion_lib.save_difficulty_to_csv(self.log_dir, current_iter, self.motion_difficulty, rank=None)
+                elif world_size > 1:
+                    # DDP sharded mode: each rank saves its own shard
+                    self._motion_lib.save_difficulty_to_csv(self.log_dir, current_iter, self.motion_difficulty, rank=rank)
+                else:
+                    # Single GPU: save without rank suffix
+                    self._motion_lib.save_difficulty_to_csv(self.log_dir, current_iter, self.motion_difficulty, rank=None)
+
                 self._last_saved_iter = current_iter
-    
+
+    def _sync_motion_difficulty(self):
+        """Synchronize motion_difficulty across all GPUs using all_reduce MIN operation.
+
+        This is called during resample, ensuring all ranks call it at the same time,
+        avoiding deadlock that would occur if called from _update_motion_difficulty during rollout.
+
+        Uses MIN operation: if any rank trained a motion well (lower difficulty),
+        all ranks adopt that lower difficulty.
+        """
+        world_size = getattr(self, 'world_size', 1)
+
+        if world_size > 1:
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    # Only sync in resample mode (all ranks have full dataset)
+                    is_resample_mode = getattr(self._motion_lib, '_skip_ddp_sharding', False)
+
+                    if is_resample_mode:
+                        dist.all_reduce(self.motion_difficulty, op=dist.ReduceOp.MIN)
+                    # In DDP shard mode: no sync needed (each rank has different subset)
+            except Exception as e:
+                import warnings
+                warnings.warn(f"Motion difficulty sync failed: {e}")
+
     def _post_physics_step_callback(self):
         """ Callback called before computing terminations, rewards, and observations
             Default behaviour: Compute ang vel command based on target and heading, compute measured terrain heights and randomly push robots

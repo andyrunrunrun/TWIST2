@@ -114,10 +114,28 @@ python play.py --task g1_stu_future --proj_name g1_stu_future --exptid <exptid> 
 | `legged_gym/scripts/` | Train (`train.py`), eval (`play.py`), export (`save_onnx.py`) |
 | `legged_gym/motion_data_configs/` | YAML configs for motion datasets |
 | `rsl_rl/` | PPO algorithm, Actor-Critic modules, motion loaders |
+| `rsl_rl/runners/` | Training runners - **IMPORTANT: Two files must be kept in sync** |
 | `pose/` | Motion retargeting (GMR implementation) |
 | `deploy_real/` | Real robot deployment scripts (sim2real, teleop) |
 | `assets/ckpts/` | Pre-trained ONNX models |
 | `assets/example_motions/` | Sample motion data for testing |
+
+## IMPORTANT: Keep Both Runner Files in Sync
+
+The training system uses **two** separate runner implementations that must be kept synchronized:
+
+1. **`rsl_rl/runners/on_policy_runner_mimic.py`** - Used for standard training (teacher training)
+2. **`rsl_rl/runners/on_policy_dagger_runner.py`** - Used for distillation training (student training with teacher)
+
+**When modifying either runner file, you MUST apply the same changes to both files.**
+
+Key areas that need synchronization:
+- `_init_resample_mode()` - Motion resampling initialization
+- `_maybe_resample_motions()` - Periodic motion resampling
+- Any new features or parameters related to motion loading/resampling
+- GPU memory budget handling (`gpu_memory_budget_gb`)
+
+**Failure to keep both files in sync will cause one training mode to work differently than the other.**
 
 ## Configuration System
 

@@ -331,6 +331,7 @@ class HumanoidCharCfg(BaseConfig):
         # Periodic resample mode: resample motion subset every N iterations
         resample_interval = 0  # 0 = disabled (use default cache behavior)
         resample_per_gpu = 15000  # Number of motions to load per GPU when resample is enabled
+        resample_gpu_memory_gb = None  # If set, load motions until this GPU memory budget is reached (in GB). Overrides resample_per_gpu.
 
         # Motion Domain Randomization parameters
         motion_dr_enabled = False  # Enable motion domain randomization

@@ -104,6 +104,7 @@ class MotionLib:
         # Periodic resample mode: only use a subset of motions
         self._resample_mode = False  # Whether resample mode is enabled
         self._loaded_subset_ids: set = set()  # Current subset of motion IDs
+        self._loaded_subset_ids_tensor = None  # Cached GPU tensor of subset IDs (for fast sampling)
         self._full_motion_ids = []  # All available motion IDs (for resampling)
 
         # Resample mode: direct GPU storage (no cache, simple and direct)
@@ -453,6 +454,8 @@ class MotionLib:
 
         self._resample_mode = True
         self._loaded_subset_ids = set(motion_ids)
+        # Cache the subset as a GPU tensor for fast sampling (avoid repeated conversions)
+        self._loaded_subset_ids_tensor = torch.tensor(sorted(motion_ids), device=self._device, dtype=torch.long)
 
         # Clear ALL caches (we don't use them in resample mode)
         if self._lazy_load:
@@ -524,8 +527,11 @@ class MotionLib:
             self._gpu_root_rot_delta_local[start:end] = data["root_rot_delta_local"].to(self._device)
 
             # Per-motion root_pos_delta
-            if not isinstance(self._motion_root_pos_delta[motion_id], type(None)):
-                self._gpu_root_pos_delta[self._motion_id_to_idx[motion_id]] = self._motion_root_pos_delta[motion_id].to(self._device)
+            # FIX: In resample mode, use the delta from the loaded data (data["root_pos_delta"]),
+            # not from self._motion_root_pos_delta[motion_id] which may have wrong indexing
+            root_pos_delta = data.get("root_pos_delta")
+            if root_pos_delta is not None:
+                self._gpu_root_pos_delta[self._motion_id_to_idx[motion_id]] = root_pos_delta.to(self._device)
             else:
                 self._gpu_root_pos_delta[self._motion_id_to_idx[motion_id]] = 0.0
 
@@ -547,7 +553,9 @@ class MotionLib:
         num_motions_subset = len(motion_ids)
         subset_num_frames = torch.tensor([info["num_frames"] for info in motion_info],
                                         device=self._device, dtype=torch.long)
-        subset_lengths = torch.tensor([info["num_frames"] / self._motion_fps[self._motion_id_to_idx[mid]]
+        # FIX: Use original motion_id (mid) to index _motion_fps, not subset index
+        # In resample mode, _motion_fps contains the full dataset (indexed by original motion_id)
+        subset_lengths = torch.tensor([info["num_frames"] / self._motion_fps[mid]
                                         for info, mid in zip(motion_info, motion_ids)],
                                         device=self._device, dtype=torch.float)
 
@@ -579,8 +587,32 @@ class MotionLib:
         self._resample_total_motions = len(motion_ids)
         self._resample_total_frames = total_frames
 
-        print(f"[MotionLib] GPU loading complete: {len(motion_ids)} motions, {total_frames} frames")
-        print(f"[MotionLib] Tensor shapes: root_pos={self._gpu_root_pos.shape}, dof_pos={self._gpu_dof_pos.shape}")
+        # Get rank info for multi-GPU
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+                world_size = dist.get_world_size()
+                rank_str = f"Rank {rank}/{world_size}"
+            else:
+                rank = 0
+                world_size = 1
+                rank_str = "Rank 0/1"
+        except:
+            rank = 0
+            world_size = 1
+            rank_str = "Rank 0/1"
+
+        # Calculate actual GPU memory used
+        total_memory_mb = (
+            (3 + 4 + 3 + 3) * 4 +  # root_pos, root_rot, root_vel, root_ang_vel (float32)
+            (D + D) * 4 +            # dof_pos, dof_vel
+            (B * 3) * 4 +            # local_body_pos
+            (3 + 3) * 4              # root_pos_delta_local, root_rot_delta_local
+        ) * total_frames / (1024**2)
+
+        print(f"[{rank_str}] Resample loaded: {len(motion_ids):5d} motions, {total_frames:7d} frames, ~{total_memory_mb:.0f}MB GPU memory")
+
 
     def _motion_ids_to_indices(self, motion_ids: torch.Tensor) -> torch.Tensor:
         """Convert motion_ids to indices in the resample subset.
@@ -606,14 +638,17 @@ class MotionLib:
         # NO-OP: In resample mode, data is already on GPU via enable_resample_mode()
         pass
 
-    def resample_subset(self, num_motions: int, seed: Optional[int] = None, motion_difficulty=None, preload=False):
+    def resample_subset(self, num_motions: int, seed: Optional[int] = None, motion_difficulty=None, preload=False, gpu_memory_budget_gb: Optional[float] = None):
         """Resample a new subset of motions and load DIRECTLY to GPU.
 
         Args:
-            num_motions: Number of motions to sample
+            num_motions: Number of motions to sample (ignored if gpu_memory_budget_gb is specified)
             seed: Random seed for reproducibility
             motion_difficulty: Optional difficulty weights for sampling
             preload: IGNORED (kept for compatibility). Data is always loaded directly to GPU.
+            gpu_memory_budget_gb: If specified, load motions until this GPU memory budget is reached (in GB).
+                                     This takes precedence over num_motions. Uses cumulative sampling
+                                     to maximize GPU memory utilization.
 
         Returns:
             List of sampled motion IDs
@@ -623,7 +658,148 @@ class MotionLib:
 
         num_total = len(self._full_motion_ids)
 
-        # If requesting more motions than available, use all
+        # Convert gpu_memory_budget_gb to float if it's a string (from command line args)
+        if gpu_memory_budget_gb is not None:
+            try:
+                gpu_memory_budget_gb = float(gpu_memory_budget_gb)
+            except (ValueError, TypeError):
+                gpu_memory_budget_gb = None
+
+        # If GPU memory budget is specified, use cumulative sampling
+        if gpu_memory_budget_gb is not None:
+            sampled_ids = self._cumulative_sample_by_budget(
+                gpu_memory_budget_gb,
+                motion_difficulty,
+                num_total
+            )
+        else:
+            # Original logic: sample fixed number of motions
+            sampled_ids = self._sample_fixed_num_motions(num_motions, motion_difficulty, num_total)
+
+        # Enable resample mode with new subset (loads DIRECTLY to GPU)
+        self.enable_resample_mode(sampled_ids)
+
+        return sampled_ids
+
+    def _cumulative_sample_by_budget(self, gpu_memory_budget_gb: float, motion_difficulty, num_total: int):
+        """Sample motions cumulatively until GPU memory budget is reached.
+
+        This method samples motions one by one (weighted by motion_weights and difficulty),
+        accumulating the total frame count until the budget is approximately reached.
+        This maximizes GPU memory utilization since different ranks may sample motions
+        of different sizes.
+
+        Args:
+            gpu_memory_budget_gb: GPU memory budget in GB
+            motion_difficulty: Optional difficulty weights for sampling
+            num_total: Total number of motions available
+
+        Returns:
+            List of sampled motion IDs
+        """
+        # Calculate memory per frame (same as before)
+        sample_motion_id = self._full_motion_ids[0]
+        sample_data = self._load_motion_on_demand(sample_motion_id)
+        D = sample_data["dof_pos"].shape[-1]
+        B = sample_data["local_body_pos"].shape[1]
+
+        bytes_per_frame = (
+            3 + 4 + 3 + 3 +  # root_pos, root_rot, root_vel, root_ang_vel
+            D + D +            # dof_pos, dof_vel
+            B * 3 +            # local_body_pos
+            3 + 3              # root_pos_delta_local, root_rot_delta_local
+        ) * 4 * 1.1  # float32 with 10% buffer
+
+        budget_bytes = gpu_memory_budget_gb * 1024**3
+        max_frames = int(budget_bytes / bytes_per_frame)
+
+        # Build sampling probability distribution
+        if motion_difficulty is not None:
+            motion_prob = self._motion_weights * motion_difficulty
+        else:
+            motion_prob = self._motion_weights.clone()
+
+        # Normalize to sum to 1
+        motion_prob = motion_prob / motion_prob.sum()
+
+        # Get rank info for logging
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+                world_size = dist.get_world_size()
+            else:
+                rank = 0
+                world_size = 1
+        except:
+            rank = 0
+            world_size = 1
+
+        # IMPORTANT: Use pre-loaded _motion_num_frames instead of loading each motion!
+        # _motion_num_frames is indexed by motion_id (0 to max_motion_id)
+        max_motion_id = max(self._full_motion_ids)
+        motion_lengths = self._motion_num_frames[:max_motion_id+1].clone()
+
+        # OPTIMIZED: Batch sampling instead of loop
+        # Sample a large batch at once, then filter by budget
+        estimated_motions = min(int(max_frames / 100), num_total)  # Assume avg 100 frames
+        estimated_motions = max(estimated_motions, 5000)  # At least 5000
+
+        # Sample 1.5x more than needed (we'll filter later)
+        sample_batch_size = min(int(estimated_motions * 1.5), num_total)
+
+        if motion_difficulty is not None:
+            motion_prob = self._motion_weights * motion_difficulty
+        else:
+            motion_prob = self._motion_weights.clone()
+        motion_prob = motion_prob / motion_prob.sum()
+
+        # Sample in one batch (all on GPU, no Python loop)
+        sampled_tensor = torch.multinomial(motion_prob, num_samples=sample_batch_size, replacement=False)
+
+        # Get motion lengths for sampled indices (all on GPU)
+        sampled_lengths = motion_lengths[sampled_tensor]
+
+        # Cumulative sum to find where to cut (all on GPU, no Python loop)
+        cumsum_frames = torch.cumsum(sampled_lengths, dim=0)
+
+        # Find how many motions we can keep (all on GPU)
+        budget_threshold = max_frames * 1.05
+        valid_mask = cumsum_frames <= budget_threshold
+
+        # Also ensure at least some motions are selected
+        if not valid_mask.any():
+            valid_mask[0] = True
+
+        # Get indices to keep (all on GPU)
+        valid_indices = torch.where(valid_mask)[0]
+        sampled_tensor_filtered = sampled_tensor[valid_indices]
+
+        # Convert to list of motion IDs
+        sampled_ids = [self._full_motion_ids[i.item()] for i in sampled_tensor_filtered]
+
+        total_frames = cumsum_frames[valid_indices[-1]].item() if len(valid_indices) > 0 else 0
+
+        # Calculate actual memory usage
+        total_memory_mb = bytes_per_frame * total_frames / (1024**2)
+
+        print(f"[Rank {rank}/{world_size}] Cumulative sampling: {len(sampled_ids)} motions, "
+              f"{total_frames} frames, ~{total_memory_mb:.0f}MB GPU memory "
+              f"(budget: {gpu_memory_budget_gb:.2f}GB = {max_frames} frames)", flush=True)
+
+        return sampled_ids
+
+    def _sample_fixed_num_motions(self, num_motions: int, motion_difficulty, num_total: int):
+        """Sample a fixed number of motions (original logic).
+
+        Args:
+            num_motions: Number of motions to sample
+            motion_difficulty: Optional difficulty weights for sampling
+            num_total: Total number of motions available
+
+        Returns:
+            List of sampled motion IDs
+        """
         if num_motions >= num_total:
             sampled_ids = self._full_motion_ids.copy()
             print(f"[MotionLib] Requested {num_motions} motions, but only {num_total} available. Using all.")
@@ -634,17 +810,19 @@ class MotionLib:
             else:
                 motion_prob = self._motion_weights
 
-            # Sample with replacement if num_motions > num_total, without replacement otherwise
-            replacement = num_motions > num_total
+            # Check if we need replacement (fewer non-zero probabilities than requested samples)
+            num_non_zero = (motion_prob > 0).sum().item()
+            if num_non_zero < num_motions:
+                replacement = True
+            else:
+                replacement = num_motions > num_total
+
             sampled_tensor = torch.multinomial(
                 motion_prob,
                 num_samples=num_motions,
                 replacement=replacement
             )
             sampled_ids = sampled_tensor.cpu().tolist()
-
-        # Enable resample mode with new subset (loads DIRECTLY to GPU)
-        self.enable_resample_mode(sampled_ids)
 
         return sampled_ids
 
@@ -1524,8 +1702,12 @@ class MotionLib:
                       error_sampling_threshold=0.15):
         # In resample mode, only sample from the loaded subset
         if self._resample_mode and self._loaded_subset_ids:
-            # Get subset IDs as a tensor
-            subset_ids = torch.tensor(list(self._loaded_subset_ids), device=self._device, dtype=torch.long)
+            # Use cached GPU tensor (much faster than converting list each time)
+            if self._loaded_subset_ids_tensor is None:
+                # Fallback: create the cached tensor if it doesn't exist
+                print("[MotionLib] WARNING: _loaded_subset_ids_tensor is None, creating it now...")
+                self._loaded_subset_ids_tensor = torch.tensor(sorted(self._loaded_subset_ids), device=self._device, dtype=torch.long)
+            subset_ids = self._loaded_subset_ids_tensor
             subset_weights = self._motion_weights[subset_ids]
 
             # Apply difficulty if provided
@@ -1581,7 +1763,7 @@ class MotionLib:
     def sample_time(self, motion_ids):
         phase = torch.rand(motion_ids.shape, device=self._device)
         motion_len = self._motion_lengths[motion_ids]
-        
+
         motion_time = motion_len * phase
         return motion_time
                 
@@ -1931,7 +2113,7 @@ class MotionLib:
             log_dir: Directory where the difficulty folder will be created
             iteration: Current training iteration (used in filename)
             motion_difficulty: Tensor of difficulty values (1-10 scale, or 100.0 for initial)
-            rank: Process rank for multi-GPU training (used in filename)
+            rank: Process rank for multi-GPU training (used in filename). None = no suffix.
         """
         import csv
 
@@ -1939,8 +2121,11 @@ class MotionLib:
         difficulty_dir = os.path.join(log_dir, "difficulty")
         os.makedirs(difficulty_dir, exist_ok=True)
 
-        # Prepare CSV file path (include rank in filename for multi-GPU)
-        csv_file = os.path.join(difficulty_dir, f"difficulty_iter_{iteration:07d}_rank{rank}.csv")
+        # Prepare CSV file path (include rank in filename only if specified)
+        if rank is not None:
+            csv_file = os.path.join(difficulty_dir, f"difficulty_iter_{iteration:07d}_rank{rank}.csv")
+        else:
+            csv_file = os.path.join(difficulty_dir, f"difficulty_iter_{iteration:07d}.csv")
 
         # Get motion names and difficulties
         motion_names = self.get_motion_names()

@@ -153,10 +153,25 @@ class TaskRegistry():
         
         train_cfg_dict = class_to_dict(train_cfg)
         runner_class = eval(train_cfg.runner.runner_class_name)
-        runner = runner_class(env, 
-                                train_cfg_dict, 
-                                log_dir, 
-                                device=args.rl_device, **kwargs)
+        runner = runner_class(env,
+                                train_cfg_dict,
+                                log_dir,
+                                device=args.rl_device,
+                                args=args,  # Pass args to access config_overrides
+                                **kwargs)
+
+        # Sync motion config from env to runner's stored values
+        # This is needed because config overrides applied in make_env may not be
+        # reflected in runner's internal state if it was initialized with old values
+        if hasattr(env, '_motion_resample_gpu_memory_gb'):
+            if not hasattr(runner, '_motion_resample_gpu_memory_gb') or runner._motion_resample_gpu_memory_gb is None:
+                runner._motion_resample_gpu_memory_gb = env._motion_resample_gpu_memory_gb
+        if hasattr(env, '_motion_resample_per_gpu'):
+            if not hasattr(runner, '_motion_resample_per_gpu'):
+                runner._motion_resample_per_gpu = env._motion_resample_per_gpu
+        if hasattr(env, '_motion_resample_interval'):
+            if not hasattr(runner, '_motion_resample_interval'):
+                runner._motion_resample_interval = env._motion_resample_interval
         #save resume path before creating a new log_dir
         resume = train_cfg.runner.resume
         if args.resumeid:
