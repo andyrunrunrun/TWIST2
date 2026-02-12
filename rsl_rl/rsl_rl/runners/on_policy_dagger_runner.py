@@ -285,6 +285,10 @@ class OnPolicyDaggerRunner:
         self.env.reset_idx(torch.arange(self.env.num_envs, device=self.env.device))
         print(f"[Motion Resample] Rank {rank}/{world_size}: environment motion IDs re-sampled", flush=True)
 
+        # Start async resample thread for next iteration (only if explicitly enabled)
+        if getattr(self.env, "_motion_async_resample", False):
+            self.env._motion_lib.enable_async_resample(self._motion_resample_interval)
+
     def _maybe_resample_motions(self, iteration):
         """Check if we need to resample motions and do it if needed."""
         if self._motion_resample_interval <= 0:
@@ -302,6 +306,18 @@ class OnPolicyDaggerRunner:
                 world_size = 1
                 rank = 0
 
+            # Try async resample first (fast switch to pre-loaded data)
+            if self.env._motion_lib._async_resample_enabled:
+                if self.env._motion_lib.check_and_resample_async(iteration):
+                    print(f"[Iteration {iteration}] Rank {rank}/{world_size}: async resample completed", flush=True)
+                    # Sync motion_difficulty across all ranks
+                    if hasattr(self.env, '_sync_motion_difficulty'):
+                        self.env._sync_motion_difficulty()
+                    # Re-sample environment motion_ids to match the new subset
+                    self.env.reset_idx(torch.arange(self.env.num_envs, device=self.env.device))
+                    return
+
+            # Fall back to synchronous resample
             # Get GPU memory budget if specified (overrides num_motions)
             gpu_memory_budget_gb = getattr(self.env, "_motion_resample_gpu_memory_gb", None)
 

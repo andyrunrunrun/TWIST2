@@ -107,6 +107,17 @@ class MotionLib:
         self._loaded_subset_ids_tensor = None  # Cached GPU tensor of subset IDs (for fast sampling)
         self._full_motion_ids = []  # All available motion IDs (for resampling)
 
+        # Async resample: prepare next subset in background on CPU
+        self._async_resample_enabled = False
+        self._async_resample_interval = 0
+        self._async_resample_thread = None
+        self._async_resample_stop_event = None
+        self._async_resample_ready_event = None
+        self._async_resample_next_data = None  # Pre-loaded data on CPU (ready to load to GPU)
+        self._async_resample_next_ids = None    # Next subset IDs (for sampling)
+        self._async_resample_last_iteration = 0
+        self._async_resample_lock = None  # Lock for thread-safe access
+
         # Resample mode: direct GPU storage (no cache, simple and direct)
         # Stores motion data directly on GPU, bypassing all cache layers
         self._resample_gpu_storage: dict = {}  # {motion_id: {root_pos, root_rot, ...}} on GPU
@@ -451,6 +462,7 @@ class MotionLib:
             motion_ids: List of motion IDs to load directly to GPU
         """
         from tqdm import tqdm
+        import gc
 
         self._resample_mode = True
         self._loaded_subset_ids = set(motion_ids)
@@ -463,6 +475,14 @@ class MotionLib:
             self._cpu_cache_bytes_used = 0
         self._clear_gpu_cache()
         self._resample_gpu_storage.clear()
+
+        # When synchronous resample happens, clear the ready event so the
+        # background thread knows to prepare new data for the next resample.
+        # Don't clear the data itself - it might still be useful or in use.
+        if self._async_resample_enabled:
+            if self._async_resample_ready_event.is_set():
+                self._async_resample_ready_event.clear()
+                print(f"[MotionLib] Cleared async ready event (synchronous resample happened, background will reprepare)", flush=True)
 
         print(f"[MotionLib] Loading {len(motion_ids)} motions to GPU (merged tensors)...")
 
@@ -485,6 +505,32 @@ class MotionLib:
         first_data = motion_info[0]["data"]
         D = first_data["dof_pos"].shape[-1]
         B = first_data["local_body_pos"].shape[1]
+
+        # CRITICAL: Delete old GPU tensors FIRST to avoid double memory usage
+        if hasattr(self, '_gpu_root_pos'):
+            del self._gpu_root_pos
+        if hasattr(self, '_gpu_root_rot'):
+            del self._gpu_root_rot
+        if hasattr(self, '_gpu_root_vel'):
+            del self._gpu_root_vel
+        if hasattr(self, '_gpu_root_ang_vel'):
+            del self._gpu_root_ang_vel
+        if hasattr(self, '_gpu_dof_pos'):
+            del self._gpu_dof_pos
+        if hasattr(self, '_gpu_dof_vel'):
+            del self._gpu_dof_vel
+        if hasattr(self, '_gpu_local_body_pos'):
+            del self._gpu_local_body_pos
+        if hasattr(self, '_gpu_root_pos_delta_local'):
+            del self._gpu_root_pos_delta_local
+        if hasattr(self, '_gpu_root_rot_delta_local'):
+            del self._gpu_root_rot_delta_local
+        if hasattr(self, '_gpu_root_pos_delta'):
+            del self._gpu_root_pos_delta
+
+        # Force GPU cache flush before allocating new tensors
+        if self._device.type == 'cuda':
+            torch.cuda.empty_cache()
 
         # Allocate merged tensors on GPU
         print(f"[MotionLib] Allocating {total_frames} frames on GPU...")
@@ -653,17 +699,20 @@ class MotionLib:
         Returns:
             List of sampled motion IDs
         """
-        if seed is not None:
-            torch.manual_seed(seed)
-
-        num_total = len(self._full_motion_ids)
-
+        # Store resample config for async worker to use
+        self._resample_num_motions = num_motions
         # Convert gpu_memory_budget_gb to float if it's a string (from command line args)
         if gpu_memory_budget_gb is not None:
             try:
                 gpu_memory_budget_gb = float(gpu_memory_budget_gb)
             except (ValueError, TypeError):
                 gpu_memory_budget_gb = None
+        self._resample_gpu_memory_budget_gb = gpu_memory_budget_gb
+
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        num_total = len(self._full_motion_ids)
 
         # If GPU memory budget is specified, use cumulative sampling
         if gpu_memory_budget_gb is not None:
@@ -2127,8 +2176,8 @@ class MotionLib:
         else:
             csv_file = os.path.join(difficulty_dir, f"difficulty_iter_{iteration:07d}.csv")
 
-        # Get motion names and difficulties
-        motion_names = self.get_motion_names()
+        # Get motion file paths and difficulties (use paths instead of names for easier lookup)
+        motion_files = self._motion_files  # List of file paths
         difficulties_cpu = motion_difficulty.cpu().numpy()
 
         # Map to 0-100 scale
@@ -2143,12 +2192,506 @@ class MotionLib:
                 difficulties_0_100.append((d - 1.0) / 9.0 * 100.0)
         difficulties_0_100 = np.array(difficulties_0_100)
 
-        # Write to CSV
+        # Write to CSV with file paths instead of motion names
         with open(csv_file, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['motion_idx', 'motion_name', 'difficulty_0_100', 'difficulty_raw'])
-            for idx, (name, diff_0_100, diff_raw) in enumerate(zip(motion_names, difficulties_0_100, difficulties_cpu)):
-                writer.writerow([idx, str(name), f"{diff_0_100:.2f}", f"{diff_raw:.4f}"])
+            writer.writerow(['motion_idx', 'motion_path', 'difficulty_0_100', 'difficulty_raw'])
+            for idx, (path, diff_0_100, diff_raw) in enumerate(zip(motion_files, difficulties_0_100, difficulties_cpu)):
+                writer.writerow([idx, str(path), f"{diff_0_100:.2f}", f"{diff_raw:.4f}"])
 
         print(f"[MotionLib] Saved motion difficulty to {csv_file}")
 
+    def load_difficulty_from_csvs(self, csv_files: List[str]) -> "torch.Tensor":
+        """Load and merge difficulty from multiple CSV files, match by current motion paths.
+
+        This method uses the current MotionLib instance's _motion_files (which has already
+        been processed by shuffle, motion_ids filter, max_motions, DDP sharding, etc.)
+        to ensure the returned difficulties are in the correct order.
+
+        Args:
+            csv_files: List of CSV file paths (from multiple ranks)
+
+        Returns:
+            Tensor of difficulty values matching current motion order (1-10 scale)
+
+        Raises:
+            FileNotFoundError: If any current motion not found in CSVs
+        """
+        import csv
+
+        # Step 1: Read all CSV files and build motion_path -> difficulties mapping
+        motion_path_to_diffs: Dict[str, List[float]] = {}
+
+        for csv_file in csv_files:
+            if not os.path.exists(csv_file):
+                print(f"[MotionLib] Warning: CSV file not found: {csv_file}")
+                continue
+
+            with open(csv_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    motion_path = row['motion_path']
+                    diff_0_100 = float(row['difficulty_0_100'])
+
+                    if motion_path not in motion_path_to_diffs:
+                        motion_path_to_diffs[motion_path] = []
+                    motion_path_to_diffs[motion_path].append(diff_0_100)
+
+        if not motion_path_to_diffs:
+            raise FileNotFoundError(f"No valid difficulty data found in CSV files: {csv_files}")
+
+        # Step 2: Match current motion paths to CSV entries
+        # Use self._motion_files which is the FINAL list after all preprocessing
+        # (shuffle, motion_ids filter, max_motions, DDP sharding, etc.)
+        difficulties = []
+        missing_motions = []
+
+        for curr_path in self._motion_files:
+            if curr_path in motion_path_to_diffs:
+                # Take MIN across all ranks (consistent with training sync logic)
+                min_diff = min(motion_path_to_diffs[curr_path])
+                difficulties.append(min_diff)
+            else:
+                missing_motions.append(curr_path)
+
+        if missing_motions:
+            raise FileNotFoundError(
+                f"Found {len(missing_motions)} current motions that are not in CSV difficulty files.\n"
+                f"First few missing: {missing_motions[:5]}\n"
+                f"CSV files: {csv_files}"
+            )
+
+        # Step 3: Convert 0-100 scale back to internal 1-10 scale
+        # Formula reverse: internal = 0_100 / 100 * 9 + 1
+        difficulties_tensor = torch.tensor(difficulties, dtype=torch.float32, device=self._device)
+        # Convert 0-100 to 1-10
+        difficulties_internal = difficulties_tensor / 100.0 * 9.0 + 1.0
+
+        return difficulties_internal
+
+
+    # ============================================================
+    # Async Resample: Prepare next subset in background on CPU
+    # ============================================================
+    
+    def enable_async_resample(self, interval: int):
+        """Enable async resample mode.
+
+        In this mode, a background thread prepares the next subset on CPU while
+        training continues. When it's time to resample, we simply switch to the
+        pre-loaded data (fast CPU->GPU copy).
+
+        Args:
+            interval: Resample interval (in iterations)
+        """
+        import threading
+        import time
+
+        if self._async_resample_thread is not None:
+            self.disable_async_resample()
+
+        self._async_resample_enabled = True
+        self._async_resample_interval = interval
+        self._async_resample_stop_event = threading.Event()
+        self._async_resample_ready_event = threading.Event()
+        self._async_resample_lock = threading.Lock()
+
+        # Start background thread
+        self._async_resample_thread = threading.Thread(
+            target=self._async_resample_worker,
+            daemon=True,
+            name="AsyncResampleWorker"
+        )
+        self._async_resample_thread.start()
+
+        print(f"[MotionLib] ========== ASYNC RESAMPLE ENABLED: interval={interval} iterations ==========", flush=True)
+
+        # IMPORTANT: Trigger the first preparation immediately after thread starts
+        # Set _async_resample_last_iteration to trigger preparation for iteration (interval-1)
+        # This ensures the first resample will have pre-loaded data ready
+        time.sleep(0.2)  # Give thread a moment to start
+        with self._async_resample_lock:
+            # Set to (interval - 1) so that (interval - 1 + 1) % interval == 0 becomes true
+            # This triggers immediate preparation for the first resample
+            if self._async_resample_next_data is None:
+                print(f"[AsyncResample] Preparing first batch (for iteration {self._async_resample_interval}) immediately after enable...", flush=True)
+                self._async_resample_last_iteration = self._async_resample_interval - 1
+                # The worker thread will pick this up and trigger preparation
+    
+    def disable_async_resample(self):
+        """Disable async resample and clean up resources."""
+        import gc
+
+        self._async_resample_enabled = False
+
+        if self._async_resample_stop_event is not None:
+            self._async_resample_stop_event.set()
+
+        if self._async_resample_thread is not None:
+            self._async_resample_thread.join(timeout=5.0)
+            if self._async_resample_thread.is_alive():
+                print("[MotionLib] Warning: Async resample thread did not stop gracefully")
+            self._async_resample_thread = None
+
+        # Clean up large data structures explicitly
+        if self._async_resample_next_data is not None:
+            self._async_resample_next_data.clear()
+        self._async_resample_next_data = None
+        self._async_resample_next_ids = None
+
+        self._async_resample_stop_event = None
+        self._async_resample_ready_event = None
+
+        # Force garbage collection to free memory
+        gc.collect()
+
+        print("[MotionLib] Async resample disabled and resources cleaned up")
+    
+    def _async_resample_worker(self):
+        """Background worker thread that prepares the next subset on CPU."""
+        import time
+
+        try:
+            # Use stored resample config from MotionLib initialization
+            num_motions = getattr(self, "_resample_num_motions", 15000)
+            gpu_memory_budget_gb = getattr(self, "_resample_gpu_memory_budget_gb", None)
+
+            budget_str = f"{gpu_memory_budget_gb}GB" if gpu_memory_budget_gb else f"{num_motions} motions"
+            print(f"[AsyncResample] Worker STARTED: interval={self._async_resample_interval}, budget={budget_str}", flush=True)
+
+            while not self._async_resample_stop_event.is_set():
+                time.sleep(0.1)  # Check every 100ms
+
+                # Check if we should prepare next subset
+                with self._async_resample_lock:
+                    current_iteration = self._async_resample_last_iteration
+
+                    # Check if we're approaching resample time
+                    # Prepare next subset when current_iteration + 1 is multiple of interval
+                    # OR when ready_event is cleared (meaning sync resample happened)
+                    should_prepare = ((current_iteration + 1) % self._async_resample_interval == 0)
+
+                    # Also trigger if ready_event was cleared (sync resample happened)
+                    if not should_prepare and not self._async_resample_ready_event.is_set():
+                        # Check if we're in the preparation window (next 5 iterations)
+                        next_trigger = ((current_iteration // self._async_resample_interval) + 1) * self._async_resample_interval
+                        if next_trigger - current_iteration <= 5:
+                            should_prepare = True
+
+                    if should_prepare:
+                        # Check if data is already being prepared or is ready
+                        if self._async_resample_next_data is None or not self._async_resample_ready_event.is_set():
+                            print(f"[AsyncResample] Starting to prepare next subset (will be used at iteration {((current_iteration // self._async_resample_interval) + 1) * self._async_resample_interval})...", flush=True)
+                            # Clear old data and prepare new subset
+                            if self._async_resample_next_data is not None:
+                                self._async_resample_next_data.clear()
+                            self._async_resample_next_data = None
+                            self._prepare_next_subset(num_motions, gpu_memory_budget_gb)
+
+                            if self._async_resample_next_data is not None:
+                                self._async_resample_ready_event.set()
+                                print(f"[AsyncResample] Next subset READY: {len(self._async_resample_next_ids)} motions - waiting for resample trigger", flush=True)
+        except Exception as e:
+            print(f"[AsyncResample] Worker error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _prepare_next_subset(self, num_motions: int, gpu_memory_budget_gb: float = None):
+        """Prepare the next subset on CPU in background."""
+        import time
+
+        t0 = time.time()
+
+        try:
+            # Sample next subset (same logic as resample_subset)
+            seed = int(time.time() * 1000000)  # Random seed
+            if seed is not None:
+                torch.manual_seed(seed)
+
+            num_total = len(self._full_motion_ids)
+
+            # Convert gpu_memory_budget_gb to float if it's a string
+            if gpu_memory_budget_gb is not None:
+                try:
+                    gpu_memory_budget_gb = float(gpu_memory_budget_gb)
+                except (ValueError, TypeError):
+                    gpu_memory_budget_gb = None
+
+            # Use cumulative sampling if budget specified
+            if gpu_memory_budget_gb is not None:
+                print(f"[AsyncResample] Sampling with GPU budget {gpu_memory_budget_gb}GB...", flush=True)
+                sampled_ids = self._cumulative_sample_by_budget(
+                    gpu_memory_budget_gb, None, num_total
+                )
+            else:
+                print(f"[AsyncResample] Sampling {num_motions} motions...", flush=True)
+                # Fixed number sampling
+                sampled_ids = self._sample_fixed_num_motions(
+                    num_motions, None, num_total
+                )
+            print(f"[AsyncResample] Sampled {len(sampled_ids)} motions, loading data to CPU...", flush=True)
+
+            # Prepare data on CPU (load to CPU tensors, not GPU)
+            next_data = {}
+            total_frames = 0
+            load_start = time.time()
+            for i, motion_id in enumerate(sampled_ids):
+                data = self._load_motion_on_demand(motion_id)
+                # IMPORTANT: Clone tensors to avoid holding references to cached data
+                # This prevents the CPU cache from being locked by async pre-loading
+                next_data[motion_id] = {
+                    'root_pos': data["root_pos"].clone(),  # Clone to break reference to cache
+                    'root_rot': data["root_rot"].clone(),
+                    'root_vel': data["root_vel"].clone(),
+                    'root_ang_vel': data["root_ang_vel"].clone(),
+                    'dof_pos': data["dof_pos"].clone(),
+                    'dof_vel': data["dof_vel"].clone(),
+                    'local_body_pos': data["local_body_pos"].clone(),
+                    'root_pos_delta_local': data["root_pos_delta_local"].clone(),
+                    'root_rot_delta_local': data["root_rot_delta_local"].clone(),
+                    'num_frames': data["root_pos"].shape[0],
+                }
+                # Get root_pos_delta separately
+                root_pos_delta = data.get("root_pos_delta")
+                if root_pos_delta is not None:
+                    next_data[motion_id]['root_pos_delta'] = root_pos_delta.clone()
+
+                total_frames += data["root_pos"].shape[0]
+                # Progress update every 1000 motions
+                if (i + 1) % 1000 == 0:
+                    print(f"[AsyncResample] Loaded {i+1}/{len(sampled_ids)} motions...", flush=True)
+
+            self._async_resample_next_ids = sampled_ids
+            self._async_resample_next_data = next_data
+
+            t1 = time.time()
+            load_time = load_start - t0
+            copy_time = t1 - load_start
+            print(f"[AsyncResample] Prepared {len(sampled_ids)} motions ({total_frames} frames) on CPU in {t1-t0:.1f}s (sample+load: {load_time:.1f}s, copy: {copy_time:.1f}s)", flush=True)
+
+        except Exception as e:
+            print(f"[AsyncResample] FAILED to prepare next subset: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            self._async_resample_next_data = None
+            self._async_resample_next_ids = None
+    
+    def _switch_to_next_subset_async(self):
+        """Fast switch to the pre-loaded next subset.
+
+        This is called when it's time to resample. It loads the pre-loaded
+        CPU data to GPU, which is much faster than sampling and loading.
+        """
+        import time
+        import gc
+
+        if self._async_resample_next_data is None:
+            print("[AsyncResample] WARNING: No pre-loaded data available, falling back to synchronous resample", flush=True)
+            return False
+
+        t0 = time.time()
+
+        try:
+            # _async_resample_next_ids is a list of motion IDs
+            motion_ids = list(self._async_resample_next_ids) if self._async_resample_next_ids else []
+
+            print(f"[AsyncResample] ========== SWITCHING to pre-loaded subset ({len(motion_ids)} motions) ==========", flush=True)
+
+            # Load to GPU using the same logic as enable_resample_mode
+            self._load_subset_to_gpu(motion_ids, self._async_resample_next_data)
+
+            # Clear pre-loaded data and explicitly free memory
+            self._async_resample_next_data.clear()
+            self._async_resample_next_data = None
+            self._async_resample_next_ids = None
+            self._async_resample_ready_event.clear()
+
+            # Force garbage collection to free CPU memory
+            gc.collect()
+
+            t1 = time.time()
+            print(f"[AsyncResample] ========== SWITCH COMPLETED in {t1-t0:.2f}s ==========", flush=True)
+
+            return True
+
+        except Exception as e:
+            print(f"[AsyncResample] FAILED to switch to next subset: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            # Clear data on error
+            if hasattr(self, '_async_resample_next_data') and self._async_resample_next_data is not None:
+                self._async_resample_next_data.clear()
+            self._async_resample_next_data = None
+            self._async_resample_next_ids = None
+            self._async_resample_ready_event.clear()
+            gc.collect()
+            return False
+    
+    def check_and_resample_async(self, current_iteration: int):
+        """Check if we should resample and do async switch if ready.
+
+        This should be called from the training loop instead of _maybe_resample_motions.
+
+        Args:
+            current_iteration: Current training iteration
+
+        Returns:
+            True if resample happened, False otherwise
+        """
+        # IMPORTANT: Don't update _async_resample_last_iteration at the start!
+        # This allows background thread to correctly trigger when:
+        # (current_iteration + 1) % interval == 0
+        # The iteration will be updated AFTER successful switch or at the end.
+
+        # Check if it's time to resample
+        if current_iteration > 0 and current_iteration % self._async_resample_interval == 0:
+            print(f"[AsyncResample] Iteration {current_iteration}: Time to resample!", flush=True)
+
+            # Try to use pre-loaded data first
+            if self._async_resample_ready_event.is_set():
+                print(f"[AsyncResample] Pre-loaded data is READY, switching...", flush=True)
+                with self._async_resample_lock:
+                    success = self._switch_to_next_subset_async()
+                    if success:
+                        # IMPORTANT: Update iteration AFTER successful switch
+                        # This allows background thread to prepare next batch during training
+                        self._async_resample_last_iteration = current_iteration
+                        return True
+                    else:
+                        # Fall through to synchronous resample
+                        pass
+            else:
+                print(f"[AsyncResample] Pre-loaded data NOT ready yet, waiting up to 5s...", flush=True)
+                # Wait a bit for the async thread to finish (with timeout)
+                self._async_resample_ready_event.wait(timeout=5.0)
+
+                if self._async_resample_ready_event.is_set():
+                    print(f"[AsyncResample] Data is now ready, switching...", flush=True)
+                    with self._async_resample_lock:
+                        success = self._switch_to_next_subset_async()
+                        if success:
+                            # Update iteration AFTER successful switch
+                            self._async_resample_last_iteration = current_iteration
+                            return True
+                else:
+                    print(f"[AsyncResample] Data still NOT ready after 5s, falling back to synchronous resample", flush=True)
+                    # Fall through to synchronous resample
+                    pass
+
+        # IMPORTANT: Always update iteration after checking
+        # This ensures background thread knows the current training iteration
+        # even when no resample happened this time
+        self._async_resample_last_iteration = current_iteration
+
+        return False
+    
+    def _load_subset_to_gpu(self, motion_ids: list, motion_data: dict):
+        """Load pre-loaded motion data from CPU dict to GPU merged tensors.
+
+        This is similar to enable_resample_mode but uses pre-loaded data.
+
+        Args:
+            motion_ids: List of motion IDs
+            motion_data: Dict of motion_id -> data dict (CPU tensors)
+        """
+        import time
+        import gc
+
+        t0 = time.time()
+        D = motion_data[motion_ids[0]]["dof_pos"].shape[-1]
+        B = motion_data[motion_ids[0]]["local_body_pos"].shape[1]
+
+        # Calculate total frames
+        total_frames = sum(motion_data[mid]["num_frames"] for mid in motion_ids)
+
+        print(f"[AsyncResample] Allocating GPU tensors for {total_frames} frames...", flush=True)
+
+        # CRITICAL: Delete old GPU tensors FIRST to avoid double memory usage
+        # This prevents GPU OOM when replacing large datasets
+        if hasattr(self, '_gpu_root_pos'):
+            del self._gpu_root_pos
+        if hasattr(self, '_gpu_root_rot'):
+            del self._gpu_root_rot
+        if hasattr(self, '_gpu_root_vel'):
+            del self._gpu_root_vel
+        if hasattr(self, '_gpu_root_ang_vel'):
+            del self._gpu_root_ang_vel
+        if hasattr(self, '_gpu_dof_pos'):
+            del self._gpu_dof_pos
+        if hasattr(self, '_gpu_dof_vel'):
+            del self._gpu_dof_vel
+        if hasattr(self, '_gpu_local_body_pos'):
+            del self._gpu_local_body_pos
+        if hasattr(self, '_gpu_root_pos_delta_local'):
+            del self._gpu_root_pos_delta_local
+        if hasattr(self, '_gpu_root_rot_delta_local'):
+            del self._gpu_root_rot_delta_local
+        if hasattr(self, '_gpu_root_pos_delta'):
+            del self._gpu_root_pos_delta
+
+        # Force GPU cache flush before allocating new tensors
+        if self._device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+        # Allocate GPU tensors
+        self._gpu_root_pos = torch.empty((total_frames, 3), device=self._device, dtype=torch.float32)
+        self._gpu_root_rot = torch.empty((total_frames, 4), device=self._device, dtype=torch.float32)
+        self._gpu_root_vel = torch.empty((total_frames, 3), device=self._device, dtype=torch.float32)
+        self._gpu_root_ang_vel = torch.empty((total_frames, 3), device=self._device, dtype=torch.float32)
+        self._gpu_dof_pos = torch.empty((total_frames, D), device=self._device, dtype=torch.float32)
+        self._gpu_dof_vel = torch.empty((total_frames, D), device=self._device, dtype=torch.float32)
+        self._gpu_local_body_pos = torch.empty((total_frames, B, 3), device=self._device, dtype=torch.float32)
+        self._gpu_root_pos_delta_local = torch.empty((total_frames, 3), device=self._device, dtype=torch.float32)
+        self._gpu_root_rot_delta_local = torch.empty((total_frames, 3), device=self._device, dtype=torch.float32)
+
+        # Per-motion root_pos_delta
+        max_id = max(motion_ids)
+        self._gpu_root_pos_delta = torch.empty((max_id + 1, 3), device=self._device, dtype=torch.float32)
+
+        print(f"[AsyncResample] Copying data from CPU to GPU...", flush=True)
+
+        # Copy data to GPU
+        start = 0
+        copy_start = time.time()
+        for i, motion_id in enumerate(motion_ids):
+            data = motion_data[motion_id]
+            num_frames = data["num_frames"]
+            end = start + num_frames
+
+            self._gpu_root_pos[start:end] = data["root_pos"].to(self._device, non_blocking=True)
+            self._gpu_root_rot[start:end] = data["root_rot"].to(self._device, non_blocking=True)
+            self._gpu_root_vel[start:end] = data["root_vel"].to(self._device, non_blocking=True)
+            self._gpu_root_ang_vel[start:end] = data["root_ang_vel"].to(self._device, non_blocking=True)
+            self._gpu_dof_pos[start:end] = data["dof_pos"].to(self._device, non_blocking=True)
+            self._gpu_dof_vel[start:end] = data["dof_vel"].to(self._device, non_blocking=True)
+            self._gpu_local_body_pos[start:end] = data["local_body_pos"].to(self._device, non_blocking=True)
+            self._gpu_root_pos_delta_local[start:end] = data["root_pos_delta_local"].to(self._device, non_blocking=True)
+            self._gpu_root_rot_delta_local[start:end] = data["root_rot_delta_local"].to(self._device, non_blocking=True)
+
+            # Per-motion root_pos_delta
+            root_pos_delta = motion_data[motion_id].get("root_pos_delta")
+            if root_pos_delta is not None:
+                self._gpu_root_pos_delta[motion_id] = root_pos_delta.to(self._device, non_blocking=True)
+            else:
+                self._gpu_root_pos_delta[motion_id] = 0.0
+
+            start = end
+
+        copy_time = time.time() - copy_start
+        print(f"[AsyncResample] CPU->GPU copy completed in {copy_time:.2f}s", flush=True)
+
+        # Update lookup tables
+        lengths_shifted = torch.zeros(len(motion_ids), dtype=torch.long, device=self._device)
+        start_indices = lengths_shifted.cumsum(0)
+        self._motion_start_idx = start_indices
+
+        max_id = max(motion_ids)
+        self._motion_start_idx_by_id = torch.full((max_id + 1,), -1, device=self._device, dtype=torch.long)
+        for i, mid in enumerate(motion_ids):
+            self._motion_start_idx_by_id[mid] = start_indices[i]
+
+        # Update cached IDs
+        self._loaded_subset_ids = set(motion_ids)
+        self._loaded_subset_ids_tensor = torch.tensor(sorted(motion_ids), device=self._device, dtype=torch.long)
+        
+        print(f"[AsyncResample] Loaded {len(motion_ids)} motions ({total_frames} frames) to GPU")

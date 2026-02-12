@@ -5,6 +5,7 @@ from isaacgym import gymtorch
 
 import torch
 
+from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs.base.legged_robot import euler_from_quaternion
 from .humanoid_mimic_config import HumanoidMimicCfg
 from .humanoid_char import HumanoidChar, convert_to_global_root_body_pos, convert_to_local_root_body_pos
@@ -72,8 +73,143 @@ class HumanoidMimic(HumanoidChar):
         
         self.deviate_tracking_frames = torch.zeros((self.num_envs), device=self.device, dtype=torch.float)
         self.deviate_vel_tracking_frames = torch.zeros((self.num_envs), device=self.device, dtype=torch.float)
+
+        # Resume motion difficulty from previous experiment if specified
+        resume_difficulty_from = getattr(self.cfg.motion, "resume_difficulty_from", None)
+        if resume_difficulty_from is not None:
+            self._resume_motion_difficulty(resume_difficulty_from)
+
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
-    
+
+    def _resume_motion_difficulty(self, resume_exptid: str):
+        """Resume motion difficulty from previous training CSV files.
+
+        Args:
+            resume_exptid: Previous experiment ID to load difficulty from
+
+        Raises:
+            FileNotFoundError: If previous experiment log_dir not found
+            FileNotFoundError: If no difficulty CSV files found
+            RuntimeError: If any current motion not found in CSV
+        """
+        from termcolor import cprint
+        import glob
+
+        # Step 1: Build previous experiment log directory path
+        # Assuming logs are in LEGGED_GYM_ROOT_DIR/logs/<proj_name>/<exptid>/
+        # We need to find the previous experiment's log directory
+
+        # Try to find the experiment directory by searching common patterns
+        possible_log_dirs = [
+            os.path.join(LEGGED_GYM_ROOT_DIR, "logs", "g1_priv_mimic", resume_exptid),
+            os.path.join(LEGGED_GYM_ROOT_DIR, "logs", "g1_stu_future", resume_exptid),
+            os.path.join(LEGGED_GYM_ROOT_DIR, "logs", resume_exptid),
+        ]
+
+        prev_log_dir = None
+        for log_dir_candidate in possible_log_dirs:
+            if os.path.isdir(log_dir_candidate):
+                prev_log_dir = log_dir_candidate
+                break
+
+        if prev_log_dir is None:
+            raise FileNotFoundError(
+                f"Cannot find previous experiment directory for exptid '{resume_exptid}'. "
+                f"Searched: {possible_log_dirs}"
+            )
+
+        # Step 2: Find the difficulty directory
+        difficulty_dir = os.path.join(prev_log_dir, "difficulty")
+        if not os.path.isdir(difficulty_dir):
+            raise FileNotFoundError(
+                f"No difficulty directory found in previous experiment: {difficulty_dir}"
+            )
+
+        # Step 3: Find the latest difficulty CSV files (max iteration)
+        # Pattern: difficulty_iter_{iteration:07d}.csv or difficulty_iter_{iteration:07d}_rank*.csv
+
+        # First, try to find CSVs without rank suffix (resample mode or single GPU)
+        csv_files_no_rank = glob.glob(os.path.join(difficulty_dir, "difficulty_iter_*.csv"))
+        csv_files_no_rank = [f for f in csv_files_no_rank if "_rank" not in os.path.basename(f)]
+
+        # Also find CSVs with rank suffix (DDP sharded mode)
+        csv_files_with_rank = glob.glob(os.path.join(difficulty_dir, "difficulty_iter_*_rank*.csv"))
+
+        if not csv_files_no_rank and not csv_files_with_rank:
+            raise FileNotFoundError(
+                f"No difficulty CSV files found in {difficulty_dir}"
+            )
+
+        # Determine the latest iteration
+        def extract_iteration(filepath):
+            """Extract iteration number from filename like difficulty_iter_0002500.csv"""
+            basename = os.path.basename(filepath)
+            # Remove prefix and suffix
+            name = basename.replace("difficulty_iter_", "").replace(".csv", "")
+            # Remove rank suffix if present
+            if "_rank" in name:
+                name = name.split("_rank")[0]
+            return int(name)
+
+        if csv_files_no_rank:
+            # Resample mode: use files without rank suffix
+            latest_iter = max(extract_iteration(f) for f in csv_files_no_rank)
+            csv_files = [f for f in csv_files_no_rank if extract_iteration(f) == latest_iter]
+        else:
+            # DDP shard mode: collect all rank files for the latest iteration
+            latest_iter = max(extract_iteration(f) for f in csv_files_with_rank)
+            csv_files = [f for f in csv_files_with_rank if extract_iteration(f) == latest_iter]
+
+        # Step 4: Load and merge difficulty from CSVs using MotionLib instance
+        # This uses self._motion_lib._motion_files which is the FINAL list after
+        # all preprocessing (shuffle, motion_ids filter, max_motions, DDP sharding)
+        try:
+            resumed_difficulty = self._motion_lib.load_difficulty_from_csvs(csv_files=csv_files)
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"Failed to resume difficulty from {resume_exptid}: {e}"
+            ) from e
+
+        # Step 5: Update motion difficulty
+        if len(resumed_difficulty) != len(self.motion_difficulty):
+            raise RuntimeError(
+                f"Difficulty length mismatch: loaded {len(resumed_difficulty)} values, "
+                f"but current motion set has {len(self.motion_difficulty)} motions. "
+                f"Make sure the motion config matches the one used in previous training."
+            )
+
+        self.motion_difficulty[:] = resumed_difficulty
+        self.mean_motion_difficulty = torch.mean(self.motion_difficulty).item()
+
+        # Step 6: Print summary with fancy output
+        rank = getattr(self, 'rank', 0)
+        if rank == 0:
+            num_easy = int((self.motion_difficulty < 2.0).sum().item())
+            num_medium = int(((self.motion_difficulty >= 2.0) & (self.motion_difficulty < 5.0)).sum().item())
+            num_hard = int((self.motion_difficulty >= 5.0).sum().item())
+
+            cprint("\n", "white", end="")
+            cprint("╔" + "═" * 68 + "╗", "cyan", attrs=["bold"])
+            cprint("║" + " " * 15 + "🎯  DIFFICULTY RESUMED  🎯" + " " * 26 + "║", "yellow", attrs=["bold"])
+            cprint("╠" + "═" * 68 + "╣", "cyan", attrs=["bold"])
+            cprint(f"║  Source:  {resume_exptid:<55}║", "white")
+            cprint(f"║  Iter:    {latest_iter:<55}║", "white")
+            cprint(f"║  Motions: {len(resumed_difficulty):<55}║", "white")
+            cprint("╠" + "═" * 68 + "╣", "cyan", attrs=["bold"])
+            cprint(f"║  📊 Mean: {self.mean_motion_difficulty:.2f}", "white", end="")
+            cprint(" " * (60 - len(f"║  📊 Mean: {self.mean_motion_difficulty:.2f}")) + "║", "white")
+            cprint(f"║  📉 Min:  {self.motion_difficulty.min().item():.2f}", "green", end="")
+            cprint(" " * (60 - len(f"║  📉 Min:  {self.motion_difficulty.min().item():.2f}")) + "║", "green")
+            cprint(f"║  📈 Max:  {self.motion_difficulty.max().item():.2f}", "red", end="")
+            cprint(" " * (60 - len(f"║  📈 Max:  {self.motion_difficulty.max().item():.2f}")) + "║", "red")
+            cprint("╠" + "═" * 68 + "╣", "cyan", attrs=["bold"])
+            cprint(f"║  🟢 Easy ( < 2.0):   {num_easy:>5}  " + "█" * min(num_easy // 10, 30) + " " * (30 - min(num_easy // 10, 30)) + "║", "green")
+            cprint(f"║  🟡 Medium(2.0-5.0): {num_medium:>5}  " + "█" * min(num_medium // 10, 30) + " " * (30 - min(num_medium // 10, 30)) + "║", "yellow")
+            cprint(f"║  🔴 Hard ( > 5.0):   {num_hard:>5}  " + "█" * min(num_hard // 10, 30) + " " * (30 - min(num_hard // 10, 30)) + "║", "red")
+            cprint("╚" + "═" * 68 + "╝", "cyan", attrs=["bold"])
+            cprint("", "white", end="")
+
+
     def _get_max_motion_len(self):
         max_len = 0
         num_motions = self._motion_lib.num_motions()
@@ -147,11 +283,14 @@ class HumanoidMimic(HumanoidChar):
         self._motion_resample_per_gpu = getattr(self.cfg.motion, "resample_per_gpu", 15000)
         # GPU memory budget for resample (in GB). If specified, overrides resample_per_gpu
         self._motion_resample_gpu_memory_gb = getattr(self.cfg.motion, "resample_gpu_memory_gb", None)
+        # Async resample flag (only enables when explicitly set via --motion_async_resample)
+        self._motion_async_resample = getattr(self.cfg.motion, "async_resample", False)
 
         # Debug: print loaded config values
         if self._motion_resample_interval > 0:
             from termcolor import cprint
-            cprint(f"[HumanoidMimic] Resample config loaded: interval={self._motion_resample_interval}, "
+            async_str = " [ASYNC]" if self._motion_async_resample else " [SYNC]"
+            cprint(f"[HumanoidMimic] Resample config loaded{async_str}: interval={self._motion_resample_interval}, "
                    f"per_gpu={self._motion_resample_per_gpu}, gpu_memory_budget={self._motion_resample_gpu_memory_gb}", "cyan")
     
     def _reset_ref_motion(self, env_ids, motion_ids=None):
@@ -351,6 +490,11 @@ class HumanoidMimic(HumanoidChar):
         Args:
             env_ids (torch.Tensor): Indices of environments being reset
         """
+        # Skip if this is initial reset (episode_length_buf == 0 for all env_ids)
+        # Initial reset doesn't represent actual training progress
+        if torch.all(self.episode_length_buf[env_ids] == 0):
+            return
+
         # Debug mode: enable via DEBUG_DIFFICULTY=1 environment variable
         debug_difficulty = os.environ.get('DEBUG_DIFFICULTY', '0') == '1'
         rank = getattr(self, 'rank', 0)
@@ -416,10 +560,10 @@ class HumanoidMimic(HumanoidChar):
         # way 1: Calculate motion difficulty ratio (normalized to 0-1 range)
         # motion_difficulty_ratio = self.motion_difficulty / 100.
         motion_difficulty_ratio = self.motion_difficulty / MOTION_DIFFICULTY_MAX
-        
+
         # way 2: only use 5 levels of pose termination distance
         # motion_difficulty_ratio = torch.floor(self.motion_difficulty / 20.) / 5.
-        
+
         # Adjust termination distance threshold based on difficulty
         # Higher difficulty -> larger termination distance (more lenient)
         # Lower difficulty -> smaller termination distance (more strict)
@@ -443,11 +587,9 @@ class HumanoidMimic(HumanoidChar):
                 self._last_saved_iter = -1
 
             should_save = False
-            # Save at the beginning (iteration 0)
-            if current_iter == 0 and self._last_saved_iter != 0:
-                should_save = True
-            # Save when current iteration is a multiple of save_interval
-            elif current_iter > 0 and current_iter % save_interval_iters == 0 and current_iter != self._last_saved_iter:
+            # Skip iteration 0 - only save starting from save_interval_iters
+            # Save when current iteration is a positive multiple of save_interval
+            if current_iter > 0 and current_iter % save_interval_iters == 0 and current_iter != self._last_saved_iter:
                 should_save = True
 
             if should_save:
@@ -476,17 +618,32 @@ class HumanoidMimic(HumanoidChar):
         Uses MIN operation: if any rank trained a motion well (lower difficulty),
         all ranks adopt that lower difficulty.
         """
+        import torch.distributed as dist
+
         world_size = getattr(self, 'world_size', 1)
+        rank = getattr(self, 'local_rank', 0)
 
         if world_size > 1:
             try:
-                import torch.distributed as dist
                 if dist.is_available() and dist.is_initialized():
                     # Only sync in resample mode (all ranks have full dataset)
                     is_resample_mode = getattr(self._motion_lib, '_skip_ddp_sharding', False)
 
                     if is_resample_mode:
+                        # Stats before sync (only rank 0 prints to avoid clutter)
+                        min_diff_before = float(self.motion_difficulty.min().item())
+                        easy_motions_before = int((self.motion_difficulty < 0.5).sum().item())
+
                         dist.all_reduce(self.motion_difficulty, op=dist.ReduceOp.MIN)
+
+                        # Stats after sync
+                        min_diff_after = float(self.motion_difficulty.min().item())
+                        easy_motions_after = int((self.motion_difficulty < 0.5).sum().item())
+
+                        changed = easy_motions_after != easy_motions_before
+
+                        if rank == 0:
+                            print(f"[Difficulty Sync] min={min_diff_after:.3f} (<0.5: {easy_motions_after}/{len(self.motion_difficulty)}){' [CHANGED]' if changed else ''}", flush=True)
                     # In DDP shard mode: no sync needed (each rank has different subset)
             except Exception as e:
                 import warnings

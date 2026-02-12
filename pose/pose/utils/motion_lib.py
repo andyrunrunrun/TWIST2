@@ -229,8 +229,8 @@ class MotionLib():
         else:
             csv_file = os.path.join(difficulty_dir, f"difficulty_iter_{iteration:07d}.csv")
 
-        # Get motion names and difficulties
-        motion_names = self.get_motion_names()
+        # Get motion file paths and difficulties (use paths instead of names for easier lookup)
+        motion_files = self.get_motion_files()  # Returns list of file paths
         difficulties_cpu = motion_difficulty.cpu().numpy()
 
         # Map to 0-100 scale
@@ -245,12 +245,12 @@ class MotionLib():
                 difficulties_0_100.append((d - 1.0) / 9.0 * 100.0)
         difficulties_0_100 = np.array(difficulties_0_100)
 
-        # Write to CSV
+        # Write to CSV with file paths instead of motion names
         with open(csv_file, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['motion_idx', 'motion_name', 'difficulty_0_100', 'difficulty_raw'])
-            for idx, (name, diff_0_100, diff_raw) in enumerate(zip(motion_names, difficulties_0_100, difficulties_cpu)):
-                writer.writerow([idx, str(name), f"{diff_0_100:.2f}", f"{diff_raw:.4f}"])
+            writer.writerow(['motion_idx', 'motion_path', 'difficulty_0_100', 'difficulty_raw'])
+            for idx, (path, diff_0_100, diff_raw) in enumerate(zip(motion_files, difficulties_0_100, difficulties_cpu)):
+                writer.writerow([idx, str(path), f"{diff_0_100:.2f}", f"{diff_raw:.4f}"])
 
         logger.info(f"Saved motion difficulty to {csv_file}")
 

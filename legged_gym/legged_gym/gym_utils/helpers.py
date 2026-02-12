@@ -215,7 +215,16 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
                 setattr(env_cfg.motion, "resample_per_gpu", int(getattr(args, "motion_resample_per_gpu", 15000)))
                 # Auto-enable lazy_load for resample mode
                 setattr(env_cfg.motion, "lazy_load", True)
-                print(f"[Motion Resample] Enabled: interval={args.motion_resample_interval}, per_gpu={args.motion_resample_per_gpu}")
+                # Async resample (only if explicitly enabled)
+                setattr(env_cfg.motion, "async_resample", getattr(args, "motion_async_resample", False))
+                async_str = " [ASYNC]" if getattr(args, "motion_async_resample", False) else " [SYNC]"
+                print(f"[Motion Resample] Enabled{async_str}: interval={args.motion_resample_interval}, per_gpu={args.motion_resample_per_gpu}")
+
+        # Resume motion difficulty from previous experiment
+        if getattr(args, "resume_difficulty_from", None) is not None:
+            if hasattr(env_cfg, "motion"):
+                setattr(env_cfg.motion, "resume_difficulty_from", args.resume_difficulty_from)
+                print(f"[Motion Difficulty] Will resume from experiment: {args.resume_difficulty_from}")
 
         # num envs
         if args.num_envs is not None:
@@ -349,6 +358,7 @@ def get_args():
 
         {"name": "--motion_resample_interval", "type": int, "default": 0, "help": "Resample motion subset every N iterations. 0 = disabled (use default cache)."},
         {"name": "--motion_resample_per_gpu", "type": int, "default": 15000, "help": "Number of motion samples to load per GPU when resampling is enabled."},
+        {"name": "--motion_async_resample", "action": "store_true", "default": False, "help": "Enable async resample (prepares next subset in background). Only works when motion_resample_interval > 0."},
 
         {"name": "--rows", "type": int, "help": "num_rows."},
         {"name": "--cols", "type": int, "help": "num_cols"},
@@ -393,6 +403,8 @@ def get_args():
         {"name": "--eval_student", "action": "store_true", "default": False, "help": "eval student"},
         {"name": "--jit_path", "type": str, "help": "jit path", "default": None},
         {"name": "--motion_file", "type": str, "help": "Path to single motion PKL file for play.py", "default": None},
+        {"name": "--resume_difficulty_from", "type": str, "default": None,
+         "help": "Resume motion difficulty from previous experiment exptid (e.g., 0205_twist2)"},
         {"name": "--student_only", "action": "store_true", "default": False, "help": "Load student model directly without teacher (for play.py)"},
     ]
     # parse arguments

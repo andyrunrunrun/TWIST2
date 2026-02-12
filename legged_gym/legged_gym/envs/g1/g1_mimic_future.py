@@ -42,15 +42,14 @@ class G1MimicFuture(G1MimicDistill):
             # Initialize with empty values - will be properly set after super().__init__()
             self.episode_length_counter = None
             self.force_scale = None
-        
+
         # Call parent constructor
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
-        
-        # Fix motion difficulty initialization - should start at 10, not 100
-        num_motions = self._motion_lib.num_motions()
-        self.motion_difficulty = 10 * torch.ones((num_motions), device=self.device, dtype=torch.float)
-        self.mean_motion_difficulty = 10.
-        
+
+        # NOTE: motion_difficulty is now initialized in HumanoidMimic.__init__
+        # and may be restored from CSV via _resume_motion_difficulty().
+        # Do NOT reinitialize here, or it will overwrite the restored values!
+
         # Only initialize future motion components if obs_type is 'student_future'
         if self.obs_type == 'student_future':
             # Initialize future motion target steps
