@@ -476,13 +476,18 @@ class MotionLib:
         self._clear_gpu_cache()
         self._resample_gpu_storage.clear()
 
-        # When synchronous resample happens, clear the ready event so the
-        # background thread knows to prepare new data for the next resample.
-        # Don't clear the data itself - it might still be useful or in use.
+        # When synchronous resample happens, clear both the ready event AND the data
+        # This ensures the background thread will immediately start preparing new data
         if self._async_resample_enabled:
+            # Clear the old pre-loaded data so worker will prepare fresh data
+            if self._async_resample_next_data is not None:
+                self._async_resample_next_data.clear()
+                self._async_resample_next_data = None
+                self._async_resample_next_ids = None
+            # Clear the ready event to signal worker to prepare
             if self._async_resample_ready_event.is_set():
                 self._async_resample_ready_event.clear()
-                print(f"[MotionLib] Cleared async ready event (synchronous resample happened, background will reprepare)", flush=True)
+            print(f"[MotionLib] Cleared async data and ready event (synchronous resample happened, background will reprepare)", flush=True)
 
         print(f"[MotionLib] Loading {len(motion_ids)} motions to GPU (merged tensors)...")
 
@@ -2307,16 +2312,16 @@ class MotionLib:
         print(f"[MotionLib] ========== ASYNC RESAMPLE ENABLED: interval={interval} iterations ==========", flush=True)
 
         # IMPORTANT: Trigger the first preparation immediately after thread starts
-        # Set _async_resample_last_iteration to trigger preparation for iteration (interval-1)
+        # Set _async_resample_last_iteration to trigger preparation at 10% of first interval
         # This ensures the first resample will have pre-loaded data ready
         time.sleep(0.2)  # Give thread a moment to start
         with self._async_resample_lock:
-            # Set to (interval - 1) so that (interval - 1 + 1) % interval == 0 becomes true
-            # This triggers immediate preparation for the first resample
-            if self._async_resample_next_data is None:
-                print(f"[AsyncResample] Preparing first batch (for iteration {self._async_resample_interval}) immediately after enable...", flush=True)
-                self._async_resample_last_iteration = self._async_resample_interval - 1
-                # The worker thread will pick this up and trigger preparation
+            # Set to (10% of interval) so that worker will trigger at 10% point
+            # This gives 90% of interval time for first preparation
+            prepare_offset = self._async_resample_interval // 10
+            print(f"[AsyncResample] ENABLE: setting last={prepare_offset} (interval={self._async_resample_interval})", flush=True)
+            self._async_resample_last_iteration = prepare_offset  # Set to prepare point, so worker triggers immediately
+            # The worker thread will pick this up and trigger preparation
     
     def disable_async_resample(self):
         """Disable async resample and clean up resources."""
@@ -2366,22 +2371,31 @@ class MotionLib:
                 with self._async_resample_lock:
                     current_iteration = self._async_resample_last_iteration
 
-                    # Check if we're approaching resample time
-                    # Prepare next subset when current_iteration + 1 is multiple of interval
-                    # OR when ready_event is cleared (meaning sync resample happened)
-                    should_prepare = ((current_iteration + 1) % self._async_resample_interval == 0)
+                    # Check if we should prepare next subset for upcoming resample
+                    # Strategy: Prepare at 10% of each interval cycle (fixed trigger point)
+                    # Example (interval=200): Prepare at 20, 220, 420... for use at 200, 400, 600...
+                    # This gives 90% of the interval time for preparation
+                    prepare_offset = self._async_resample_interval // 10  # At least 1, or 10% of interval
+                    at_prepare_point = (current_iteration % self._async_resample_interval == prepare_offset)
 
-                    # Also trigger if ready_event was cleared (sync resample happened)
+                    should_prepare = at_prepare_point
+
+                    # Also IMMEDIATELY trigger if ready_event is cleared (sync resample happened)
+                    # This ensures async mode recovers quickly after a sync fallback
                     if not should_prepare and not self._async_resample_ready_event.is_set():
-                        # Check if we're in the preparation window (next 5 iterations)
-                        next_trigger = ((current_iteration // self._async_resample_interval) + 1) * self._async_resample_interval
-                        if next_trigger - current_iteration <= 5:
-                            should_prepare = True
+                        should_prepare = True
+                        print(f"[AsyncResample] Ready event cleared (sync resample happened), immediately preparing next subset...", flush=True)
+
+                    # Even if ready_event is_set, we still need to prepare at trigger point
+                    if at_prepare_point and (self._async_resample_next_data is None or not self._async_resample_ready_event.is_set()):
+                        should_prepare = True
 
                     if should_prepare:
                         # Check if data is already being prepared or is ready
                         if self._async_resample_next_data is None or not self._async_resample_ready_event.is_set():
-                            print(f"[AsyncResample] Starting to prepare next subset (will be used at iteration {((current_iteration // self._async_resample_interval) + 1) * self._async_resample_interval})...", flush=True)
+                            # Calculate the next resample iteration (round up to next interval boundary)
+                            next_resample = ((current_iteration // self._async_resample_interval) + 1) * self._async_resample_interval
+                            print(f"[AsyncResample] TRIGGER: last={current_iteration}, interval={self._async_resample_interval}, next_resample={next_resample})", flush=True)
                             # Clear old data and prepare new subset
                             if self._async_resample_next_data is not None:
                                 self._async_resample_next_data.clear()
@@ -2401,6 +2415,7 @@ class MotionLib:
         import time
 
         t0 = time.time()
+        print(f"[AsyncResample] _prepare_next_subset STARTED", flush=True)
 
         try:
             # Sample next subset (same logic as resample_subset)
@@ -2553,9 +2568,11 @@ class MotionLib:
                 with self._async_resample_lock:
                     success = self._switch_to_next_subset_async()
                     if success:
-                        # IMPORTANT: Update iteration AFTER successful switch
-                        # This allows background thread to prepare next batch during training
-                        self._async_resample_last_iteration = current_iteration
+                        # IMPORTANT: Update last to current prepare point in this cycle
+                        # This ensures worker will find next prepare point correctly
+                        # Formula: round down to nearest prepare_offset point
+                        prepare_offset = self._async_resample_interval // 10
+                        self._async_resample_last_iteration = (current_iteration // self._async_resample_interval) * self._async_resample_interval + prepare_offset
                         return True
                     else:
                         # Fall through to synchronous resample
@@ -2570,18 +2587,26 @@ class MotionLib:
                     with self._async_resample_lock:
                         success = self._switch_to_next_subset_async()
                         if success:
-                            # Update iteration AFTER successful switch
-                            self._async_resample_last_iteration = current_iteration
+                            # IMPORTANT: Update last to current prepare point in this cycle
+                            # Same logic as async success path above
+                            prepare_offset = self._async_resample_interval // 10
+                            self._async_resample_last_iteration = (current_iteration // self._async_resample_interval) * self._async_resample_interval + prepare_offset
                             return True
                 else:
                     print(f"[AsyncResample] Data still NOT ready after 5s, falling back to synchronous resample", flush=True)
                     # Fall through to synchronous resample
                     pass
 
-        # IMPORTANT: Always update iteration after checking
-        # This ensures background thread knows the current training iteration
-        # even when no resample happened this time
-        self._async_resample_last_iteration = current_iteration
+        # IMPORTANT: Only update last at prepare points (iteration % interval == prepare_offset)
+        # This matches the worker trigger condition for async preparation
+        # If async succeeded above, last was already updated. Otherwise, only update at prepare points.
+        # Example (interval=200): only update when current is 20, 220, 420...
+        prepare_offset = self._async_resample_interval // 10
+        at_prepare_point = (current_iteration % self._async_resample_interval == prepare_offset)
+
+        if at_prepare_point:
+            self._async_resample_last_iteration = current_iteration
+        # else: don't update, so worker can still find the prepare point
 
         return False
     
@@ -2596,6 +2621,9 @@ class MotionLib:
         """
         import time
         import gc
+
+        if not motion_ids:
+            raise ValueError("motion_ids is empty in _load_subset_to_gpu")
 
         t0 = time.time()
         D = motion_data[motion_ids[0]]["dof_pos"].shape[-1]
@@ -2644,9 +2672,12 @@ class MotionLib:
         self._gpu_root_pos_delta_local = torch.empty((total_frames, 3), device=self._device, dtype=torch.float32)
         self._gpu_root_rot_delta_local = torch.empty((total_frames, 3), device=self._device, dtype=torch.float32)
 
-        # Per-motion root_pos_delta
-        max_id = max(motion_ids)
-        self._gpu_root_pos_delta = torch.empty((max_id + 1, 3), device=self._device, dtype=torch.float32)
+        # Build motion-id mapping tables (must match synchronous resample path)
+        self._motion_id_to_frame = {}
+        self._motion_id_to_idx = {mid: i for i, mid in enumerate(motion_ids)}
+
+        # Per-motion root_pos_delta is indexed by subset index (not global motion_id)
+        self._gpu_root_pos_delta = torch.empty((len(motion_ids), 3), device=self._device, dtype=torch.float32)
 
         print(f"[AsyncResample] Copying data from CPU to GPU...", flush=True)
 
@@ -2671,24 +2702,51 @@ class MotionLib:
             # Per-motion root_pos_delta
             root_pos_delta = motion_data[motion_id].get("root_pos_delta")
             if root_pos_delta is not None:
-                self._gpu_root_pos_delta[motion_id] = root_pos_delta.to(self._device, non_blocking=True)
+                self._gpu_root_pos_delta[self._motion_id_to_idx[motion_id]] = root_pos_delta.to(self._device, non_blocking=True)
             else:
-                self._gpu_root_pos_delta[motion_id] = 0.0
+                self._gpu_root_pos_delta[self._motion_id_to_idx[motion_id]] = 0.0
+
+            self._motion_id_to_frame[motion_id] = (start, num_frames)
 
             start = end
 
         copy_time = time.time() - copy_start
         print(f"[AsyncResample] CPU->GPU copy completed in {copy_time:.2f}s", flush=True)
 
-        # Update lookup tables
-        lengths_shifted = torch.zeros(len(motion_ids), dtype=torch.long, device=self._device)
+        # Create fast lookup tables: motion_id -> frame start / subset index
+        max_id = max(motion_ids)
+        self._motion_start_frame = torch.zeros(max_id + 1, device=self._device, dtype=torch.long)
+        for mid, (start_frame, _) in self._motion_id_to_frame.items():
+            self._motion_start_frame[mid] = start_frame
+
+        self._motion_id_to_idx_tensor = torch.full((max_id + 1,), -1, device=self._device, dtype=torch.long)
+        for mid, idx in self._motion_id_to_idx.items():
+            self._motion_id_to_idx_tensor[mid] = idx
+
+        # Update resample-specific frame/length metadata (used by _calc_frame_blend)
+        subset_num_frames = torch.tensor(
+            [motion_data[mid]["num_frames"] for mid in motion_ids],
+            device=self._device,
+            dtype=torch.long,
+        )
+        subset_lengths = subset_num_frames.float() / self._motion_fps[torch.tensor(motion_ids, device=self._device, dtype=torch.long)]
+        self._motion_num_frames_resample = subset_num_frames
+        self._motion_lengths_resample = subset_lengths
+
+        lengths_shifted = torch.roll(subset_num_frames, 1)
+        lengths_shifted[0] = 0
         start_indices = lengths_shifted.cumsum(0)
         self._motion_start_idx = start_indices
 
-        max_id = max(motion_ids)
         self._motion_start_idx_by_id = torch.full((max_id + 1,), -1, device=self._device, dtype=torch.long)
         for i, mid in enumerate(motion_ids):
             self._motion_start_idx_by_id[mid] = start_indices[i]
+
+        # Cache dimensions/stats for debug and downstream assumptions
+        self._resample_D = D
+        self._resample_B = B
+        self._resample_total_motions = len(motion_ids)
+        self._resample_total_frames = total_frames
 
         # Update cached IDs
         self._loaded_subset_ids = set(motion_ids)

@@ -159,7 +159,9 @@ class OnPolicyRunnerMimic:
         # Motion resample mode initialization
         self._motion_resample_interval = getattr(self.env, "_motion_resample_interval", 0)
         self._motion_resample_per_gpu = getattr(self.env, "_motion_resample_per_gpu", 15000)
-        self._resample_counter = 0
+        # Initialize to -1 so that resample triggers at iteration 30, 60, 90... (not 29, 59, 89...)
+        # This aligns with check_and_resample_async() condition: iteration % interval == 0
+        self._resample_counter = -1
 
         # Initialize resample mode if enabled
         if self._motion_resample_interval > 0:
@@ -230,14 +232,34 @@ class OnPolicyRunnerMimic:
             # Try async resample first (fast switch to pre-loaded data)
             if self.env._motion_lib._async_resample_enabled:
                 if self.env._motion_lib.check_and_resample_async(iteration):
-                    print(f"[Iteration {iteration}] Rank {rank}/{world_size}: async resample completed", flush=True)
+                    # Sync motion_difficulty across all ranks
+                    if hasattr(self.env, '_sync_motion_difficulty'):
+                        self.env._sync_motion_difficulty()
                     # Re-sample environment motion_ids to match the new subset
                     self.env.reset_idx(torch.arange(self.env.num_envs, device=self.env.device))
+
+                    # Fancy success output
+                    num_motions = len(self.env._motion_lib._loaded_subset_ids)
+                    print(f"\033[1;32m" + "═" * 60 + "\033[0m", flush=True)
+                    print(f"\033[1;32m║\033[0m \033[1;33m⚡  ASYNC RESAMPLE SUCCESS  ⚡\033[0m", flush=True)
+                    print(f"\033[1;32m║\033[0m  Iteration: {iteration:<10}  Rank: {rank}/{world_size:<10}  Motions: {num_motions:<8}", flush=True)
+                    print(f"\033[1;32m" + "═" * 60 + "\033[0m", flush=True)
                     return
 
             # Fall back to synchronous resample
+            # IMPORTANT: Clear the ready_event so async worker immediately prepares next batch
+            if hasattr(self.env._motion_lib, '_async_resample_ready_event'):
+                self.env._motion_lib._async_resample_ready_event.clear()
+
             # Get GPU memory budget if specified (overrides num_motions)
             gpu_memory_budget_gb = getattr(self.env, "_motion_resample_gpu_memory_gb", None)
+
+            # Warning output for sync fallback
+            print(f"\033[1;33m" + "═" * 60 + "\033[0m", flush=True)
+            print(f"\033[1;33m║\033[0m \033[1;31m⚠  SYNC RESAMPLE FALLBACK  ⚠\033[0m", flush=True)
+            print(f"\033[1;33m║\033[0m  Iteration: {iteration:<10}  Rank: {rank}/{world_size:<10}", flush=True)
+            print(f"\033[1;33m║\033[0m  Async data not ready, using synchronous load", flush=True)
+            print(f"\033[1;33m" + "═" * 60 + "\033[0m", flush=True)
 
             # Use rank-dependent seed to ensure each rank samples different subset
             seed = iteration + getattr(self.env.cfg, "seed", 0) + rank * 10000
@@ -251,19 +273,33 @@ class OnPolicyRunnerMimic:
             else:
                 print(f"[Iteration {iteration}] Rank {rank}/{world_size}: resampling {self._motion_resample_per_gpu} motions...", flush=True)
 
-            sampled_ids = self.env._motion_lib.resample_subset(
-                num_motions=self._motion_resample_per_gpu,  # Fallback if gpu_memory_budget_gb fails
-                seed=seed,
-                motion_difficulty=motion_difficulty,
-                preload=True,  # Preload with progress bar
-                gpu_memory_budget_gb=gpu_memory_budget_gb  # Use GPU budget instead of num_motions
-            )
-            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: resample complete with {len(sampled_ids)} motions", flush=True)
+            try:
+                # Sync motion_difficulty across all ranks BEFORE resampling
+                # This ensures all ranks use the same difficulty values when sampling
+                if hasattr(self.env, '_sync_motion_difficulty'):
+                    self.env._sync_motion_difficulty()
 
-            # Re-sample environment motion_ids to match the new subset
-            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: re-sampling environment motion IDs...", flush=True)
-            self.env.reset_idx(torch.arange(self.env.num_envs, device=self.env.device))
-            print(f"[Iteration {iteration}] Rank {rank}/{world_size}: environment motion IDs re-sampled", flush=True)
+                sampled_ids = self.env._motion_lib.resample_subset(
+                    num_motions=self._motion_resample_per_gpu,  # Fallback if gpu_memory_budget_gb fails
+                    seed=seed,
+                    motion_difficulty=motion_difficulty,
+                    preload=True,  # Preload with progress bar
+                    gpu_memory_budget_gb=gpu_memory_budget_gb  # Use GPU budget instead of num_motions
+                )
+                print(f"[Iteration {iteration}] Rank {rank}/{world_size}: resample complete with {len(sampled_ids)} motions", flush=True)
+
+                # Re-sample environment motion_ids to match the new subset
+                print(f"[Iteration {iteration}] Rank {rank}/{world_size}: re-sampling environment motion IDs...", flush=True)
+                self.env.reset_idx(torch.arange(self.env.num_envs, device=self.env.device))
+                print(f"[Iteration {iteration}] Rank {rank}/{world_size}: environment motion IDs re-sampled", flush=True)
+            except Exception as e:
+                # Print error but don't crash - this could cause DDP deadlock
+                import traceback
+                print(f"[Iteration {iteration}] Rank {rank}/{world_size}: ERROR during resample - {e}")
+                traceback.print_exc()
+                # In DDP, we should probably abort to avoid deadlock
+                if world_size > 1:
+                    raise  # Re-raise to ensure all ranks fail together
 
     def learn_RL(self, num_learning_iterations, init_at_random_ep_len=False):
         mean_value_loss = 0.

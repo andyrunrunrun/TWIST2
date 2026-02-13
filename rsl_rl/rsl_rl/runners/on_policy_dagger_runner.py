@@ -232,7 +232,9 @@ class OnPolicyDaggerRunner:
         # Motion resample mode initialization
         self._motion_resample_interval = getattr(self.env, "_motion_resample_interval", 0)
         self._motion_resample_per_gpu = getattr(self.env, "_motion_resample_per_gpu", 15000)
-        self._resample_counter = 0
+        # Initialize to -1 so that resample triggers at iteration 30, 60, 90... (not 29, 59, 89...)
+        # This aligns with check_and_resample_async() condition: iteration % interval == 0
+        self._resample_counter = -1
 
         # Debug: print values read from env
         if self._motion_resample_interval > 0:
@@ -309,17 +311,34 @@ class OnPolicyDaggerRunner:
             # Try async resample first (fast switch to pre-loaded data)
             if self.env._motion_lib._async_resample_enabled:
                 if self.env._motion_lib.check_and_resample_async(iteration):
-                    print(f"[Iteration {iteration}] Rank {rank}/{world_size}: async resample completed", flush=True)
                     # Sync motion_difficulty across all ranks
                     if hasattr(self.env, '_sync_motion_difficulty'):
                         self.env._sync_motion_difficulty()
                     # Re-sample environment motion_ids to match the new subset
                     self.env.reset_idx(torch.arange(self.env.num_envs, device=self.env.device))
+
+                    # Fancy success output
+                    num_motions = len(self.env._motion_lib._loaded_subset_ids)
+                    print(f"\033[1;32m" + "═" * 60 + "\033[0m", flush=True)
+                    print(f"\033[1;32m║\033[0m \033[1;33m⚡  ASYNC RESAMPLE SUCCESS  ⚡\033[0m", flush=True)
+                    print(f"\033[1;32m║\033[0m  Iteration: {iteration:<10}  Rank: {rank}/{world_size:<10}  Motions: {num_motions:<8}", flush=True)
+                    print(f"\033[1;32m" + "═" * 60 + "\033[0m", flush=True)
                     return
 
             # Fall back to synchronous resample
+            # IMPORTANT: Clear the ready_event so async worker immediately prepares next batch
+            if hasattr(self.env._motion_lib, '_async_resample_ready_event'):
+                self.env._motion_lib._async_resample_ready_event.clear()
+
             # Get GPU memory budget if specified (overrides num_motions)
             gpu_memory_budget_gb = getattr(self.env, "_motion_resample_gpu_memory_gb", None)
+
+            # Warning output for sync fallback
+            print(f"\033[1;33m" + "═" * 60 + "\033[0m", flush=True)
+            print(f"\033[1;33m║\033[0m \033[1;31m⚠  SYNC RESAMPLE FALLBACK  ⚠\033[0m", flush=True)
+            print(f"\033[1;33m║\033[0m  Iteration: {iteration:<10}  Rank: {rank}/{world_size:<10}", flush=True)
+            print(f"\033[1;33m║\033[0m  Async data not ready, using synchronous load", flush=True)
+            print(f"\033[1;33m" + "═" * 60 + "\033[0m", flush=True)
 
             # Use rank-dependent seed to ensure each rank samples different subset
             seed = iteration + getattr(self.env.cfg, "seed", 0) + rank * 10000
