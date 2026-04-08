@@ -233,23 +233,21 @@ class MotionLib():
         motion_files = self.get_motion_files()  # Returns list of file paths
         difficulties_cpu = motion_difficulty.cpu().numpy()
 
-        # Map to 0-100 scale
-        # Note: initial value is 100.0, after updates it's clamped to 1-10 range
-        # For initial 100.0, treat as 0 (not yet trained)
-        # For 1-10 range, map to 0-100: (x - 1) / 9 * 100
-        difficulties_0_100 = []
-        for d in difficulties_cpu:
-            if d >= 50.0:  # Initial value (100.0) or similar
-                difficulties_0_100.append(0.0)
-            else:
-                difficulties_0_100.append((d - 1.0) / 9.0 * 100.0)
-        difficulties_0_100 = np.array(difficulties_0_100)
+        # Normalize to internal [1, 10] before exporting.
+        # Legacy checkpoints may still carry "uninitialized" values around 100;
+        # treat those as hardest (10.0), not as 0 difficulty.
+        difficulties_internal = np.asarray(difficulties_cpu, dtype=np.float32).copy()
+        high_mask = difficulties_internal >= 50.0
+        difficulties_internal[high_mask] = 10.0
+        difficulties_internal = np.clip(difficulties_internal, 1.0, 10.0)
+        # Map internal [1,10] to [0,100] for CSV compatibility.
+        difficulties_0_100 = (difficulties_internal - 1.0) / 9.0 * 100.0
 
         # Write to CSV with file paths instead of motion names
         with open(csv_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['motion_idx', 'motion_path', 'difficulty_0_100', 'difficulty_raw'])
-            for idx, (path, diff_0_100, diff_raw) in enumerate(zip(motion_files, difficulties_0_100, difficulties_cpu)):
+            for idx, (path, diff_0_100, diff_raw) in enumerate(zip(motion_files, difficulties_0_100, difficulties_internal)):
                 writer.writerow([idx, str(path), f"{diff_0_100:.2f}", f"{diff_raw:.4f}"])
 
         logger.info(f"Saved motion difficulty to {csv_file}")

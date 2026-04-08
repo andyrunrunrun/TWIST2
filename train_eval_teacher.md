@@ -1,5 +1,38 @@
 ## Train
 
+### Anti-shuffle 参数（可选，默认关闭）
+
+用于抑制 teacher 在站立/慢速段的小碎步。默认不启用，旧训练行为不变。
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--enable_anti_shuffle_reward` | `False` | 启用 anti-shuffle 奖励（`step_switch_rate` + `stance_foot_speed`） |
+| `--anti_shuffle_ref_vel_th` | `0.12` | 仅在参考速度低于该阈值时施加 anti-shuffle（m/s） |
+| `--anti_shuffle_tilt_th` | `0.25` | 仅在机体倾斜低于该阈值时施加 anti-shuffle（投影重力 XY 范数） |
+| `--anti_shuffle_contact_force_th` | `5.0` | 判定足接触的竖直力阈值（N） |
+| `--anti_shuffle_step_switch_scale` | `-0.20` | 频繁换脚惩罚权重（更负=更强抑制小碎步） |
+| `--anti_shuffle_stance_foot_speed_scale` | `-0.05` | 支撑脚平面速度惩罚权重（更负=更强抑制脚底小抖） |
+
+示例（启用 anti-shuffle）：
+
+```bash
+# 封装脚本（新增）：
+bash train_teacher.sh 0106_teacher cuda:0
+# 开启 anti-shuffle：
+# bash train_teacher.sh 0106_teacher cuda:0 true -0.20 -0.05
+
+CUDA_VISIBLE_DEVICES=4 python legged_gym/legged_gym/scripts/train.py \
+    --task g1_priv_mimic \
+    --proj_name g1_priv_mimic \
+    --exptid 0213_teacher_antishuffle \
+    --device cuda:0 \
+    --num_envs 4096 --max_iterations 30000 \
+    --enable_anti_shuffle_reward \
+    --anti_shuffle_step_switch_scale -0.20 \
+    --anti_shuffle_stance_foot_speed_scale -0.05 \
+    --motion.motion_file /home/weijin/source/Humanoid/TWIST2/legged_gym/motion_data_configs/humanoid_wbc_gmr_30fps_mix.yaml
+```
+
 ```bash
 CUDA_VISIBLE_DEVICES=4 python legged_gym/legged_gym/scripts/train.py \
     --task g1_priv_mimic \

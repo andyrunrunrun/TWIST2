@@ -2185,23 +2185,21 @@ class MotionLib:
         motion_files = self._motion_files  # List of file paths
         difficulties_cpu = motion_difficulty.cpu().numpy()
 
-        # Map to 0-100 scale
-        # Note: initial value is 100.0, after updates it's clamped to 1-10 range
-        # For initial 100.0, treat as 0 (not yet trained)
-        # For 1-10 range, map to 0-100: (x - 1) / 9 * 100
-        difficulties_0_100 = []
-        for d in difficulties_cpu:
-            if d >= 50.0:  # Initial value (100.0) or similar
-                difficulties_0_100.append(0.0)
-            else:
-                difficulties_0_100.append((d - 1.0) / 9.0 * 100.0)
-        difficulties_0_100 = np.array(difficulties_0_100)
+        # Normalize to internal [1, 10] before exporting.
+        # Legacy checkpoints may still carry "uninitialized" values around 100;
+        # treat those as hardest (10.0), not as 0 difficulty.
+        difficulties_internal = np.asarray(difficulties_cpu, dtype=np.float32).copy()
+        high_mask = difficulties_internal >= 50.0
+        difficulties_internal[high_mask] = 10.0
+        difficulties_internal = np.clip(difficulties_internal, 1.0, 10.0)
+        # Map internal [1,10] to [0,100] for CSV compatibility.
+        difficulties_0_100 = (difficulties_internal - 1.0) / 9.0 * 100.0
 
         # Write to CSV with file paths instead of motion names
         with open(csv_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['motion_idx', 'motion_path', 'difficulty_0_100', 'difficulty_raw'])
-            for idx, (path, diff_0_100, diff_raw) in enumerate(zip(motion_files, difficulties_0_100, difficulties_cpu)):
+            for idx, (path, diff_0_100, diff_raw) in enumerate(zip(motion_files, difficulties_0_100, difficulties_internal)):
                 writer.writerow([idx, str(path), f"{diff_0_100:.2f}", f"{diff_raw:.4f}"])
 
         print(f"[MotionLib] Saved motion difficulty to {csv_file}")
@@ -2236,11 +2234,31 @@ class MotionLib:
                 reader = csv.DictReader(f)
                 for row in reader:
                     motion_path = row['motion_path']
-                    diff_0_100 = float(row['difficulty_0_100'])
+                    # Prefer raw internal difficulty if available.
+                    # Fallback to difficulty_0_100 for backward compatibility.
+                    diff_internal = None
+                    raw_str = row.get('difficulty_raw', None)
+                    if raw_str not in (None, ""):
+                        try:
+                            raw_val = float(raw_str)
+                            if raw_val >= 50.0:
+                                diff_internal = 10.0
+                            else:
+                                diff_internal = max(1.0, min(10.0, raw_val))
+                        except ValueError:
+                            diff_internal = None
+
+                    if diff_internal is None:
+                        diff_0_100 = float(row['difficulty_0_100'])
+                        # Old CSV format encoded "untrained/high" as 0.
+                        if diff_0_100 <= 0.0:
+                            diff_internal = 10.0
+                        else:
+                            diff_internal = max(1.0, min(10.0, diff_0_100 / 100.0 * 9.0 + 1.0))
 
                     if motion_path not in motion_path_to_diffs:
                         motion_path_to_diffs[motion_path] = []
-                    motion_path_to_diffs[motion_path].append(diff_0_100)
+                    motion_path_to_diffs[motion_path].append(diff_internal)
 
         if not motion_path_to_diffs:
             raise FileNotFoundError(f"No valid difficulty data found in CSV files: {csv_files}")
@@ -2266,12 +2284,9 @@ class MotionLib:
                 f"CSV files: {csv_files}"
             )
 
-        # Step 3: Convert 0-100 scale back to internal 1-10 scale
-        # Formula reverse: internal = 0_100 / 100 * 9 + 1
-        difficulties_tensor = torch.tensor(difficulties, dtype=torch.float32, device=self._device)
-        # Convert 0-100 to 1-10
-        difficulties_internal = difficulties_tensor / 100.0 * 9.0 + 1.0
-
+        # Step 3: Build output tensor (already in internal 1-10 scale).
+        difficulties_internal = torch.tensor(difficulties, dtype=torch.float32, device=self._device)
+        difficulties_internal = torch.clamp(difficulties_internal, 1.0, 10.0)
         return difficulties_internal
 
 

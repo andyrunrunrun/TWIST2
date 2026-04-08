@@ -1,5 +1,5 @@
 # sudo ufw disable
-
+# 激活conda环境
 source ~/miniconda3/bin/activate gmr
 
 cd deploy_real

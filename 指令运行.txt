@@ -1,0 +1,65 @@
+export PYTHONPATH=/home/huanghao/source/env/isaacgym/python:$PYTHONPATH
+export PYTHONPATH=/home/huanghao/source/code/TWIST2:$PYTHONPATH
+export LD_LIBRARY_PATH=/home/huanghao/miniconda3/envs/twist2/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/home/huanghao/source/code/TWIST2:$LD_LIBRARY_PATH
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4  torchrun --standalone --nproc_per_node=5 legged_gym/legged_gym/scripts/train.py \
+    --task g1_priv_mimic \
+    --proj_name g1_priv_mimic \
+    --exptid dataset_335003_hard_2 \                                                                                 --num_envs 2048 --max_iterations 300000 \                                                                      --motion.motion_file /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/dataset_mix_49d201b9_total335003.yaml  --gpu_cache 6
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4  torchrun --standalone --nproc_per_node=5 legged_gym/legged_gym/scripts/train.py \
+    --task g1_priv_mimic \
+    --proj_name g1_priv_mimic \
+    --exptid dataset_335003_hard_big \                                                                                 --num_envs 2048 --max_iterations 300000 \                                                                      --motion.motion_file /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/dataset_mix_49d201b9_total335003.yaml  --gpu_cache 4
+
+ CUDA_VISIBLE_DEVICES=0,1,2,3,4 NCCL_TIMEOUT=2400 torchrun --standalone --nproc_per_node=5 legged_gym/legged_gym/scripts/train.py \
+  --task g1_stu_future \
+  --proj_name g1_stu_future \
+  --exptid dataset_335003_stu_old \                                                    --checkpoint -1 \
+  --teacher_exptid dataset_mix_8203b425_total328739  \                                          --num_envs 2048 --max_iterations 150000 \
+  --motion.motion_file  /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/dataset_mix_5f39031a_total335003.yaml --gpu_cache 5.5
+
+ CUDA_VISIBLE_DEVICES=6 NCCL_TIMEOUT=2400 torchrun --standalone --nproc_per_node=1 legged_gym/legged_gym/scripts/train.py \
+  --task g1_stu_future \
+  --proj_name g1_stu_future \
+  --exptid AMASS \       --teacher_exptid "None" \                                          --num_envs 4096 --max_iterations 50000 \                                                                                       --motion.motion_file  /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/AMASS_numpy123_w1_total17029.yaml --gpu_cache 6
+
+ CUDA_VISIBLE_DEVICES=7 NCCL_TIMEOUT=2400 torchrun --standalone --nproc_per_node=1 legged_gym/legged_gym/scripts/train.py \
+  --task g1_stu_future \
+  --proj_name g1_stu_future \
+  --exptid TWIST2_dataset \       --teacher_exptid "None" \                                          --num_envs 4096 --max_iterations 50000 \                                                                                       --motion.motion_file  /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/AMASS_numpy123_w1_OMOMO_numpy123_w1_lafan1_numpy123_w1_twist1_to_twist2_numpy123_w1_v1_v2_v3_g1_numpy123_w20_total35849.yaml --gpu_cache 6
+
+ CUDA_VISIBLE_DEVICES=0,1,3,4,6 NCCL_TIMEOUT=2400 torchrun --standalone --nproc_per_node=5 legged_gym/legged_gym/scripts/train.py \
+  --task g1_stu_future \
+  --proj_name g1_stu_future \
+  --exptid dataset_335003_hard_stu \
+  --teacher_exptid dataset_335003_hard_2  \                                      --num_envs 2048 --max_iterations 300000 \
+  --motion.motion_file  /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/dataset_mix_49d201b9_total335003.yaml --gpu_cache 5.5
+
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4  NCCL_TIMEOUT=2400 \
+torchrun --standalone --nproc_per_node=5 legged_gym/legged_gym/scripts/train.py \
+  --task g1_stu_future \
+  --proj_name g1_stu_future \
+  --exptid dataset_335003_hard_stu \
+  --resume \
+  --checkpoint -1 \
+  --resume_difficulty_from dataset_335003_hard_stu \
+  --teacher_exptid dataset_335003_hard_2 \
+  --num_envs 4096 \
+  --max_iterations 300000 \
+  --motion.motion_file /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/dataset_mix_49d201b9_total335003.yaml \
+  --gpu_cache 5.5
+
+
+
+CUDA_VISIBLE_DEVICES=0,3,4,5,7  NCCL_TIMEOUT=2400 \
+torchrun --standalone --nproc_per_node=5 legged_gym/legged_gym/scripts/train.py \
+  --task g1_stu_future \
+  --proj_name g1_stu_future \
+  --exptid dataset_335003_hard_big_stu \
+  --teacher_exptid dataset_335003_hard_big \
+  --num_envs 4096 \
+  --max_iterations 300000 \
+  --motion.motion_file /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/dataset_mix_49d201b9_total335003.yaml \
+  --gpu_cache 5.2

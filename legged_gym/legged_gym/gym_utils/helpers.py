@@ -220,6 +220,34 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
                 async_str = " [ASYNC]" if getattr(args, "motion_async_resample", False) else " [SYNC]"
                 print(f"[Motion Resample] Enabled{async_str}: interval={args.motion_resample_interval}, per_gpu={args.motion_resample_per_gpu}")
 
+        # Anti-shuffle reward controls (for mimic tasks).
+        if hasattr(env_cfg, "rewards"):
+            if getattr(args, "enable_anti_shuffle_reward", False):
+                if hasattr(env_cfg.rewards, "enable_anti_shuffle_reward"):
+                    setattr(env_cfg.rewards, "enable_anti_shuffle_reward", True)
+            if getattr(args, "disable_anti_shuffle_reward", False):
+                if hasattr(env_cfg.rewards, "enable_anti_shuffle_reward"):
+                    setattr(env_cfg.rewards, "enable_anti_shuffle_reward", False)
+
+            anti_shuffle_scalar_overrides = [
+                ("anti_shuffle_ref_vel_th", "anti_shuffle_ref_vel_th"),
+                ("anti_shuffle_tilt_th", "anti_shuffle_tilt_th"),
+                ("anti_shuffle_contact_force_th", "anti_shuffle_contact_force_th"),
+            ]
+            for arg_name, cfg_name in anti_shuffle_scalar_overrides:
+                arg_val = getattr(args, arg_name, None)
+                if arg_val is not None and hasattr(env_cfg.rewards, cfg_name):
+                    setattr(env_cfg.rewards, cfg_name, float(arg_val))
+
+            if hasattr(env_cfg.rewards, "scales"):
+                step_switch_scale = getattr(args, "anti_shuffle_step_switch_scale", None)
+                if step_switch_scale is not None and hasattr(env_cfg.rewards.scales, "step_switch_rate"):
+                    setattr(env_cfg.rewards.scales, "step_switch_rate", float(step_switch_scale))
+
+                stance_speed_scale = getattr(args, "anti_shuffle_stance_foot_speed_scale", None)
+                if stance_speed_scale is not None and hasattr(env_cfg.rewards.scales, "stance_foot_speed"):
+                    setattr(env_cfg.rewards.scales, "stance_foot_speed", float(stance_speed_scale))
+
         # Resume motion difficulty from previous experiment
         if getattr(args, "resume_difficulty_from", None) is not None:
             if hasattr(env_cfg, "motion"):
@@ -359,6 +387,13 @@ def get_args():
         {"name": "--motion_resample_interval", "type": int, "default": 0, "help": "Resample motion subset every N iterations. 0 = disabled (use default cache)."},
         {"name": "--motion_resample_per_gpu", "type": int, "default": 15000, "help": "Number of motion samples to load per GPU when resampling is enabled."},
         {"name": "--motion_async_resample", "action": "store_true", "default": False, "help": "Enable async resample (prepares next subset in background). Only works when motion_resample_interval > 0."},
+        {"name": "--enable_anti_shuffle_reward", "action": "store_true", "default": False, "help": "Enable anti-shuffle rewards (step switch rate + stance foot speed)."},
+        {"name": "--disable_anti_shuffle_reward", "action": "store_true", "default": False, "help": "Force disable anti-shuffle rewards even if cfg enables it."},
+        {"name": "--anti_shuffle_ref_vel_th", "type": float, "default": None, "help": "Stable-gate threshold: reference root XY speed (m/s)."},
+        {"name": "--anti_shuffle_tilt_th", "type": float, "default": None, "help": "Stable-gate threshold: body tilt magnitude (projected gravity XY norm)."},
+        {"name": "--anti_shuffle_contact_force_th", "type": float, "default": None, "help": "Foot contact threshold (N) used by anti-shuffle rewards."},
+        {"name": "--anti_shuffle_step_switch_scale", "type": float, "default": None, "help": "Reward scale override for step_switch_rate (typically negative)."},
+        {"name": "--anti_shuffle_stance_foot_speed_scale", "type": float, "default": None, "help": "Reward scale override for stance_foot_speed (typically negative)."},
 
         {"name": "--rows", "type": int, "help": "num_rows."},
         {"name": "--cols", "type": int, "help": "num_cols"},

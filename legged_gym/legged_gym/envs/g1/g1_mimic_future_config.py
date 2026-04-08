@@ -96,6 +96,12 @@ class G1MimicStuFutureCfg(G1MimicPrivCfg):
         error_sampling_threshold = 0.15     # Threshold for max key body error normalization
     
     class rewards(G1MimicPrivCfg.rewards):
+        # Default OFF: keeps legacy behavior unchanged unless explicitly enabled.
+        enable_anti_shuffle_reward = False
+        anti_shuffle_ref_vel_th = 0.12
+        anti_shuffle_tilt_th = 0.25
+        anti_shuffle_contact_force_th = 5.0
+
         class scales:      
             # tracking_joint_dof = 2.0
             # tracking_joint_vel = 0.4
@@ -148,6 +154,9 @@ class G1MimicStuFutureCfg(G1MimicPrivCfg):
             ang_vel_xy = -0.01            
             ankle_dof_acc = -5e-8 * 2
             ankle_dof_vel = -1e-4 * 2
+            # Anti-shuffle (only active when enable_anti_shuffle_reward=True)
+            step_switch_rate = -0.20
+            stance_foot_speed = -0.05
         
         
 
@@ -202,8 +211,10 @@ class G1MimicStuFutureCfgDAgger(G1MimicStuFutureCfg):
         action_std = [0.7] * 12 + [0.4] * 3 + [0.5] * 14
         init_noise_std = 1.0
         obs_context_len = 11
-        actor_hidden_dims = [512, 512, 256, 128]
-        critic_hidden_dims = [512, 512, 256, 128]
+        # actor_hidden_dims = [512, 512, 256, 128]
+        # critic_hidden_dims = [512, 512, 256, 128]
+        actor_hidden_dims = [1024, 1024, 512, 256] #！！！！！！！！！！！！！！！！！！！!!!!!!!!!!!!!!!!!!!!!!!!!!
+        critic_hidden_dims = [1024, 1024, 512, 256]
         activation = 'silu'
         layer_norm = True
         motion_latent_dim = 128

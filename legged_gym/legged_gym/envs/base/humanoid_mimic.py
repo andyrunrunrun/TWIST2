@@ -225,6 +225,12 @@ class HumanoidMimic(HumanoidChar):
         self.max_episode_length_s = self._get_max_motion_len().item()
         self.max_episode_length = np.ceil(self.max_episode_length_s / self.dt)
         super()._init_buffers()
+        # Anti-shuffle reward state: previous per-foot contact for switch-rate penalty.
+        self._anti_shuffle_last_contact = torch.zeros(
+            (self.num_envs, len(self.feet_indices)),
+            device=self.device,
+            dtype=torch.bool,
+        )
         self._init_motion_buffers()
         
     def _load_motions(self):
@@ -443,6 +449,10 @@ class HumanoidMimic(HumanoidChar):
         self.last_torques[env_ids] = 0.
         self.last_root_vel[:] = 0.
         self.feet_air_time[env_ids] = 0.
+        anti_shuffle_contact = self.contact_forces[env_ids][:, self.feet_indices, 2] > getattr(
+            self.cfg.rewards, "anti_shuffle_contact_force_th", 5.0
+        )
+        self._anti_shuffle_last_contact[env_ids] = anti_shuffle_contact
         self.reset_buf[env_ids] = 1
         self.obs_history_buf[env_ids, :, :] = 0.  # reset obs history buffer TODO no 0s
         self.contact_buf[env_ids, :, :] = 0.
@@ -1295,6 +1305,39 @@ class HumanoidMimic(HumanoidChar):
     
     def _reward_torque_penalty(self):
         return torch.sum(torch.square(self.torques), dim=1)
+
+    def _anti_shuffle_stable_gate(self):
+        """Gate anti-shuffle penalties to only act in stable/slow reference phases."""
+        ref_speed_th = getattr(self.cfg.rewards, "anti_shuffle_ref_vel_th", 0.12)
+        tilt_th = getattr(self.cfg.rewards, "anti_shuffle_tilt_th", 0.25)
+
+        ref_speed = torch.norm(self._ref_root_vel[:, :2], dim=1)
+        tilt = torch.norm(self.projected_gravity[:, :2], dim=1)
+        return ((ref_speed < ref_speed_th) & (tilt < tilt_th)).float()
+
+    def _reward_step_switch_rate(self):
+        if not getattr(self.cfg.rewards, "enable_anti_shuffle_reward", False):
+            return torch.zeros(self.num_envs, device=self.device)
+
+        contact_th = getattr(self.cfg.rewards, "anti_shuffle_contact_force_th", 5.0)
+        contact = self.contact_forces[:, self.feet_indices, 2] > contact_th
+
+        # Penalize frequent contact-state toggling (small-step behavior).
+        switch_cnt = torch.logical_xor(contact, self._anti_shuffle_last_contact).float().sum(dim=1)
+        self._anti_shuffle_last_contact[:] = contact
+
+        return switch_cnt * self._anti_shuffle_stable_gate()
+
+    def _reward_stance_foot_speed(self):
+        if not getattr(self.cfg.rewards, "enable_anti_shuffle_reward", False):
+            return torch.zeros(self.num_envs, device=self.device)
+
+        contact_th = getattr(self.cfg.rewards, "anti_shuffle_contact_force_th", 5.0)
+        contact = (self.contact_forces[:, self.feet_indices, 2] > contact_th).float()
+        foot_speed_xy = torch.norm(self.rigid_body_states[:, self.feet_indices, 7:9], dim=2)
+        stance_speed = (foot_speed_xy * contact).sum(dim=1)
+
+        return stance_speed * self._anti_shuffle_stable_gate()
 
     def _reward_feet_air_time(self):
         contact = self.contact_forces[:, self.feet_indices, 2] > 5.

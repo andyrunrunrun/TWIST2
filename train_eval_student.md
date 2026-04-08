@@ -15,6 +15,35 @@
 - `<teacher_checkpoint>` 对应保存的迭代号（`-1` 表示自动取最新的 `model_*.pt`）
 
 
+### Anti-shuffle 参数（可选，默认关闭）
+
+用于抑制站立/慢速段的小碎步。默认不启用，旧训练行为不变。
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--enable_anti_shuffle_reward` | `False` | 启用 anti-shuffle 奖励（`step_switch_rate` + `stance_foot_speed`） |
+| `--anti_shuffle_ref_vel_th` | `0.12` | 仅在参考速度低于该阈值时施加 anti-shuffle（m/s） |
+| `--anti_shuffle_tilt_th` | `0.25` | 仅在机体倾斜低于该阈值时施加 anti-shuffle（投影重力 XY 范数） |
+| `--anti_shuffle_contact_force_th` | `5.0` | 判定足接触的竖直力阈值（N） |
+| `--anti_shuffle_step_switch_scale` | `-0.20` | 频繁换脚惩罚权重（更负=更强抑制小碎步） |
+| `--anti_shuffle_stance_foot_speed_scale` | `-0.05` | 支撑脚平面速度惩罚权重（更负=更强抑制脚底小抖） |
+
+示例（启用 anti-shuffle）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python legged_gym/legged_gym/scripts/train.py \
+  --task g1_stu_future \
+  --proj_name g1_stu_future \
+  --exptid 0213_student_antishuffle \
+  --device cuda:0 \
+  --teacher_exptid 0106_teacher \
+  --teacher_checkpoint -1 \
+  --enable_anti_shuffle_reward \
+  --anti_shuffle_step_switch_scale -0.20 \
+  --anti_shuffle_stance_foot_speed_scale -0.05
+```
+
+
 ### 1) 单卡训练（推荐：带 teacher 蒸馏）
 
 ```bash
@@ -42,6 +71,8 @@ CUDA_VISIBLE_DEVICES=0 python legged_gym/legged_gym/scripts/train.py \
 
 ```bash
 bash train.sh 0116_student cuda:0
+# 开启 anti-shuffle：
+# bash train.sh 0116_student cuda:0 true -0.20 -0.05
 ```
 
 ```bash
