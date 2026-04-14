@@ -1,0 +1,55 @@
+# ============================================
+# Transformer Backbone 实验
+# ============================================
+
+# --- 17k 数据集 ---
+
+# 实验 1a: Transformer-2x - 17k 数据集
+CUDA_VISIBLE_DEVICES=7 NCCL_TIMEOUT=2400 \
+torchrun --standalone --nproc_per_node=1 legged_gym/legged_gym/scripts/train.py \
+  --task g1_stu_future_trans2x \
+  --proj_name g1_stu_future_trans2x \
+  --exptid AMASS_17k_trans2x \
+  --teacher_exptid "None" \
+  --num_envs 4096 \
+  --max_iterations 50000 \
+  --motion.motion_file /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/AMASS_numpy123_w1_total17029.yaml \
+  --gpu_cache 60
+
+# 实验 1b: Transformer-4x - 17k 数据集
+CUDA_VISIBLE_DEVICES=4 NCCL_TIMEOUT=2400 \
+torchrun --standalone --nproc_per_node=1 legged_gym/legged_gym/scripts/train.py \
+  --task g1_stu_future_trans4x \
+  --proj_name g1_stu_future_trans4x \
+  --exptid AMASS_17k_trans4x \
+  --teacher_exptid "None" \
+  --num_envs 4096 \
+  --max_iterations 50000 \
+  --motion.motion_file /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/AMASS_numpy123_w1_total17029.yaml \
+  --gpu_cache 6
+
+# --- 35k 数据集 ---
+
+# 实验 2a: Transformer-2x - 35k 数据集
+CUDA_VISIBLE_DEVICES=5 NCCL_TIMEOUT=2400 \
+torchrun --standalone --nproc_per_node=1 legged_gym/legged_gym/scripts/train.py \
+  --task g1_stu_future_trans2x \
+  --proj_name g1_stu_future_trans2x \
+  --exptid TWIST2_35k_trans2x \
+  --teacher_exptid "None" \
+  --num_envs 4096 \
+  --max_iterations 50000 \
+  --motion.motion_file /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/AMASS_numpy123_w1_OMOMO_numpy123_w1_twist1_to_twist2_numpy123_w1_v1_v2_v3_g1_numpy123_w20_total35772.yaml \
+  --gpu_cache 6
+
+# 实验 2b: Transformer-4x - 35k 数据集
+CUDA_VISIBLE_DEVICES=2 NCCL_TIMEOUT=2400 \
+torchrun --standalone --nproc_per_node=1 legged_gym/legged_gym/scripts/train.py \
+  --task g1_stu_future_trans4x \
+  --proj_name g1_stu_future_trans4x \
+  --exptid TWIST2_35k_trans4x \
+  --teacher_exptid "None" \
+  --num_envs 4096 \
+  --max_iterations 50000 \
+  --motion.motion_file /home/huanghao/source/code/TWIST2/legged_gym/motion_data_configs/AMASS_numpy123_w1_OMOMO_numpy123_w1_twist1_to_twist2_numpy123_w1_v1_v2_v3_g1_numpy123_w20_total35772.yaml \
+  --gpu_cache 6

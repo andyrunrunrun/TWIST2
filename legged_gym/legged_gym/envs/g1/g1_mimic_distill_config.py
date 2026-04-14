@@ -279,7 +279,7 @@ class G1MimicPrivCfg(HumanoidMimicCfg):
         termination_roll = 4.0
         termination_pitch = 4.0
         # root_height_diff_threshold = 0.25 hard
-        # root_height_diff_threshold = 0.4 初代大规模
+        # root_height_diff_threshold = 0.4 # 初代大规模训练环境
         root_height_diff_threshold = 0.25 #原本是 0,3！！！！！！！！！！！！！！！！！！！!!!!!!!!!!!!!!!!!!!!!!!!!!
         
 

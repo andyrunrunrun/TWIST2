@@ -10,7 +10,7 @@ cmu_fbx_all/
 npy
 pkl
 phc/
-
+eval_results/
 motion_data/
 
 ignore/

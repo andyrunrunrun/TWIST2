@@ -47,6 +47,17 @@ from .g1.g1_mimic_distill_config import G1MimicStuLimbWeightCfg, G1MimicStuLimbW
 from .g1.g1_mimic_future import G1MimicFuture
 from .g1.g1_mimic_future_config import G1MimicStuFutureCfg, G1MimicStuFutureCfgDAgger
 
+# MoE (Mixture of Experts) configuration
+from .g1.g1_mimic_moe_config import G1MimicStuFutureMoECfg, G1MimicStuFutureMoECfgDAgger
+
+# Transformer configuration
+from .g1.g1_mimic_transformer_config import (
+    G1MimicStuFutureTrans2xCfg,
+    G1MimicStuFutureTrans2xCfgDAgger,
+    G1MimicStuFutureTrans4xCfg,
+    G1MimicStuFutureTrans4xCfgDAgger,
+)
+
 from .g1.g1_mimic_hyfeat import G1MimicHyFeat
 from .g1.g1_mimic_hyfeat_config import (
     G1HyMotion100kPrivCfg,
@@ -66,6 +77,15 @@ task_registry.register("g1_stu_rl", G1MimicDistill, G1MimicStuRLCfg(), G1MimicSt
 task_registry.register("g1_priv_mimic_limbw", G1MimicDistill, G1MimicPrivLimbWeightCfg(), G1MimicPrivLimbWeightCfgPPO())
 task_registry.register("g1_stu_mimic_limbw", G1MimicDistill, G1MimicStuLimbWeightCfg(), G1MimicStuLimbWeightCfgDAgger())
 task_registry.register("g1_stu_future", G1MimicFuture, G1MimicStuFutureCfg(), G1MimicStuFutureCfgDAgger())
+
+# MoE (Mixture of Experts) - Student policy with MoE backbone
+task_registry.register("g1_stu_future_moe", G1MimicFuture, G1MimicStuFutureMoECfg(), G1MimicStuFutureMoECfgDAgger())
+
+# Transformer - Student policy with Transformer backbone (2x params)
+task_registry.register("g1_stu_future_trans2x", G1MimicFuture, G1MimicStuFutureTrans2xCfg(), G1MimicStuFutureTrans2xCfgDAgger())
+
+# Transformer - Student policy with Transformer backbone (4x params)
+task_registry.register("g1_stu_future_trans4x", G1MimicFuture, G1MimicStuFutureTrans4xCfg(), G1MimicStuFutureTrans4xCfgDAgger())
 
 # HYMotion100k (HY features + curriculum masking on mimic_obs)
 task_registry.register("g1_priv_hymotion100k", G1MimicHyFeat, G1HyMotion100kPrivCfg(), G1HyMotion100kPrivCfgPPO())

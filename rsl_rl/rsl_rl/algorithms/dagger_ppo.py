@@ -79,6 +79,7 @@ class DaggerPPO:
                  std_schedule = [1.0, 1.0, 10, 10],
                  num_hist=10,
                  precision="float32",
+                 moe_load_balancing_weight=0.0,
                  **kwargs
                  ):
 
@@ -138,6 +139,9 @@ class DaggerPPO:
         # Action std
         self.fix_std = self.actor_critic.if_fix_std()
         self.std_schedule = std_schedule
+        
+        # MoE load balancing
+        self.moe_load_balancing_weight = moe_load_balancing_weight
     
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
         self.storage = RolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape,  critic_obs_shape, action_shape, self.device)
@@ -263,6 +267,15 @@ class DaggerPPO:
                 # print("KL teacher student: ", kl_teacher_student.item())
                 
                 loss += kl_teacher_student_loss
+                
+                # MoE load balancing loss
+                if self.moe_load_balancing_weight > 0:
+                    # Handle DDP wrapped model
+                    if hasattr(self.actor_critic, 'module'):
+                        moe_aux_loss = self.actor_critic.module.get_moe_aux_loss()
+                    else:
+                        moe_aux_loss = self.actor_critic.get_moe_aux_loss()
+                    loss += moe_aux_loss * self.moe_load_balancing_weight
 
                 # Gradient step with AMP support
                 self.optimizer.zero_grad()
