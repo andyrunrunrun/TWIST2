@@ -211,10 +211,10 @@ class G1MimicStuFutureCfgDAgger(G1MimicStuFutureCfg):
         action_std = [0.7] * 12 + [0.4] * 3 + [0.5] * 14
         init_noise_std = 1.0
         obs_context_len = 11
-        # actor_hidden_dims = [512, 512, 256, 128]
-        # critic_hidden_dims = [512, 512, 256, 128]
-        actor_hidden_dims = [1024, 1024, 512, 256] #！！！！！！！！！！！！！！！！！！！!!!!!!!!!!!!!!!!!!!!!!!!!!
-        critic_hidden_dims = [1024, 1024, 512, 256]
+        actor_hidden_dims = [512, 512, 256, 128]
+        critic_hidden_dims = [512, 512, 256, 128]
+        # actor_hidden_dims = [1024, 1024, 512, 256] #！！！！！！！！！！！！！！！！！！！!!!!!!!!!!!!!!!!!!!!!!!!!!
+        # critic_hidden_dims = [1024, 1024, 512, 256]
         activation = 'silu'
         layer_norm = True
         motion_latent_dim = 128

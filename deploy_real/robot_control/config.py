@@ -1,9 +1,10 @@
 import numpy as np
 import yaml
+from robot_control.pd_utils import apply_sonic_g1_pd_to_config
 
 
 class Config:
-    def __init__(self, file_path) -> None:
+    def __init__(self, file_path, use_sonic_pd=False) -> None:
         with open(file_path, "r") as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
             self.control_dt = config["control_dt"]
@@ -34,3 +35,9 @@ class Config:
 
             self.num_actions = config["num_actions"] if "num_actions" in config else None
             self.num_obs = config["num_obs"] if "num_obs" in config else None
+
+            if use_sonic_pd:
+                if self.num_actions == 29 and len(self.kps) == 29 and len(self.kds) == 29:
+                    apply_sonic_g1_pd_to_config(self)
+                else:
+                    print("[PD] Ignoring --sonic_pd because this config is not a 29-DoF G1 body config.")

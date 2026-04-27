@@ -199,6 +199,12 @@ class G1MimicFuture(G1MimicDistill):
         
         return future_obs
 
+    def get_reference_action_target(self):
+        """Return the current-step reference action target in policy action space."""
+        clip_actions = self.cfg.normalization.clip_actions / self.cfg.control.action_scale
+        reference_actions = (self._ref_dof_pos - self.default_dof_pos_all) / self.cfg.control.action_scale
+        return torch.clamp(reference_actions, -clip_actions, clip_actions)
+
 
 
     def _get_mimic_obs(self):
@@ -294,9 +300,10 @@ class G1MimicFuture(G1MimicDistill):
             proprio_obs_buf += (2 * torch.rand_like(proprio_obs_buf) - 1) * self.noise_scale_vec
         
         # Disable ankle dof velocity (same as parent)
-        dof_vel_start_dim = 3 + 2 + self.dof_pos.shape[1]
-        ankle_idx = [4, 5, 10, 11]
-        proprio_obs_buf[:, [dof_vel_start_dim + i for i in ankle_idx]] = 0.
+        if not getattr(self.cfg.env, "sonic_pd", False):
+            dof_vel_start_dim = 3 + 2 + self.dof_pos.shape[1]
+            ankle_idx = [4, 5, 10, 11]
+            proprio_obs_buf[:, [dof_vel_start_dim + i for i in ankle_idx]] = 0.
         
         # Private information for critic (same as parent)
         key_body_pos = self.rigid_body_states[:, self._key_body_ids, :3]

@@ -31,4 +31,5 @@
 from .ppo import PPO
 from .dagger import DAgger
 from .dagger_ppo import DaggerPPO
+from .diffusion_dagger import DiffusionDagger
 # Removed unnecessary maskedmimic algorithms

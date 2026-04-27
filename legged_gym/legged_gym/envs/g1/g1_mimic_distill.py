@@ -322,8 +322,9 @@ class G1MimicDistill(HumanoidMimic):
         dof_vel_start_dim = 3 + 2 + self.dof_pos.shape[1]
 
         # disable ankle dof velocity
-        ankle_idx = [4, 5, 10, 11]
-        proprio_obs_buf[:, [dof_vel_start_dim + i for i in ankle_idx]] = 0.
+        if not getattr(self.cfg.env, "sonic_pd", False):
+            ankle_idx = [4, 5, 10, 11]
+            proprio_obs_buf[:, [dof_vel_start_dim + i for i in ankle_idx]] = 0.
         
         key_body_pos = self.rigid_body_states[:, self._key_body_ids, :3]
         key_body_pos = key_body_pos - self.root_states[:, None, :3]

@@ -119,6 +119,88 @@ def resolve_task_name(cli_task: str, model_info: dict) -> str:
     return cli_task
 
 
+def detect_sonic_model(model_path: str) -> bool:
+    """根据模型路径判断是否为 sonic_pd 训练的模型。"""
+    return 'sonic' in str(model_path).lower()
+
+
+def resolve_sonic_pd_mode(model_path: str, cli_override):
+    """解析评估时是否启用 sonic_pd。
+
+    优先级:
+    1. --sonic_pd / --no_sonic_pd 显式覆盖
+    2. 模型路径自动检测
+    """
+    is_sonic_model = detect_sonic_model(model_path)
+
+    if cli_override is True:
+        enable_sonic_pd = True
+        source = 'cli_force_on'
+    elif cli_override is False:
+        enable_sonic_pd = False
+        source = 'cli_force_off'
+    elif is_sonic_model:
+        enable_sonic_pd = True
+        source = 'path_auto'
+    else:
+        enable_sonic_pd = False
+        source = 'default_off'
+
+    return {
+        'is_sonic_model': is_sonic_model,
+        'enable_sonic_pd': enable_sonic_pd,
+        'preserve_ankle_obs': enable_sonic_pd,
+        'source': source,
+    }
+
+
+def print_sonic_pd_summary(mode: dict):
+    """打印 sonic_pd 检测与生效状态。"""
+    source_text = {
+        'path_auto': 'auto-detected from model path',
+        'cli_force_on': 'forced by --sonic_pd',
+        'cli_force_off': 'forced by --no_sonic_pd',
+        'default_off': 'default disabled',
+    }.get(mode.get('source'), 'unknown')
+
+    detected_text = 'YES' if mode['is_sonic_model'] else 'NO'
+    effective_text = 'ENABLED' if mode['enable_sonic_pd'] else 'DISABLED'
+    ankle_text = 'PRESERVED' if mode['preserve_ankle_obs'] else 'MASKED'
+    pd_text = 'SONIC-derived G1 gains' if mode['enable_sonic_pd'] else 'default env gains'
+
+    try:
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.table import Table
+
+        console = Console()
+        table = Table.grid(padding=(0, 2))
+        table.add_row('Detected SONIC model', f"[bold]{detected_text}[/bold]")
+        table.add_row('Effective SONIC PD', f"[bold]{effective_text}[/bold]")
+        table.add_row('PD gains', pd_text)
+        table.add_row('Ankle observations', ankle_text)
+        table.add_row('Decision source', source_text)
+
+        border_style = 'green' if mode['enable_sonic_pd'] else 'yellow'
+        title = 'SONIC PD Evaluation Mode'
+        console.print(Panel(table, title=title, border_style=border_style))
+    except ImportError:
+        lines = [
+            'SONIC PD Evaluation Mode',
+            f'Detected SONIC model : {detected_text}',
+            f'Effective SONIC PD   : {effective_text}',
+            f'PD gains             : {pd_text}',
+            f'Ankle observations   : {ankle_text}',
+            f'Decision source      : {source_text}',
+        ]
+        width = max(len(line) for line in lines)
+        border = '+' + '-' * (width + 2) + '+'
+        print(border)
+        for line in lines:
+            print(f"| {line.ljust(width)} |")
+        print(border)
+
+
 # ============================================================================
 # 模型加载器
 # ============================================================================
@@ -510,6 +592,19 @@ def load_pt_model(model_path: str, env, device: str, task_name: str):
     
     # 只加载 shape 完全匹配的权重，避免 strict=False 仍因 size mismatch 抛错
     filtered_state_dict, skipped_mismatch, filtered_unexpected = _filter_matching_state_dict(actor_critic, new_state_dict)
+    if skipped_mismatch:
+        mismatch_lines = [
+            f"    - {key}: checkpoint {src_shape} != model {dst_shape}"
+            for key, src_shape, dst_shape in skipped_mismatch[:20]
+        ]
+        remaining = len(skipped_mismatch) - len(mismatch_lines)
+        if remaining > 0:
+            mismatch_lines.append(f"    ... and {remaining} more")
+        raise RuntimeError(
+            "Checkpoint weights do not fully match the reconstructed model. "
+            "Aborting evaluation to avoid testing a partially loaded model.\n"
+            + "\n".join(mismatch_lines)
+        )
     missing_keys, unexpected_keys = actor_critic.load_state_dict(filtered_state_dict, strict=False)
     
     if missing_keys:
@@ -521,11 +616,6 @@ def load_pt_model(model_path: str, env, device: str, task_name: str):
         print(f"  Warning: {len(all_unexpected_keys)} unexpected keys")
         for k in all_unexpected_keys[:5]:
             print(f"    - {k}")
-    if skipped_mismatch:
-        print(f"  Warning: {len(skipped_mismatch)} mismatched keys skipped")
-        for k, src_shape, dst_shape in skipped_mismatch[:5]:
-            print(f"    - {k}: checkpoint {src_shape} != model {dst_shape}")
-    
     actor_critic.eval()
     print(f"Model loaded: {sum(p.numel() for p in actor_critic.parameters())/1e6:.2f}M parameters")
     
@@ -613,7 +703,16 @@ def evaluate_single_motion_group(
 ):
     """评估单个动作库的所有动作，动作数据按需加载"""
     import torch
+    from isaacgym.torch_utils import quat_rotate_inverse
     from legged_gym.envs.base.humanoid_mimic import HumanoidMimic
+    from legged_gym.envs.base.legged_robot import euler_from_quaternion
+
+    def _refresh_metric_state():
+        """首次 reset 后尚未经历 post_physics_step，需要手动补齐误差函数依赖的姿态状态。"""
+        env.base_quat[:] = env.root_states[:, 3:7]
+        env.base_lin_vel[:] = quat_rotate_inverse(env.base_quat, env.root_states[:, 7:10])
+        env.base_ang_vel[:] = quat_rotate_inverse(env.base_quat, env.root_states[:, 10:13])
+        env.roll, env.pitch, env.yaw = euler_from_quaternion(env.base_quat)
     
     motion_lib = env._motion_lib
     num_motions = motion_lib.num_motions()
@@ -622,9 +721,15 @@ def evaluate_single_motion_group(
     
     num_envs = env.num_envs
     dt = env.dt
+    quality_metric_fns = {
+        metric_name: getattr(env, f"_{metric_name}")
+        for metric_name in QUALITY_METRIC_SPECS
+        if hasattr(env, f"_{metric_name}")
+    }
     
     results = []
     all_motion_ids = list(range(num_motions))
+    all_env_ids = torch.arange(num_envs, device=device)
     
     # 获取所有动作长度
     motion_ids_tensor = torch.tensor(all_motion_ids, device=device, dtype=torch.int64)
@@ -649,7 +754,6 @@ def evaluate_single_motion_group(
             motion_ids_tensor = torch.cat([motion_ids_tensor, padding])
         
         # 重置环境
-        all_env_ids = torch.arange(num_envs, device=device)
         HumanoidMimic.reset_idx(env, all_env_ids, motion_ids=motion_ids_tensor)
         obs = env.get_observations()
         
@@ -665,28 +769,55 @@ def evaluate_single_motion_group(
         # 收集指标（可选）
         if collect_metrics:
             episode_metrics = defaultdict(lambda: torch.zeros(num_envs, device=device))
+        quality_metric_sums = {
+            key: torch.zeros(num_envs, device=device)
+            for key in quality_metric_fns
+        }
+        quality_metric_counts = {
+            key: torch.zeros(num_envs, device=device)
+            for key in quality_metric_fns
+        }
+        skipped_quality_metrics = set()
         
         # 运行模拟
         for _ in range(actual_max_steps):
+            active_batch_mask = ~done_mask[:batch_size]
+            active_idx = torch.nonzero(active_batch_mask, as_tuple=False).squeeze(-1)
+            if active_idx.numel() == 0:
+                break
+
             with torch.no_grad():
-                # 只评估有效的batch
-                valid_obs = obs[:batch_size]
-                active_batch_mask = ~done_mask[:batch_size]
-                
-                # 推理
-                valid_actions = policy(valid_obs.detach())
-                
+                if quality_metric_fns:
+                    if not hasattr(env, 'yaw'):
+                        _refresh_metric_state()
+                    for key, metric_fn in quality_metric_fns.items():
+                        metric_values = metric_fn()
+                        if isinstance(metric_values, tuple):
+                            metric_values = metric_values[0]
+                        if not isinstance(metric_values, torch.Tensor):
+                            metric_values = torch.as_tensor(metric_values, device=device)
+                        if metric_values.ndim == 0 or metric_values.shape[0] != num_envs:
+                            if key not in skipped_quality_metrics:
+                                print(
+                                    f"  Warning: skip quality metric '{key}' because it is not per-env "
+                                    f"(shape={tuple(metric_values.shape)})"
+                                )
+                                skipped_quality_metrics.add(key)
+                            continue
+                        quality_metric_counts[key][active_idx] += 1
+                        quality_metric_sums[key][active_idx] += metric_values[active_idx]
+
+                # 只对仍在评估中的env执行策略推理，done后保持零动作。
+                active_obs = obs.index_select(0, active_idx)
+                valid_actions = policy(active_obs.detach())
+
                 if isinstance(valid_actions, torch.Tensor):
                     valid_actions = valid_actions.to(device)
                 else:
                     valid_actions = torch.from_numpy(valid_actions).to(device)
-                
-                # 填充动作
-                if batch_size < num_envs:
-                    actions = torch.zeros((num_envs, valid_actions.shape[1]), device=device, dtype=valid_actions.dtype)
-                    actions[:batch_size] = valid_actions
-                else:
-                    actions = valid_actions
+
+                actions = torch.zeros((num_envs, env.num_actions), device=device, dtype=valid_actions.dtype)
+                actions.index_copy_(0, active_idx, valid_actions)
             
             # 环境步进
             obs, _, _, dones, infos = env.step(actions)
@@ -700,17 +831,16 @@ def evaluate_single_motion_group(
                 for key, value in infos['episode'].items():
                     if isinstance(value, torch.Tensor):
                         if value.ndim == 0:
-                            value_batch = value.expand(batch_size)
-                        elif value.shape[0] == num_envs:
+                            # 标量是reset env的均值，不能安全映射回单个动作结果。
+                            continue
+                        if value.shape[0] == num_envs:
                             value_batch = value[:batch_size]
                         elif value.shape[0] == batch_size:
                             value_batch = value
                         else:
                             continue
 
-                        active_idx = torch.nonzero(active_batch_mask, as_tuple=False).squeeze(-1)
-                        if active_idx.numel() > 0:
-                            episode_metrics[key][active_idx] += value_batch[active_idx]
+                        episode_metrics[key][active_idx] += value_batch[active_idx]
             
             # 提前退出条件
             if done_mask[:batch_size].all():
@@ -721,6 +851,14 @@ def evaluate_single_motion_group(
         completion_rates = actual_times / batch_motion_lengths
         completion_rates = torch.clamp(completion_rates, 0.0, 1.0)
         completion_scores = completion_rates * 100.0
+        quality_metrics = {}
+        if quality_metric_fns:
+            for key, values in quality_metric_sums.items():
+                counts = quality_metric_counts[key][:batch_size]
+                if not torch.any(counts > 0):
+                    continue
+                valid_counts = torch.clamp(counts, min=1.0)
+                quality_metrics[key] = values[:batch_size] / valid_counts
         
         # 保存结果
         for i, local_idx in enumerate(batch_motion_ids):
@@ -735,23 +873,77 @@ def evaluate_single_motion_group(
             }
             
             # 添加指标
+            result_metrics = {}
             if collect_metrics:
-                result['metrics'] = {}
                 for key, values in episode_metrics.items():
-                    result['metrics'][key] = values[i].item()
+                    result_metrics[key] = values[i].item()
+            for key, values in quality_metrics.items():
+                result_metrics[key] = values[i].item()
+            if result_metrics:
+                result['metrics'] = result_metrics
+
+            result['quality_score'] = compute_quality_score(result_metrics, fallback=result['completion_score'])
+            result['ranking_score'] = compute_ranking_score(
+                result['completion_score'],
+                result['quality_score'],
+            )
             
             results.append(result)
         
-        # 显式清理GPU缓存（可选）
-        if device.startswith('cuda'):
-            torch.cuda.empty_cache()
-    
     return results
 
 
 # ============================================================================
 # 结果统计和输出
 # ============================================================================
+
+QUALITY_METRIC_SPECS = {
+    'error_tracking_keybody_pos': {'threshold': 0.35, 'weight': 0.30},
+    'error_tracking_root_translation': {'threshold': 0.30, 'weight': 0.20},
+    'error_tracking_root_rotation': {'threshold': 1.00, 'weight': 0.15},
+    'error_tracking_joint_dof': {'threshold': 0.35, 'weight': 0.15},
+    'error_tracking_root_vel': {'threshold': 1.50, 'weight': 0.10},
+    'error_tracking_joint_vel': {'threshold': 2.50, 'weight': 0.05},
+    'error_tracking_root_ang_vel': {'threshold': 3.00, 'weight': 0.05},
+}
+
+RANKING_SCORE_WEIGHTS = {
+    'completion_score': 0.70,
+    'quality_score': 0.30,
+}
+
+
+def normalize_error_score(value: float, threshold: float) -> float:
+    """Map an absolute tracking error to a 0-100 score using a fixed threshold."""
+    if threshold <= 0:
+        return 0.0
+    return float(np.clip(1.0 - value / threshold, 0.0, 1.0) * 100.0)
+
+
+def compute_quality_score(metrics: dict, fallback: float = 0.0) -> float:
+    """Aggregate available tracking errors into a stable 0-100 quality score."""
+    weighted_score = 0.0
+    total_weight = 0.0
+
+    for key, spec in QUALITY_METRIC_SPECS.items():
+        if key not in metrics:
+            continue
+        weighted_score += normalize_error_score(metrics[key], spec['threshold']) * spec['weight']
+        total_weight += spec['weight']
+
+    if total_weight == 0.0:
+        return float(fallback)
+
+    return float(weighted_score / total_weight)
+
+
+def compute_ranking_score(completion_score: float, quality_score: float) -> float:
+    """Combine completion and motion quality into a ranking-friendly score."""
+    return float(
+        completion_score * RANKING_SCORE_WEIGHTS['completion_score']
+        + quality_score * RANKING_SCORE_WEIGHTS['quality_score']
+    )
+
 
 def compute_statistics(values: list) -> dict:
     """计算统计信息"""
@@ -771,11 +963,11 @@ def compute_statistics(values: list) -> dict:
 def aggregate_results(results: list, motions_by_group: dict) -> dict:
     """汇总结果，按动作库分组统计"""
     # 整体统计
-    all_scores = [r['completion_score'] for r in results]
     overall_stats = {
-        'completion_score': compute_statistics(all_scores),
         'total_motions': len(results)
     }
+    for score_key in ('completion_score', 'quality_score', 'ranking_score'):
+        overall_stats[score_key] = compute_statistics([r[score_key] for r in results])
     
     # 收集所有指标
     all_metrics = defaultdict(list)
@@ -798,11 +990,11 @@ def aggregate_results(results: list, motions_by_group: dict) -> dict:
     
     # 计算每组的统计
     for group_name, group_res in group_results.items():
-        group_scores = [r['completion_score'] for r in group_res]
         group_stat = {
             'count': len(group_res),
-            'completion_score': compute_statistics(group_scores)
         }
+        for score_key in ('completion_score', 'quality_score', 'ranking_score'):
+            group_stat[score_key] = compute_statistics([r[score_key] for r in group_res])
         
         # 组内指标统计
         group_metrics = defaultdict(list)
@@ -833,9 +1025,13 @@ def print_results_table(overall_stats: dict, group_stats: dict):
         
         # 整体统计
         console.print("[bold green]整体性能:[/bold green]")
-        score_stats = overall_stats['completion_score']
-        console.print(f"  完成度得分: {score_stats['mean']:.2f} ± {score_stats['std']:.2f}")
-        console.print(f"  范围: [{score_stats['min']:.2f}, {score_stats['max']:.2f}]")
+        completion_stats = overall_stats['completion_score']
+        quality_stats = overall_stats['quality_score']
+        ranking_stats = overall_stats['ranking_score']
+        console.print(f"  完成度得分: {completion_stats['mean']:.2f} ± {completion_stats['std']:.2f}")
+        console.print(f"  质量得分: {quality_stats['mean']:.2f} ± {quality_stats['std']:.2f}")
+        console.print(f"  排序得分: {ranking_stats['mean']:.2f} ± {ranking_stats['std']:.2f}")
+        console.print(f"  完成度范围: [{completion_stats['min']:.2f}, {completion_stats['max']:.2f}]")
         console.print(f"  测试动作数: {overall_stats['total_motions']}\n")
         
         # 分组统计表
@@ -843,20 +1039,22 @@ def print_results_table(overall_stats: dict, group_stats: dict):
         table.add_column("动作库", style="cyan")
         table.add_column("数量", justify="right")
         table.add_column("完成度均值", justify="right")
+        table.add_column("质量均值", justify="right")
+        table.add_column("排序分均值", justify="right")
         table.add_column("完成度标准差", justify="right")
-        table.add_column("最低分", justify="right")
-        table.add_column("最高分", justify="right")
         
         for group_name in sorted(group_stats.keys()):
             stats = group_stats[group_name]
-            score = stats['completion_score']
+            completion = stats['completion_score']
+            quality = stats['quality_score']
+            ranking = stats['ranking_score']
             table.add_row(
                 group_name,
                 str(stats['count']),
-                f"{score['mean']:.2f}",
-                f"{score['std']:.2f}",
-                f"{score['min']:.2f}",
-                f"{score['max']:.2f}"
+                f"{completion['mean']:.2f}",
+                f"{quality['mean']:.2f}",
+                f"{ranking['mean']:.2f}",
+                f"{completion['std']:.2f}",
             )
         
         console.print(table)
@@ -867,19 +1065,28 @@ def print_results_table(overall_stats: dict, group_stats: dict):
         print("模型测评结果汇总")
         print("=" * 60)
         
-        score_stats = overall_stats['completion_score']
-        print(f"\n整体完成度得分: {score_stats['mean']:.2f} ± {score_stats['std']:.2f}")
-        print(f"范围: [{score_stats['min']:.2f}, {score_stats['max']:.2f}]")
+        completion_stats = overall_stats['completion_score']
+        quality_stats = overall_stats['quality_score']
+        ranking_stats = overall_stats['ranking_score']
+        print(f"\n整体完成度得分: {completion_stats['mean']:.2f} ± {completion_stats['std']:.2f}")
+        print(f"整体质量得分: {quality_stats['mean']:.2f} ± {quality_stats['std']:.2f}")
+        print(f"整体排序得分: {ranking_stats['mean']:.2f} ± {ranking_stats['std']:.2f}")
+        print(f"完成度范围: [{completion_stats['min']:.2f}, {completion_stats['max']:.2f}]")
         print(f"测试动作数: {overall_stats['total_motions']}\n")
         
         print("按动作库分组统计:")
         print("-" * 60)
-        print(f"{'动作库':<30} {'数量':>8} {'完成度均值':>12} {'标准差':>8}")
+        print(f"{'动作库':<30} {'数量':>8} {'完成度均值':>12} {'质量均值':>10} {'排序均值':>10}")
         print("-" * 60)
         for group_name in sorted(group_stats.keys()):
             stats = group_stats[group_name]
-            score = stats['completion_score']
-            print(f"{group_name:<30} {stats['count']:>8} {score['mean']:>12.2f} {score['std']:>8.2f}")
+            completion = stats['completion_score']
+            quality = stats['quality_score']
+            ranking = stats['ranking_score']
+            print(
+                f"{group_name:<30} {stats['count']:>8} "
+                f"{completion['mean']:>12.2f} {quality['mean']:>10.2f} {ranking['mean']:>10.2f}"
+            )
 
 
 def save_results(output_path: str, model_info: dict, overall_stats: dict, 
@@ -913,6 +1120,20 @@ def main():
     parser.add_argument('--max_steps', type=int, default=5000, help='最大模拟步数')
     parser.add_argument('--output_dir', type=str, default='./eval_results', help='输出目录')
     parser.add_argument('--headless', action='store_true', help='无头模式运行')
+    parser.set_defaults(sonic_pd=None)
+    sonic_pd_group = parser.add_mutually_exclusive_group()
+    sonic_pd_group.add_argument(
+        '--sonic_pd',
+        dest='sonic_pd',
+        action='store_true',
+        help='显式启用 SONIC-derived G1 PD 参数，并保留脚踝观测输入',
+    )
+    sonic_pd_group.add_argument(
+        '--no_sonic_pd',
+        dest='sonic_pd',
+        action='store_false',
+        help='显式关闭 SONIC PD 自动识别，回退到默认 PD 参数和默认脚踝观测逻辑',
+    )
     args = parser.parse_args()
     
     # 导入isaacgym（必须在torch之前！）
@@ -930,6 +1151,10 @@ def main():
     # 提取模型信息
     model_info = extract_model_info(args.model_path)
     args.task = resolve_task_name(args.task, model_info)
+    sonic_pd_mode = resolve_sonic_pd_mode(model_info['path'], cli_override=args.sonic_pd)
+    model_info['is_sonic_model'] = sonic_pd_mode['is_sonic_model']
+    model_info['enable_sonic_pd'] = sonic_pd_mode['enable_sonic_pd']
+    model_info['sonic_pd_source'] = sonic_pd_mode['source']
     print(f"\n{'='*60}")
     print(f"模型测评开始")
     print(f"{'='*60}")
@@ -938,6 +1163,8 @@ def main():
     print(f"模型名称: {model_info['name']}")
     if model_info['steps']:
         print(f"训练步数: {model_info['steps']}")
+    if sonic_pd_mode['is_sonic_model'] or args.sonic_pd is not None:
+        print_sonic_pd_summary(sonic_pd_mode)
     
     # 解析动作配置
     print(f"\n解析动作配置...")
@@ -967,6 +1194,7 @@ def main():
             self.task = args.task
             self.device = args.device
             self.headless = args.headless
+            self.sonic_pd = sonic_pd_mode['enable_sonic_pd']
             self.use_jit = False
             self.record_video = False
             self.record_log = False

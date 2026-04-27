@@ -11,6 +11,7 @@ import mujoco.viewer as mjv
 from tqdm import tqdm
 import os
 from data_utils.rot_utils import quatToEuler
+from robot_control.pd_utils import get_sonic_g1_pd_arrays
 
 try:
     import onnxruntime as ort
@@ -93,9 +94,11 @@ class RealTimePolicyController:
                  policy_frequency=50,
                  viewer_decimation=0,
                  smooth_body=0.0,
+                 sonic_pd=False,
                  ):
         self.measure_fps = measure_fps
         self.limit_fps = limit_fps
+        self.sonic_pd = sonic_pd
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -164,6 +167,9 @@ class RealTimePolicyController:
                 5, 5, 5, 5, 0.2, 0.2, 0.2,
                 5, 5, 5, 5, 0.2, 0.2, 0.2,
             ])
+        if sonic_pd:
+            self.stiffness, self.damping = get_sonic_g1_pd_arrays(dtype=np.float32)
+            print("[PD] Using SONIC-derived G1 PD gains for simulation deployment.")
 
         
         self.torque_limits = np.array([
@@ -282,7 +288,8 @@ class RealTimePolicyController:
                     # Build proprioceptive observation
                     rpy = quatToEuler(quat)
                     obs_body_dof_vel = dof_vel.copy()
-                    obs_body_dof_vel[self.ankle_idx] = 0.
+                    if not self.sonic_pd:
+                        obs_body_dof_vel[self.ankle_idx] = 0.
                     obs_proprio = np.concatenate([
                         ang_vel * 0.25,
                         rpy[:2], # only use roll and pitch
@@ -469,6 +476,11 @@ def main():
         default=0.0,
         help="EMA smoothing factor for action_mimic from Redis (0 disables; recommended 0.05~0.2)",
     )
+    parser.add_argument(
+        "--sonic_pd",
+        action="store_true",
+        help="Use SONIC-derived G1 PD gains instead of the default TWIST2 deploy-time PD gains.",
+    )
     args = parser.parse_args()
     
     # Verify policy file exists
@@ -500,6 +512,7 @@ def main():
         policy_frequency=args.policy_frequency,
         viewer_decimation=args.viewer_decimation,
         smooth_body=args.smooth_body,
+        sonic_pd=args.sonic_pd,
     )
     controller.run()
 

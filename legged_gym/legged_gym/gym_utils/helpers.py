@@ -39,6 +39,63 @@ from isaacgym import gymutil
 import argparse
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
 
+SONIC_PD_SUPPORTED_MODULES = {
+    "legged_gym.envs.g1.g1_mimic_distill_config",
+    "legged_gym.envs.g1.g1_mimic_future_config",
+    "legged_gym.envs.g1.g1_mimic_diffusion_config",
+    "legged_gym.envs.g1.g1_mimic_moe_config",
+    "legged_gym.envs.g1.g1_mimic_transformer_config",
+}
+
+SONIC_PD_NATURAL_FREQ = 10.0 * 2.0 * np.pi
+SONIC_PD_DAMPING_RATIO = 2.0
+SONIC_PD_ARMATURE_5020 = 0.003609725
+SONIC_PD_ARMATURE_7520_14 = 0.010177520
+SONIC_PD_ARMATURE_7520_22 = 0.025101925
+SONIC_PD_ARMATURE_4010 = 0.00425
+
+SONIC_PD_STIFFNESS_5020 = SONIC_PD_ARMATURE_5020 * SONIC_PD_NATURAL_FREQ**2
+SONIC_PD_STIFFNESS_7520_14 = SONIC_PD_ARMATURE_7520_14 * SONIC_PD_NATURAL_FREQ**2
+SONIC_PD_STIFFNESS_7520_22 = SONIC_PD_ARMATURE_7520_22 * SONIC_PD_NATURAL_FREQ**2
+SONIC_PD_STIFFNESS_4010 = SONIC_PD_ARMATURE_4010 * SONIC_PD_NATURAL_FREQ**2
+
+SONIC_PD_DAMPING_5020 = 2.0 * SONIC_PD_DAMPING_RATIO * SONIC_PD_ARMATURE_5020 * SONIC_PD_NATURAL_FREQ
+SONIC_PD_DAMPING_7520_14 = 2.0 * SONIC_PD_DAMPING_RATIO * SONIC_PD_ARMATURE_7520_14 * SONIC_PD_NATURAL_FREQ
+SONIC_PD_DAMPING_7520_22 = 2.0 * SONIC_PD_DAMPING_RATIO * SONIC_PD_ARMATURE_7520_22 * SONIC_PD_NATURAL_FREQ
+SONIC_PD_DAMPING_4010 = 2.0 * SONIC_PD_DAMPING_RATIO * SONIC_PD_ARMATURE_4010 * SONIC_PD_NATURAL_FREQ
+
+SONIC_G1_STIFFNESS = {
+    "hip_pitch": float(SONIC_PD_STIFFNESS_7520_22),
+    "hip_roll": float(SONIC_PD_STIFFNESS_7520_22),
+    "hip_yaw": float(SONIC_PD_STIFFNESS_7520_14),
+    "knee": float(SONIC_PD_STIFFNESS_7520_22),
+    "ankle": float(2.0 * SONIC_PD_STIFFNESS_5020),
+    "waist_yaw": float(SONIC_PD_STIFFNESS_7520_14),
+    "waist_roll": float(2.0 * SONIC_PD_STIFFNESS_5020),
+    "waist_pitch": float(2.0 * SONIC_PD_STIFFNESS_5020),
+    "shoulder": float(SONIC_PD_STIFFNESS_5020),
+    "elbow": float(SONIC_PD_STIFFNESS_5020),
+    "wrist_roll": float(SONIC_PD_STIFFNESS_5020),
+    "wrist_pitch": float(SONIC_PD_STIFFNESS_4010),
+    "wrist_yaw": float(SONIC_PD_STIFFNESS_4010),
+}
+
+SONIC_G1_DAMPING = {
+    "hip_pitch": float(SONIC_PD_DAMPING_7520_22),
+    "hip_roll": float(SONIC_PD_DAMPING_7520_22),
+    "hip_yaw": float(SONIC_PD_DAMPING_7520_14),
+    "knee": float(SONIC_PD_DAMPING_7520_22),
+    "ankle": float(2.0 * SONIC_PD_DAMPING_5020),
+    "waist_yaw": float(SONIC_PD_DAMPING_7520_14),
+    "waist_roll": float(2.0 * SONIC_PD_DAMPING_5020),
+    "waist_pitch": float(2.0 * SONIC_PD_DAMPING_5020),
+    "shoulder": float(SONIC_PD_DAMPING_5020),
+    "elbow": float(SONIC_PD_DAMPING_5020),
+    "wrist_roll": float(SONIC_PD_DAMPING_5020),
+    "wrist_pitch": float(SONIC_PD_DAMPING_4010),
+    "wrist_yaw": float(SONIC_PD_DAMPING_4010),
+}
+
 def class_to_dict(obj) -> dict:
     if not  hasattr(obj,"__dict__"):
         return obj
@@ -142,6 +199,19 @@ def set_seed(seed):
     os.environ['PYTHONHASHSEED'] = str(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+def supports_sonic_pd(env_cfg):
+    module_name = getattr(env_cfg.__class__, "__module__", "")
+    return module_name in SONIC_PD_SUPPORTED_MODULES
+
+def apply_sonic_pd_to_env_cfg(env_cfg):
+    if env_cfg is None or not hasattr(env_cfg, "control"):
+        return False
+    if not hasattr(env_cfg.control, "stiffness") or not hasattr(env_cfg.control, "damping"):
+        return False
+    env_cfg.control.stiffness = copy.deepcopy(SONIC_G1_STIFFNESS)
+    env_cfg.control.damping = copy.deepcopy(SONIC_G1_DAMPING)
+    return True
 
 def parse_sim_params(args, cfg):
     # code from Isaac Gym Preview 2
@@ -267,6 +337,25 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             env_cfg.env.record_video = args.record_video
         if args.no_rand:
             env_cfg.domain_rand.domain_rand_general = False
+        sonic_pd_active = False
+        if getattr(args, "sonic_pd", False):
+            if supports_sonic_pd(env_cfg) and apply_sonic_pd_to_env_cfg(env_cfg):
+                sonic_pd_active = True
+                print("============================================================")
+                print("============================================================")
+                print("============================================================")
+                print("============================================================")
+                print("===========[PD] Using SONIC-derived G1 PD gains.============")
+                print("============================================================")
+                print("============================================================")
+                print("============================================================")
+                
+            else:
+                module_name = getattr(env_cfg.__class__, "__module__", "")
+                print(f"[PD] Ignoring --sonic_pd for unsupported env cfg module: {module_name}")
+        if hasattr(env_cfg, "env"):
+            # Only expose sonic_pd=True to observation logic when the PD override is actually active.
+            setattr(env_cfg.env, "sonic_pd", sonic_pd_active)
     if cfg_train is not None:
         if args.seed is not None:
             cfg_train.seed = args.seed
@@ -432,6 +521,7 @@ def get_args():
         {"name": "--record_log_env_id", "type": int, "default": -1, "help": "When --record_log is set: which env index to log. -1 uses env.lookat_id if available, else 0."},
         
         {"name": "--use_transformer", "action": "store_true", "default": False, "help": "use transformer"},
+        {"name": "--sonic_pd", "action": "store_true", "default": False, "help": "Use SONIC-derived G1 PD gains for supported G1 distill and future configs."},
 
         {"name": "--teacher_exptid", "type": str, "help": "teacher exptid", "default": "mimic"},
         {"name": "--teacher_checkpoint", "type": int, "help": "teacher checkpoint", "default": -1},

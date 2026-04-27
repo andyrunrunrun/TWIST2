@@ -18,6 +18,7 @@ script_dir = os.path.dirname(os.path.realpath(__file__))
 from data_utils.rot_utils import quatToEuler, euler_from_quaternion_torch, quat_rotate_inverse_torch
 from pose.utils.motion_lib_pkl import MotionLib
 from data_utils.params import DEFAULT_MIMIC_OBS
+from robot_control.pd_utils import get_sonic_g1_pd_arrays
 
 try:
     import onnxruntime as ort
@@ -139,12 +140,14 @@ class SimulationRunner:
                  motion_file,
                  device='cuda', 
                  vis=False,
-                 fall_threshold=0.3
+                 fall_threshold=0.3,
+                 sonic_pd=False,
                  ):
         
         self.device = device
         self.vis = vis
         self.fall_threshold = fall_threshold
+        self.sonic_pd = sonic_pd
 
         # Load Policy
         self.policy = load_onnx_policy(policy_path, device)
@@ -208,6 +211,9 @@ class SimulationRunner:
                 5, 5, 5, 5, 0.2, 0.2, 0.2,
                 5, 5, 5, 5, 0.2, 0.2, 0.2,
             ])
+        if sonic_pd:
+            self.stiffness, self.damping = get_sonic_g1_pd_arrays(dtype=np.float32)
+            print("[PD] Using SONIC-derived G1 PD gains for run_simulation.")
         
         self.torque_limits = np.array([
                 100, 100, 100, 150, 40, 40,
@@ -298,7 +304,8 @@ class SimulationRunner:
                     # 2. Build Proprio Observation
                     rpy = quatToEuler(quat)
                     obs_body_dof_vel = dof_vel.copy()
-                    obs_body_dof_vel[self.ankle_idx] = 0.
+                    if not self.sonic_pd:
+                        obs_body_dof_vel[self.ankle_idx] = 0.
                     
                     obs_proprio = np.concatenate([
                         ang_vel * 0.25,
@@ -368,6 +375,8 @@ def main():
     parser.add_argument('--motion_file', type=str, required=True, help='Path to .pkl motion file')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--vis', action='store_true', help='Visualize simulation')
+    parser.add_argument('--sonic_pd', action='store_true',
+                        help='Use SONIC-derived G1 PD gains instead of the default TWIST2 deploy-time PD gains')
     
     args = parser.parse_args()
     
@@ -386,7 +395,8 @@ def main():
         policy_path=args.policy,
         motion_file=args.motion_file,
         device=args.device,
-        vis=args.vis
+        vis=args.vis,
+        sonic_pd=args.sonic_pd,
     )
     
     success = runner.run()

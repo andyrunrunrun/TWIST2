@@ -99,9 +99,10 @@ class G1MimicHyFeat(G1MimicDistill):
             proprio_obs_buf = proprio_obs_buf + (2 * torch.rand_like(proprio_obs_buf) - 1) * self.noise_scale_vec
 
         # disable ankle dof velocity
-        dof_vel_start_dim = 3 + 2 + self.dof_pos.shape[1]
-        ankle_idx = [4, 5, 10, 11]
-        proprio_obs_buf[:, [dof_vel_start_dim + i for i in ankle_idx]] = 0.0
+        if not getattr(self.cfg.env, "sonic_pd", False):
+            dof_vel_start_dim = 3 + 2 + self.dof_pos.shape[1]
+            ankle_idx = [4, 5, 10, 11]
+            proprio_obs_buf[:, [dof_vel_start_dim + i for i in ankle_idx]] = 0.0
 
         # Privileged critic info (unchanged)
         key_body_pos = self.rigid_body_states[:, self._key_body_ids, :3]

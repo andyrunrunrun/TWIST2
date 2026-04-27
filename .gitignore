@@ -12,7 +12,8 @@ pkl
 phc/
 eval_results/
 motion_data/
-
+easy_motion/
+hard_motion/
 ignore/
 
 deploy_real/photo

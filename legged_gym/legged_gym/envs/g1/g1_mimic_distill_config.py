@@ -280,8 +280,12 @@ class G1MimicPrivCfg(HumanoidMimicCfg):
         termination_pitch = 4.0
         # root_height_diff_threshold = 0.25 hard
         # root_height_diff_threshold = 0.4 # 初代大规模训练环境
-        root_height_diff_threshold = 0.25 #原本是 0,3！！！！！！！！！！！！！！！！！！！!!!!!!!!!!!!!!!!!!!!!!!!!!
-        
+        root_height_diff_threshold = 0.4 #原本是 0,3！！！！！！！！！！！！！！！！！！！!!!!!!!!!!!!!!!!!!!!!!!!!!
+        print("============================================================")
+        print("============================================================")
+        print("root_height_diff_threshold: ", root_height_diff_threshold)
+        print("============================================================")
+        print("============================================================")
 
     class evaluations:
         tracking_joint_dof = True
@@ -405,10 +409,10 @@ class G1MimicPrivCfgPPO(HumanoidMimicCfgPPO):
         action_std = [0.7] * 12 + [0.4] * 3 + [0.5] * 14
         init_noise_std = 1.0
         obs_context_len = 11
-        # actor_hidden_dims = [512, 512, 256, 128] 
-        # critic_hidden_dims = [512, 512, 256, 128]
-        actor_hidden_dims = [1024, 1024, 512, 256] #！！！！！！！！！！！！！！！！！！！!!!!!!!!!!!!!!!!!!!!!!!!!!
-        critic_hidden_dims = [1024, 1024, 512, 256]
+        actor_hidden_dims = [512, 512, 256, 128] 
+        critic_hidden_dims = [512, 512, 256, 128]
+        # actor_hidden_dims = [1024, 1024, 512, 256] #！！！！！！！！！！！！！！！！！！！!!!!!!!!!!!!!!!!!!!!!!!!!!
+        # critic_hidden_dims = [1024, 1024, 512, 256]
         activation = 'silu'
         layer_norm = True
         motion_latent_dim = 128

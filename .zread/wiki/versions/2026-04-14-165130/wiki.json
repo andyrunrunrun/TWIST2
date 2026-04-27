@@ -1,0 +1,293 @@
+{
+  "id": "2026-04-14-165130",
+  "generated_at": "2026-04-14T08:51:30.712856159Z",
+  "language": "zh",
+  "pages": [
+    {
+      "slug": "1-gai-lan",
+      "title": "概览",
+      "file": "1-gai-lan.md",
+      "section": "快速开始",
+      "level": "Beginner"
+    },
+    {
+      "slug": "2-kuai-su-shang-shou",
+      "title": "快速上手",
+      "file": "2-kuai-su-shang-shou.md",
+      "section": "快速开始",
+      "level": "Beginner"
+    },
+    {
+      "slug": "3-shuang-conda-huan-jing-yu-he-xin-yi-lai-an-zhuang",
+      "title": "双 Conda 环境与核心依赖安装",
+      "file": "3-shuang-conda-huan-jing-yu-he-xin-yi-lai-an-zhuang.md",
+      "section": "快速开始",
+      "group": "环境与依赖准备",
+      "level": "Beginner"
+    },
+    {
+      "slug": "4-isaac-gym-mujoco-redis-yu-onnxruntime-pei-zhi",
+      "title": "Isaac Gym、MuJoCo、Redis 与 ONNXRuntime 配置",
+      "file": "4-isaac-gym-mujoco-redis-yu-onnxruntime-pei-zhi.md",
+      "section": "快速开始",
+      "group": "环境与依赖准备",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "5-gmr-pico-sdk-yu-unitree-sdk-de-wai-bu-zu-jian-jie-ru",
+      "title": "GMR、PICO SDK 与 Unitree SDK 的外部组件接入",
+      "file": "5-gmr-pico-sdk-yu-unitree-sdk-de-wai-bu-zu-jian-jie-ru.md",
+      "section": "快速开始",
+      "group": "环境与依赖准备",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "6-shi-yong-shi-li-dong-zuo-yu-guan-fang-onnx-jian-cha-dian-wan-cheng-zui-xiao-yan-zheng",
+      "title": "使用示例动作与官方 ONNX 检查点完成最小验证",
+      "file": "6-shi-yong-shi-li-dong-zuo-yu-guan-fang-onnx-jian-cha-dian-wan-cheng-zui-xiao-yan-zheng.md",
+      "section": "快速开始",
+      "group": "首次运行路径",
+      "level": "Beginner"
+    },
+    {
+      "slug": "7-yun-xing-fang-zhen-bu-shu-lian-lu-cong-ce-lue-wen-jian-dao-sim2sim",
+      "title": "运行仿真部署链路：从策略文件到 Sim2Sim",
+      "file": "7-yun-xing-fang-zhen-bu-shu-lian-lu-cong-ce-lue-wen-jian-dao-sim2sim.md",
+      "section": "快速开始",
+      "group": "首次运行路径",
+      "level": "Beginner"
+    },
+    {
+      "slug": "8-qi-dong-yao-cao-zuo-lian-lu-pico-chuan-liu-zi-tai-xiao-zhun-yu-kong-zhi-an-jian",
+      "title": "启动遥操作链路：PICO 串流、姿态校准与控制按键",
+      "file": "8-qi-dong-yao-cao-zuo-lian-lu-pico-chuan-liu-zi-tai-xiao-zhun-yu-kong-zhi-an-jian.md",
+      "section": "快速开始",
+      "group": "首次运行路径",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "9-tong-guo-tu-xing-kong-zhi-zhong-xin-guan-li-chang-yong-fu-wu-yu-jin-cheng",
+      "title": "通过图形控制中心管理常用服务与进程",
+      "file": "9-tong-guo-tu-xing-kong-zhi-zhong-xin-guan-li-chang-yong-fu-wu-yu-jin-cheng.md",
+      "section": "快速开始",
+      "group": "首次运行路径",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "10-xue-sheng-ce-lue-xun-lian-ming-ling-yu-chang-yong-jiao-ben-ru-kou",
+      "title": "学生策略训练命令与常用脚本入口",
+      "file": "10-xue-sheng-ce-lue-xun-lian-ming-ling-yu-chang-yong-jiao-ben-ru-kou.md",
+      "section": "快速开始",
+      "group": "训练与评测入口",
+      "level": "Beginner"
+    },
+    {
+      "slug": "11-jiao-shi-zheng-liu-chun-student-ddp-xu-xun-de-xuan-ze-fang-fa",
+      "title": "教师蒸馏、纯 Student、DDP 续训的选择方法",
+      "file": "11-jiao-shi-zheng-liu-chun-student-ddp-xu-xun-de-xuan-ze-fang-fa.md",
+      "section": "快速开始",
+      "group": "训练与评测入口",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "12-mo-xing-ping-ce-hui-fang-yu-onnx-dao-chu-liu-cheng",
+      "title": "模型评测、回放与 ONNX 导出流程",
+      "file": "12-mo-xing-ping-ce-hui-fang-yu-onnx-dao-chu-liu-cheng.md",
+      "section": "快速开始",
+      "group": "训练与评测入口",
+      "level": "Beginner"
+    },
+    {
+      "slug": "13-shi-li-dong-zuo-can-kao-dong-zuo-yu-g1-ji-qi-ren-mo-xing-zi-yuan-shuo-ming",
+      "title": "示例动作、参考动作与 G1 机器人模型资源说明",
+      "file": "13-shi-li-dong-zuo-can-kao-dong-zuo-yu-g1-ji-qi-ren-mo-xing-zi-yuan-shuo-ming.md",
+      "section": "快速开始",
+      "group": "数据与资产认知",
+      "level": "Beginner"
+    },
+    {
+      "slug": "14-dong-zuo-shu-ju-ji-yaml-pkl-yu-npz-de-zhuan-huan-yu-zu-zhi-fang-shi",
+      "title": "动作数据集 YAML、PKL 与 NPZ 的转换与组织方式",
+      "file": "14-dong-zuo-shu-ju-ji-yaml-pkl-yu-npz-de-zhuan-huan-yu-zu-zhi-fang-shi.md",
+      "section": "快速开始",
+      "group": "数据与资产认知",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "15-twist2-de-he-xin-jie-zhi-ke-kuo-zhan-de-ren-xing-quan-shen-shu-ju-cai-ji-yu-kong-zhi-bi-huan",
+      "title": "TWIST2 的核心价值：可扩展的人形全身数据采集与控制闭环",
+      "file": "15-twist2-de-he-xin-jie-zhi-ke-kuo-zhan-de-ren-xing-quan-shen-shu-ju-cai-ji-yu-kong-zhi-bi-huan.md",
+      "section": "深入解析",
+      "group": "系统目标与整体架构",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "16-cang-ku-zong-ti-fen-ceng-xun-lian-kuang-jia-dong-zuo-biao-shi-bu-shu-fu-wu-yu-gong-ju-lian",
+      "title": "仓库总体分层：训练框架、动作表示、部署服务与工具链",
+      "file": "16-cang-ku-zong-ti-fen-ceng-xun-lian-kuang-jia-dong-zuo-biao-shi-bu-shu-fu-wu-yu-gong-ju-lian.md",
+      "section": "深入解析",
+      "group": "系统目标与整体架构",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "17-mian-xiang-shui-yue-du-ben-cang-ku-qiang-hua-xue-xi-kai-fa-zhe-ji-qi-ren-bu-shu-gong-cheng-shi-yu-yan-jiu-zhe",
+      "title": "面向谁阅读本仓库：强化学习开发者、机器人部署工程师与研究者",
+      "file": "17-mian-xiang-shui-yue-du-ben-cang-ku-qiang-hua-xue-xi-kai-fa-zhe-ji-qi-ren-bu-shu-gong-cheng-shi-yu-yan-jiu-zhe.md",
+      "section": "深入解析",
+      "group": "系统目标与整体架构",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "18-ren-wu-zhu-ce-ti-xi-yu-g1-xi-lie-huan-jing-zu-pu",
+      "title": "任务注册体系与 G1 系列环境族谱",
+      "file": "18-ren-wu-zhu-ce-ti-xi-yu-g1-xi-lie-huan-jing-zu-pu.md",
+      "section": "深入解析",
+      "group": "训练系统核心设计",
+      "level": "Advanced"
+    },
+    {
+      "slug": "19-xue-sheng-huan-jing-de-he-xin-si-xiang-wei-lai-dong-zuo-guan-ce-te-quan-xin-xi-yu-ke-cheng-zhe-zhao",
+      "title": "学生环境的核心思想：未来动作观测、特权信息与课程遮罩",
+      "file": "19-xue-sheng-huan-jing-de-he-xin-si-xiang-wei-lai-dong-zuo-guan-ce-te-quan-xin-xi-yu-ke-cheng-zhe-zhao.md",
+      "section": "深入解析",
+      "group": "训练系统核心设计",
+      "level": "Advanced"
+    },
+    {
+      "slug": "20-jiao-shi-dao-xue-sheng-de-zheng-liu-ji-zhi-g1_priv_mimic-yu-g1_stu_future-de-pei-he-guan-xi",
+      "title": "教师到学生的蒸馏机制：g1_priv_mimic 与 g1_stu_future 的配合关系",
+      "file": "20-jiao-shi-dao-xue-sheng-de-zheng-liu-ji-zhi-g1_priv_mimic-yu-g1_stu_future-de-pei-he-guan-xi.md",
+      "section": "深入解析",
+      "group": "训练系统核心设计",
+      "level": "Advanced"
+    },
+    {
+      "slug": "21-jiang-li-she-ji-yu-xun-lian-ji-qiao-gen-zong-xiang-wen-ding-xing-xiang-yu-anti-shuffle-yi-zhi-ji-zhi",
+      "title": "奖励设计与训练技巧：跟踪项、稳定性项与 anti-shuffle 抑制机制",
+      "file": "21-jiang-li-she-ji-yu-xun-lian-ji-qiao-gen-zong-xiang-wen-ding-xing-xiang-yu-anti-shuffle-yi-zhi-ji-zhi.md",
+      "section": "深入解析",
+      "group": "训练系统核心设计",
+      "level": "Advanced"
+    },
+    {
+      "slug": "22-dong-zuo-ke-cheng-xue-xi-nan-du-fen-shu-yu-wu-chai-gan-zhi-cai-yang-ji-zhi",
+      "title": "动作课程学习、难度分数与误差感知采样机制",
+      "file": "22-dong-zuo-ke-cheng-xue-xi-nan-du-fen-shu-yu-wu-chai-gan-zhi-cai-yang-ji-zhi.md",
+      "section": "深入解析",
+      "group": "训练系统核心设计",
+      "level": "Advanced"
+    },
+    {
+      "slug": "23-tong-ping-ce-qi-de-she-ji-jian-rong-pt-yu-onnx-mlp-moe-transformer",
+      "title": "统一评测器的设计：兼容 PT 与 ONNX、MLP、MoE、Transformer",
+      "file": "23-tong-ping-ce-qi-de-she-ji-jian-rong-pt-yu-onnx-mlp-moe-transformer.md",
+      "section": "深入解析",
+      "group": "模型与推理接口",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "24-guan-ce-wei-du-gua-pei-yu-mo-xing-bao-zhuang-xun-lian-pei-zhi-chai-yi-xia-de-tui-li-jian-rong-ceng",
+      "title": "观测维度适配与模型包装：训练配置差异下的推理兼容层",
+      "file": "24-guan-ce-wei-du-gua-pei-yu-mo-xing-bao-zhuang-xun-lian-pei-zhi-chai-yi-xia-de-tui-li-jian-rong-ceng.md",
+      "section": "深入解析",
+      "group": "模型与推理接口",
+      "level": "Advanced"
+    },
+    {
+      "slug": "25-cong-xun-lian-jian-cha-dian-dao-bu-shu-mo-xing-bao-cun-dao-chu-yu-wen-jian-ming-ming-yue-ding",
+      "title": "从训练检查点到部署模型：保存、导出与文件命名约定",
+      "file": "25-cong-xun-lian-jian-cha-dian-dao-bu-shu-mo-xing-bao-cun-dao-chu-yu-wen-jian-ming-ming-yue-ding.md",
+      "section": "深入解析",
+      "group": "模型与推理接口",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "26-di-ceng-kong-zhi-fu-wu-mujoco-fang-zhen-pd-can-shu-yu-29-zi-you-du-dong-zuo-jie-kou",
+      "title": "低层控制服务：MuJoCo 仿真、PD 参数与 29 自由度动作接口",
+      "file": "26-di-ceng-kong-zhi-fu-wu-mujoco-fang-zhen-pd-can-shu-yu-29-zi-you-du-dong-zuo-jie-kou.md",
+      "section": "深入解析",
+      "group": "仿真与实机部署链路",
+      "level": "Advanced"
+    },
+    {
+      "slug": "27-dong-zuo-can-kao-fu-wu-jiang-shu-ju-ji-pian-duan-zhong-jian-wei-35-wei-mimic-guan-ce",
+      "title": "动作参考服务：将数据集片段重建为 35 维 mimic 观测",
+      "file": "27-dong-zuo-can-kao-fu-wu-jiang-shu-ju-ji-pian-duan-zhong-jian-wei-35-wei-mimic-guan-ce.md",
+      "section": "深入解析",
+      "group": "仿真与实机部署链路",
+      "level": "Advanced"
+    },
+    {
+      "slug": "28-redis-zai-xi-tong-zhong-de-zuo-yong-kua-jin-cheng-tong-xin-guan-ce-jiao-huan-yu-fu-wu-jie-ou",
+      "title": "Redis 在系统中的作用：跨进程通信、观测交换与服务解耦",
+      "file": "28-redis-zai-xi-tong-zhong-de-zuo-yong-kua-jin-cheng-tong-xin-guan-ce-jiao-huan-yu-fu-wu-jie-ou.md",
+      "section": "深入解析",
+      "group": "仿真与实机部署链路",
+      "level": "Advanced"
+    },
+    {
+      "slug": "29-cong-teleop-dao-sim2real-zai-xian-zhong-ding-xiang-di-ceng-zhi-xing-yu-shu-ju-lu-zhi-xie-tong",
+      "title": "从 Teleop 到 Sim2Real：在线重定向、低层执行与数据录制协同",
+      "file": "29-cong-teleop-dao-sim2real-zai-xian-zhong-ding-xiang-di-ceng-zhi-xing-yu-shu-ju-lu-zhi-xie-tong.md",
+      "section": "深入解析",
+      "group": "仿真与实机部署链路",
+      "level": "Advanced"
+    },
+    {
+      "slug": "30-g1-shi-ji-kong-zhi-bao-zhuang-ceng-yu-ji-qi-ren-pei-zhi-wen-jian-jie-gou",
+      "title": "G1 实机控制包装层与机器人配置文件结构",
+      "file": "30-g1-shi-ji-kong-zhi-bao-zhuang-ceng-yu-ji-qi-ren-pei-zhi-wen-jian-jie-gou.md",
+      "section": "深入解析",
+      "group": "仿真与实机部署链路",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "31-pico-yao-cao-zuo-liu-cheng-de-jie-duan-hua-fen-she-bei-qi-dong-biao-ding-kong-zhi-yu-lu-zhi",
+      "title": "PICO 遥操作流程的阶段划分：设备启动、标定、控制与录制",
+      "file": "31-pico-yao-cao-zuo-liu-cheng-de-jie-duan-hua-fen-she-bei-qi-dong-biao-ding-kong-zhi-yu-lu-zhi.md",
+      "section": "深入解析",
+      "group": "遥操作与数据生产",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "32-yuan-shi-shu-ju-qing-xi-bu-zheng-zi-ji-chou-qu-yu-ke-shi-hua-gong-ju-lian",
+      "title": "原始数据清洗、补帧、子集抽取与可视化工具链",
+      "file": "32-yuan-shi-shu-ju-qing-xi-bu-zheng-zi-ji-chou-qu-yu-ke-shi-hua-gong-ju-lian.md",
+      "section": "深入解析",
+      "group": "遥操作与数据生产",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "33-zai-xian-yu-chi-xian-dong-zuo-zhong-ding-xiang-zai-xi-tong-zhong-de-zhi-ze-bian-jie",
+      "title": "在线与离线动作重定向在系统中的职责边界",
+      "file": "33-zai-xian-yu-chi-xian-dong-zuo-zhong-ding-xiang-zai-xi-tong-zhong-de-zhi-ze-bian-jie.md",
+      "section": "深入解析",
+      "group": "遥操作与数据生产",
+      "level": "Advanced"
+    },
+    {
+      "slug": "34-legged_gym-rsl_rl-yu-pose-san-ge-zi-xiang-mu-ge-zi-cheng-dan-de-zhi-ze",
+      "title": "legged_gym、rsl_rl 与 pose 三个子项目各自承担的职责",
+      "file": "34-legged_gym-rsl_rl-yu-pose-san-ge-zi-xiang-mu-ge-zi-cheng-dan-de-zhi-ze.md",
+      "section": "深入解析",
+      "group": "代码库延展与研究入口",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "35-bi-jiao-shi-yan-ru-kou-moe-transformer-diffusion-yu-hyfeat-bian-ti",
+      "title": "比较实验入口：MoE、Transformer、Diffusion 与 HyFeat 变体",
+      "file": "35-bi-jiao-shi-yan-ru-kou-moe-transformer-diffusion-yu-hyfeat-bian-ti.md",
+      "section": "深入解析",
+      "group": "代码库延展与研究入口",
+      "level": "Advanced"
+    },
+    {
+      "slug": "36-yan-jiu-bi-ji-yu-jing-yan-wen-dang-suo-yin-ddp-xun-lian-zhi-biao-jiang-li-fen-xi-yu-huan-cun-xi-tong",
+      "title": "研究笔记与经验文档索引：DDP、训练指标、奖励分析与缓存系统",
+      "file": "36-yan-jiu-bi-ji-yu-jing-yan-wen-dang-suo-yin-ddp-xun-lian-zhi-biao-jiang-li-fen-xi-yu-huan-cun-xi-tong.md",
+      "section": "深入解析",
+      "group": "代码库延展与研究入口",
+      "level": "Intermediate"
+    }
+  ]
+}

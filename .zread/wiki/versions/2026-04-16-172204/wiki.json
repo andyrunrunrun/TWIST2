@@ -1,0 +1,192 @@
+{
+  "id": "2026-04-16-172204",
+  "generated_at": "2026-04-16T09:22:04.550027807Z",
+  "language": "zh",
+  "pages": [
+    {
+      "slug": "1-xiang-mu-gai-shu",
+      "title": "项目概述",
+      "file": "1-xiang-mu-gai-shu.md",
+      "section": "入门指南",
+      "level": "Beginner"
+    },
+    {
+      "slug": "2-kuai-su-qi-dong",
+      "title": "快速启动",
+      "file": "2-kuai-su-qi-dong.md",
+      "section": "入门指南",
+      "level": "Beginner"
+    },
+    {
+      "slug": "3-condahuan-jing-pei-zhi",
+      "title": "conda环境配置",
+      "file": "3-condahuan-jing-pei-zhi.md",
+      "section": "入门指南",
+      "group": "环境配置",
+      "level": "Beginner"
+    },
+    {
+      "slug": "4-yi-lai-an-zhuang",
+      "title": "依赖安装",
+      "file": "4-yi-lai-an-zhuang.md",
+      "section": "入门指南",
+      "group": "环境配置",
+      "level": "Beginner"
+    },
+    {
+      "slug": "5-liang-ceng-ji-kong-zhi-jia-gou",
+      "title": "两层级控制架构",
+      "file": "5-liang-ceng-ji-kong-zhi-jia-gou.md",
+      "section": "核心概念",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "6-shi-sheng-zheng-liu-xun-lian",
+      "title": "师生蒸馏训练",
+      "file": "6-shi-sheng-zheng-liu-xun-lian.md",
+      "section": "核心概念",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "7-yun-dong-shu-ju-ji-yu-dong-zuo-ku",
+      "title": "运动数据集与动作库",
+      "file": "7-yun-dong-shu-ju-ji-yu-dong-zuo-ku.md",
+      "section": "核心概念",
+      "level": "Advanced"
+    },
+    {
+      "slug": "8-dan-gpuxun-lian",
+      "title": "单GPU训练",
+      "file": "8-dan-gpuxun-lian.md",
+      "section": "训练指南",
+      "level": "Beginner"
+    },
+    {
+      "slug": "9-duo-gpufen-bu-shi-xun-lian",
+      "title": "多GPU分布式训练",
+      "file": "9-duo-gpufen-bu-shi-xun-lian.md",
+      "section": "训练指南",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "10-jiao-shi-ce-lue-xun-lian",
+      "title": "教师策略训练",
+      "file": "10-jiao-shi-ce-lue-xun-lian.md",
+      "section": "训练指南",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "11-xue-sheng-ce-lue-zheng-liu",
+      "title": "学生策略蒸馏",
+      "file": "11-xue-sheng-ce-lue-zheng-liu.md",
+      "section": "训练指南",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "12-xun-lian-jiao-ben-xiang-jie",
+      "title": "训练脚本详解",
+      "file": "12-xun-lian-jiao-ben-xiang-jie.md",
+      "section": "训练指南",
+      "group": "训练脚本与参数",
+      "level": "Beginner"
+    },
+    {
+      "slug": "13-anti-shuffleyi-zhi-xiao-sui-bu",
+      "title": "Anti-Shuffle抑制小碎步",
+      "file": "13-anti-shuffleyi-zhi-xiao-sui-bu.md",
+      "section": "训练指南",
+      "group": "训练脚本与参数",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "14-sim2simfang-zhen-yan-zheng",
+      "title": "Sim2Sim仿真验证",
+      "file": "14-sim2simfang-zhen-yan-zheng.md",
+      "section": "仿真与部署",
+      "level": "Beginner"
+    },
+    {
+      "slug": "15-sim2realshi-wu-bu-shu",
+      "title": "Sim2Real实物部署",
+      "file": "15-sim2realshi-wu-bu-shu.md",
+      "section": "仿真与部署",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "16-vryao-cao-zuo",
+      "title": "VR遥操作",
+      "file": "16-vryao-cao-zuo.md",
+      "section": "仿真与部署",
+      "level": "Advanced"
+    },
+    {
+      "slug": "17-di-ceng-kong-zhi-qi",
+      "title": "低层控制器",
+      "file": "17-di-ceng-kong-zhi-qi.md",
+      "section": "仿真与部署",
+      "group": "部署脚本",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "18-yun-dong-fu-wu-qi",
+      "title": "运动服务器",
+      "file": "18-yun-dong-fu-wu-qi.md",
+      "section": "仿真与部署",
+      "group": "部署脚本",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "19-g1mo-fang-huan-jing-pei-zhi",
+      "title": "G1模仿环境配置",
+      "file": "19-g1mo-fang-huan-jing-pei-zhi.md",
+      "section": "核心模块详解",
+      "group": "环境定义",
+      "level": "Advanced"
+    },
+    {
+      "slug": "20-guan-cha-kong-jian-yu-jiang-li-she-ji",
+      "title": "观察空间与奖励设计",
+      "file": "20-guan-cha-kong-jian-yu-jiang-li-she-ji.md",
+      "section": "核心模块详解",
+      "group": "环境定义",
+      "level": "Advanced"
+    },
+    {
+      "slug": "21-actor-criticwang-luo-jia-gou",
+      "title": "Actor-Critic网络架构",
+      "file": "21-actor-criticwang-luo-jia-gou.md",
+      "section": "核心模块详解",
+      "group": "强化学习算法",
+      "level": "Advanced"
+    },
+    {
+      "slug": "22-pposuan-fa-yu-ji-yi-cun-chu",
+      "title": "PPO算法与记忆存储",
+      "file": "22-pposuan-fa-yu-ji-yi-cun-chu.md",
+      "section": "核心模块详解",
+      "group": "强化学习算法",
+      "level": "Advanced"
+    },
+    {
+      "slug": "23-onnxmo-xing-dao-chu",
+      "title": "ONNX模型导出",
+      "file": "23-onnxmo-xing-dao-chu.md",
+      "section": "模型导出与工具",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "24-ping-gu-yu-ke-shi-hua",
+      "title": "评估与可视化",
+      "file": "24-ping-gu-yu-ke-shi-hua.md",
+      "section": "模型导出与工具",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "25-guitu-xing-jie-mian",
+      "title": "GUI图形界面",
+      "file": "25-guitu-xing-jie-mian.md",
+      "section": "模型导出与工具",
+      "level": "Advanced"
+    }
+  ]
+}

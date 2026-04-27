@@ -23,6 +23,7 @@ import torch
 
 class HumanoidMimic(HumanoidChar):
     def __init__(self, cfg: HumanoidMimicCfg, sim_params, physics_engine, sim_device, headless):
+        """Initialize mimic task state, evaluation metrics, and motion curriculum buffers."""
         self._enable_early_termination = cfg.env.enable_early_termination
         self._pose_termination = cfg.env.pose_termination
         self._pose_termination_dist = cfg.env.pose_termination_dist
@@ -211,6 +212,7 @@ class HumanoidMimic(HumanoidChar):
 
 
     def _get_max_motion_len(self):
+        """Return the maximum motion duration among all loaded reference motions."""
         max_len = 0
         num_motions = self._motion_lib.num_motions()
         for i in range(num_motions):
@@ -220,6 +222,7 @@ class HumanoidMimic(HumanoidChar):
         return max_len
         
     def _init_buffers(self):
+        """Initialize simulator buffers and mimic-specific state after loading motions."""
         self._load_motions()
         # if self.viewer is None:
         self.max_episode_length_s = self._get_max_motion_len().item()
@@ -234,6 +237,7 @@ class HumanoidMimic(HumanoidChar):
         self._init_motion_buffers()
         
     def _load_motions(self):
+        """Build MotionLib with current config, cache options, and DDP/resample behavior."""
         # Check if resample mode is enabled (resample_interval > 0)
         resample_interval = getattr(self.cfg.motion, "resample_interval", 0)
         skip_ddp_sharding = (resample_interval > 0)
@@ -260,6 +264,7 @@ class HumanoidMimic(HumanoidChar):
         return
     
     def _init_motion_buffers(self):
+        """Allocate reference-motion tensors and curriculum/resample control variables."""
         self._motion_ids = torch.zeros(self.num_envs, device=self.device, dtype=torch.int64)
         self._motion_time_offsets = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
         
@@ -300,6 +305,7 @@ class HumanoidMimic(HumanoidChar):
                    f"per_gpu={self._motion_resample_per_gpu}, gpu_memory_budget={self._motion_resample_gpu_memory_gb}", "cyan")
     
     def _reset_ref_motion(self, env_ids, motion_ids=None):
+        """Sample/reset reference motions for envs and refresh all cached reference states."""
         n = len(env_ids)
         if motion_ids is None:
             # Check if error aware sampling is enabled
@@ -340,6 +346,7 @@ class HumanoidMimic(HumanoidChar):
         
     
     def _get_motion_times(self, env_ids=None):
+        """Compute current reference-motion time for all or selected environments."""
         if env_ids is None:
             motion_times = self.episode_length_buf * self.dt + self._motion_time_offsets
         else:
@@ -347,6 +354,7 @@ class HumanoidMimic(HumanoidChar):
         return motion_times
 
     def _reset_dofs(self, env_ids, dof_pos, dof_vel):
+        """Reset joint positions/velocities for selected envs and sync tensors to simulator."""
         self.dof_pos[env_ids] = dof_pos[env_ids] * torch_rand_float(0.8, 1.2, (len(env_ids), self.num_dof), device=self.device)
         self.dof_vel[env_ids] = dof_vel[env_ids]
 
@@ -356,6 +364,7 @@ class HumanoidMimic(HumanoidChar):
                                               gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
 
     def _update_ref_motion(self):
+        """Advance and refresh per-env reference motion state at current episode times."""
         motion_ids = self._motion_ids
         motion_times = self._get_motion_times()
         if hasattr(self._motion_lib, "prefetch"):
@@ -373,12 +382,7 @@ class HumanoidMimic(HumanoidChar):
         self._ref_body_pos[:] = convert_to_global_root_body_pos(root_pos=root_pos, root_rot=root_rot, body_pos=body_pos)
             
     def _reset_root_states(self, env_ids, root_vel=None, root_quat=None, root_pos=None, root_ang_vel=None):
-        """ Resets ROOT states position and velocities of selected environmments
-            Sets base position based on the curriculum
-            Selects randomized base velocities within -0.5:0.5 [m/s, rad/s]
-        Args:
-            env_ids (List[int]): Environemnt ids
-        """
+        """Reset base/root state for selected envs, with optional randomization and overrides."""
         # base position
         if self.custom_origins:
             self.root_states[env_ids] = self.base_init_state
@@ -412,6 +416,7 @@ class HumanoidMimic(HumanoidChar):
                                                      gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
             
     def reset_idx(self, env_ids, motion_ids=None):
+        """Main reset entry: log episode stats, update curriculum, and reset env physics/buffers."""
         if len(env_ids) == 0:
             return
 
@@ -476,6 +481,7 @@ class HumanoidMimic(HumanoidChar):
         return
     
     def _hard_sync_motion_loop(self):
+        """Hard-reset envs at loop boundaries to keep simulated state aligned with reference clips."""
         motion_times = self._get_motion_times()
         motion_lengths = self._motion_lib.get_motion_length(self._motion_ids)
         hard_sync_envs = (motion_times >= motion_lengths) & (torch.abs(motion_times - motion_lengths) < self.dt)
@@ -660,9 +666,7 @@ class HumanoidMimic(HumanoidChar):
                 warnings.warn(f"Motion difficulty sync failed: {e}")
 
     def _post_physics_step_callback(self):
-        """ Callback called before computing terminations, rewards, and observations
-            Default behaviour: Compute ang vel command based on target and heading, compute measured terrain heights and randomly push robots
-        """
+        """Run post-step updates: refresh references, domain randomization pushes, and eval metrics."""
         self._update_ref_motion()
         # self._hard_sync_motion_loop()
 
@@ -683,6 +687,7 @@ class HumanoidMimic(HumanoidChar):
             self._update_max_key_body_error()
             
     def check_termination(self):
+        """Compose all reset conditions: contacts, posture, timing, speed, and tracking failures."""
         contact_force_termination = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
         self.reset_buf = contact_force_termination.clone()
         
@@ -784,6 +789,7 @@ class HumanoidMimic(HumanoidChar):
         
 
     def _get_mimic_obs(self):
+        """Build stacked reference-motion observation features across configured target time steps."""
         num_steps = self._tar_motion_steps_priv.shape[0]
         assert num_steps > 0, "Invalid number of target observation steps"
         motion_times = self._get_motion_times().unsqueeze(-1)
@@ -896,6 +902,7 @@ class HumanoidMimic(HumanoidChar):
         return root_pos_noisy, root_rot_noisy, root_vel_noisy, root_ang_vel_noisy, dof_pos_noisy, dof_vel
         
     def compute_observations(self):
+        """Assemble policy observations from mimic targets, proprioception, history, and priv latents."""
         # imu_obs = torch.stack((self.roll, self.pitch, self.yaw - self.init_yaw), dim=1)
         imu_obs = torch.stack((self.roll, self.pitch), dim=1)
         
@@ -944,6 +951,7 @@ class HumanoidMimic(HumanoidChar):
         
             
     def _get_noise_scale_vec(self, cfg):
+        """Create per-dimension observation noise scales for proprioceptive channels."""
         noise_scale_vec = torch.zeros(1, self.cfg.env.n_proprio, device=self.device)
         if not self.cfg.noise.add_noise:
             return noise_scale_vec
@@ -957,6 +965,7 @@ class HumanoidMimic(HumanoidChar):
         return noise_scale_vec
 
     def get_episode_log(self, env_ids=0):
+        """Return rich per-episode diagnostics for one environment (tracking/contact/error metrics)."""
         log = super().get_episode_log(env_ids=env_ids)
 
         try:
@@ -1044,9 +1053,11 @@ class HumanoidMimic(HumanoidChar):
     
     # ================== rewards ==================
     def _reward_alive(self):
+        """Constant survival reward term."""
         return 1.
     
     def _reward_tracking_joint_dof(self):
+        """Reward tracking of reference joint positions (weighted squared error)."""
         dof_diff = self._ref_dof_pos - self.dof_pos
         dof_err = torch.sum(self._dof_err_w * dof_diff * dof_diff, dim=-1)
         
@@ -1054,6 +1065,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.exp(-pos_scale * dof_err)
     
     def _reward_tracking_joint_vel(self):
+        """Reward tracking of reference joint velocities."""
         vel_diff = self._ref_dof_vel - self.dof_vel
         vel_err = torch.sum(self._dof_err_w * vel_diff * vel_diff, dim=-1)
         
@@ -1061,7 +1073,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.exp(-vel_scale * vel_err)
     
     def _reward_tracking_root_pose(self):
-        """jointly reward translation and rotation"""
+        """Reward joint tracking of root translation and orientation."""
 
         root_pos_diff = self._ref_root_pos - self.root_states[:, 0:3]
         
@@ -1075,7 +1087,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.exp(-root_pose_scale * (root_pos_err + 0.1 * root_rot_err))
 
     def _reward_tracking_root_pose_delta_local(self):
-        """reward translation and rotation"""
+        """Reward matching local root translation delta between consecutive frames."""
         root_pose_delta_local = self.root_states[:, 0:3] - self.last_root_pos
         root_pose_delta_local = quat_rotate_inverse(self.last_root_rot, root_pose_delta_local)
         diff = self._ref_root_pos_delta_local - root_pose_delta_local
@@ -1086,6 +1098,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.exp(-root_pose_scale * root_pos_err)
     
     def _reward_tracking_root_rotation_delta_local(self):
+        """Reward matching local root rotation delta between consecutive frames."""
         root_rot_delta_local = self.root_states[:, 3:7] - self.last_root_rot
         # to eluer
         root_rot_delta_local = torch.stack(euler_from_quaternion(root_rot_delta_local), dim=-1)
@@ -1099,7 +1112,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.exp(-root_pose_scale * root_rot_err)
         
     def _reward_tracking_root_translation(self):
-        """reward translation only"""
+        """Reward root translation tracking only."""
         root_pos_diff = self._ref_root_pos - self.root_states[:, 0:3]
         
         root_pos_err = torch.sum(root_pos_diff * root_pos_diff, dim=-1)
@@ -1109,7 +1122,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.exp(-root_pose_scale * root_pos_err)
 
     def _reward_tracking_root_translation_xy(self):
-        """reward translation xy only"""
+        """Reward root XY translation tracking only."""
         root_pos_diff = self._ref_root_pos[:, :2] - self.root_states[:, :2]
         
         root_pos_err = torch.sum(root_pos_diff * root_pos_diff, dim=-1)
@@ -1120,7 +1133,7 @@ class HumanoidMimic(HumanoidChar):
     
     
     def _reward_tracking_root_translation_z(self):
-        """reward translation z only"""
+        """Reward root Z translation tracking only."""
         root_pos_diff = self._ref_root_pos[:, 2:3] - self.root_states[:, 2:3]
         
         root_pos_err = torch.sum(root_pos_diff * root_pos_diff, dim=-1)
@@ -1130,7 +1143,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.exp(-root_pose_scale * root_pos_err)
     
     def _reward_tracking_root_rotation(self):
-        """reward rotation only"""
+        """Reward root orientation tracking only."""
         root_rot_err = torch_utils.quat_diff_angle(self.root_states[:, 3:7], self._ref_root_rot)
         root_rot_err *= root_rot_err
         
@@ -1139,7 +1152,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.exp(-root_pose_scale * root_rot_err)
     
     def _reward_tracking_root_vel(self):
-        """jointly reward angular and linear velocity"""
+        """Reward joint tracking of root linear and angular velocity."""
         if self.global_obs:
             root_vel_diff = self._ref_root_vel - self.root_states[:, 7:10]
             root_ang_vel_diff = self._ref_root_ang_vel - self.root_states[:, 10:13]
@@ -1159,7 +1172,7 @@ class HumanoidMimic(HumanoidChar):
     
     
     def _reward_tracking_root_linear_vel(self):
-        """reward linear velocity only"""
+        """Reward root linear-velocity tracking only."""
         if self.global_obs:
             root_vel_diff = self._ref_root_vel - self.root_states[:, 7:10]
         else:
@@ -1170,7 +1183,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.exp(-root_vel_scale * root_vel_err)
     
     def _reward_tracking_root_angular_vel(self):
-        """reward angular velocity only"""
+        """Reward root angular-velocity tracking only."""
         if self.global_obs:
             root_ang_vel_diff = self._ref_root_ang_vel - self.root_states[:, 10:13]
         else:
@@ -1181,6 +1194,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.exp(-root_ang_vel_scale * root_ang_vel_err)
     
     def _reward_tracking_keybody_pos(self): # local body pos
+        """Reward key-body position tracking in yaw-aligned local coordinates."""
         key_body_pos = self.rigid_body_states[:, self._key_body_ids, 0:3] # (num_envs, num_key_bodies, 3)
         key_body_pos = key_body_pos - self.root_states[:, 0:3].unsqueeze(1)
         base_yaw_quat = quat_from_euler_xyz(0*self.yaw, 0*self.yaw, self.yaw)
@@ -1208,6 +1222,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.exp(-key_body_pos_scale * key_body_pos_err)
     
     def _reward_tracking_keybody_pos_global(self):
+        """Reward key-body position tracking in global coordinates."""
         key_body_pos = self.rigid_body_states[:, self._key_body_ids, 0:3] # (num_envs, num_key_bodies, 3)
         # key_body_pos = key_body_pos - self.root_states[:, 0:3].unsqueeze(1)
         
@@ -1228,6 +1243,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.exp(-key_body_pos_scale * key_body_pos_err)
     
     def _reward_tracking_feet_height(self):
+        """Reward matching reference swing-foot height profile during non-contact phases."""
         contact = self.contact_forces[:, self.feet_indices, 2] > 5.
         ref_feet_height = self._ref_body_pos[:, self.feet_indices, 2]
         feet_z = self.rigid_body_states[:, self.feet_indices, 2]
@@ -1244,29 +1260,35 @@ class HumanoidMimic(HumanoidChar):
         return torch.sum(rew_pos, dim=1)
     
     def _reward_collision(self):
+        """Penalty for collisions on penalized body parts."""
         return torch.sum(1.*(torch.norm(self.contact_forces[:, self.penalised_contact_indices, :], dim=-1) > 0.1), dim=1)
     
     def _reward_dof_pos_limits(self):
+        """Penalty for violating joint position limits."""
         out_of_limits = -(self.dof_pos - self.dof_pos_limits[:, 0]).clip(max=0.)
         out_of_limits += (self.dof_pos - self.dof_pos_limits[:, 1]).clip(min=0.)
         return torch.sum(out_of_limits, dim=1)
     
     def _reward_dof_torque_limits(self):
+        """Penalty for exceeding soft torque limits."""
         out_of_limits = torch.sum((torch.abs(self.torques) / self.torque_limits - self.cfg.rewards.soft_torque_limit).clip(min=0), dim=1)
         return out_of_limits
     
     def _reward_feet_stumble(self):
+        """Penalty when foot horizontal contact force dominates vertical support force."""
         rew = torch.any(torch.norm(self.contact_forces[:, self.feet_indices, :2], dim=2) >\
              4 *torch.abs(self.contact_forces[:, self.feet_indices, 2]), dim=1)
         return rew.float()
     
     def _reward_feet_contact_forces(self):
+        """Penalty for excessive vertical contact force at feet."""
         rew = torch.norm(self.contact_forces[:, self.feet_indices, 2], dim=-1)
         rew[rew < self.cfg.rewards.max_contact_force] = 0
         rew[rew > self.cfg.rewards.max_contact_force] -= self.cfg.rewards.max_contact_force
         return rew
     
     def _reward_feet_height(self):
+        """Penalty when feet deviate from target height band."""
         # from OmniH2O
         feet_height = self.rigid_body_states[:,self.feet_indices, 2]
         dif = torch.abs(feet_height - self.cfg.rewards.feet_height_target)
@@ -1274,6 +1296,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.clip(dif - 0.02, min=0.) # target - 0.02 ~ target + 0.02 is acceptable 
         
     def _reward_feet_slip(self):
+        """Penalty for foot sliding speed while in contact."""
         contact = self.contact_forces[:, self.feet_indices, 2] > 5.
         foot_speed_norm = torch.norm(self.rigid_body_states[:, self.feet_indices, 7:9], dim=2)
         rew = torch.sqrt(foot_speed_norm)
@@ -1281,29 +1304,37 @@ class HumanoidMimic(HumanoidChar):
         return torch.sum(rew, dim=1)
     
     def _reward_lin_vel_z(self):
+        """Penalty on vertical base linear velocity."""
         rew = torch.square(self.base_lin_vel[:, 2])
         return rew
     
     def _reward_ang_vel_xy(self):
+        """Penalty on base roll/pitch angular velocity."""
         return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
     
     def _reward_orientation(self):
+        """Penalty for base tilt away from upright orientation."""
         rew = torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
         return rew
     
     def _reward_dof_acc(self):
+        """Penalty on joint acceleration magnitude."""
         return torch.sum(torch.square((self.last_dof_vel - self.dof_vel) / self.dt), dim=1)
     
     def _reward_action_rate(self):
+        """Penalty on action change rate between consecutive control steps."""
         return torch.norm(self.last_actions - self.actions, dim=1)
     
     def _reward_dof_vel(self):
+        """Penalty on joint velocity magnitude."""
         return torch.sum(torch.square(self.dof_vel), dim=1)
     
     def _reward_base_acc(self):
+        """Penalty on base linear/angular acceleration magnitude."""
         return torch.sum(torch.square((self.last_root_vel - self.root_states[:, 7:13]) / self.dt), dim=1)
     
     def _reward_torque_penalty(self):
+        """Penalty on actuator torque magnitude."""
         return torch.sum(torch.square(self.torques), dim=1)
 
     def _anti_shuffle_stable_gate(self):
@@ -1316,6 +1347,7 @@ class HumanoidMimic(HumanoidChar):
         return ((ref_speed < ref_speed_th) & (tilt < tilt_th)).float()
 
     def _reward_step_switch_rate(self):
+        """Anti-shuffle penalty for frequent foot contact-state toggling."""
         if not getattr(self.cfg.rewards, "enable_anti_shuffle_reward", False):
             return torch.zeros(self.num_envs, device=self.device)
 
@@ -1329,6 +1361,7 @@ class HumanoidMimic(HumanoidChar):
         return switch_cnt * self._anti_shuffle_stable_gate()
 
     def _reward_stance_foot_speed(self):
+        """Anti-shuffle penalty on support-foot XY speed during contact."""
         if not getattr(self.cfg.rewards, "enable_anti_shuffle_reward", False):
             return torch.zeros(self.num_envs, device=self.device)
 
@@ -1340,6 +1373,7 @@ class HumanoidMimic(HumanoidChar):
         return stance_speed * self._anti_shuffle_stable_gate()
 
     def _reward_feet_air_time(self):
+        """Reward swing duration close to target air-time for each foot."""
         contact = self.contact_forces[:, self.feet_indices, 2] > 5.
         self.contact_filt = torch.logical_or(contact, self.last_contacts)
         self.last_contacts = contact
@@ -1354,38 +1388,44 @@ class HumanoidMimic(HumanoidChar):
         return rew_airtime
 
     def _reward_tracking_lin_vel(self):
+        """Reward commanded linear-velocity tracking."""
         lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
         return torch.exp(-lin_vel_error/self.cfg.rewards.tracking_sigma)
     
     def _reward_tracking_ang_vel(self):
+        """Reward commanded yaw-rate tracking."""
         ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
         return torch.exp(-ang_vel_error/self.cfg.rewards.tracking_sigma_ang)
     
     def _error_tracking_joint_dof(self):
+        """Compute per-env L1 joint-position tracking error."""
         dof_diff = self._ref_dof_pos - self.dof_pos
         # compute L1 error
         dof_err = torch.mean(torch.abs(dof_diff), dim=-1)
         return dof_err
     
     def _error_tracking_joint_vel(self):
+        """Compute per-env L1 joint-velocity tracking error."""
         vel_diff = self._ref_dof_vel - self.dof_vel
         # compute L1 error
         vel_err = torch.mean(torch.abs(vel_diff), dim=-1)
         return vel_err
     
     def _error_tracking_root_translation(self):
+        """Compute per-env L1 root-translation tracking error."""
         root_pos_diff = self._ref_root_pos - self.root_states[:, 0:3]
         # compute L1 error
         root_pos_err = torch.mean(torch.abs(root_pos_diff), dim=-1)
         return root_pos_err
     
     def _error_tracking_root_rotation(self):
+        """Compute per-env root-rotation tracking error magnitude."""
         root_rot_err = torch_utils.quat_diff_angle(self.root_states[:, 3:7], self._ref_root_rot)
-        # compute L1 error
-        root_rot_err = torch.mean(torch.abs(root_rot_err), dim=-1)
-        return root_rot_err
+        # quat_diff_angle already returns one angle per env.
+        return torch.abs(root_rot_err)
     
     def _error_tracking_root_vel(self):
+        """Compute per-env L1 root linear-velocity tracking error in local frame."""
         local_ref_root_vel = quat_rotate_inverse(self._ref_root_rot, self._ref_root_vel)
         root_vel_diff = local_ref_root_vel - self.base_lin_vel
         # compute L1 error
@@ -1393,6 +1433,7 @@ class HumanoidMimic(HumanoidChar):
         return root_vel_err
     
     def _error_tracking_root_ang_vel(self):
+        """Compute per-env L1 root angular-velocity tracking error in local frame."""
         local_ref_root_ang_vel = quat_rotate_inverse(self._ref_root_rot, self._ref_root_ang_vel)
         root_ang_vel_diff = local_ref_root_ang_vel - self.base_ang_vel
         # compute L1 error
@@ -1400,6 +1441,7 @@ class HumanoidMimic(HumanoidChar):
         return root_ang_vel_err
     
     def _error_tracking_keybody_pos(self):
+        """Compute per-env mean L1 error for key-body positions."""
         key_body_pos = self.rigid_body_states[:, self._key_body_ids, 0:3] # (num_envs, num_key_bodies, 3)
         key_body_pos = key_body_pos - self.root_states[:, 0:3].unsqueeze(1)
         if not self.global_obs:
@@ -1447,6 +1489,7 @@ class HumanoidMimic(HumanoidChar):
         self.max_key_body_error = torch.max(self.max_key_body_error, motion_max_errors)
     
     def _error_feet_slip(self):
+        """Compute foot-slip metric from contact-phase foot XY speed."""
         contact = self.contact_forces[:, self.feet_indices, 2] > 5.
         foot_speed_norm = torch.norm(self.rigid_body_states[:, self.feet_indices, 7:9], dim=2)
         rew = torch.sqrt(foot_speed_norm)
@@ -1454,7 +1497,7 @@ class HumanoidMimic(HumanoidChar):
         return torch.sum(rew, dim=1)
     
     def _error_tracking_root_pose_delta_local(self):
-        """reward translation and rotation"""
+        """Compute squared error of local root translation delta tracking."""
         root_pose_delta_local = self.root_states[:, 0:3] - self.last_root_pos
         root_pose_delta_local = quat_rotate_inverse(self.last_root_rot, root_pose_delta_local)
         diff = self._ref_root_pos_delta_local - root_pose_delta_local
@@ -1463,6 +1506,7 @@ class HumanoidMimic(HumanoidChar):
         return root_pos_err
     
     def _error_tracking_root_rotation_delta_local(self):
+        """Compute squared error of local root rotation delta tracking."""
         root_rot_delta_local = self.root_states[:, 3:7] - self.last_root_rot
         # to eluer
         root_rot_delta_local = torch.stack(euler_from_quaternion(root_rot_delta_local), dim=-1)

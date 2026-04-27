@@ -46,6 +46,14 @@ from .g1.g1_mimic_distill_config import G1MimicStuLimbWeightCfg, G1MimicStuLimbW
 
 from .g1.g1_mimic_future import G1MimicFuture
 from .g1.g1_mimic_future_config import G1MimicStuFutureCfg, G1MimicStuFutureCfgDAgger
+from .g1.g1_mimic_diffusion_config import (
+    G1MimicStuFutureDiffusionCfg,
+    G1MimicStuFutureDiffusionCfgTrain,
+    G1MimicStuFutureDiffusion2xCfg,
+    G1MimicStuFutureDiffusion2xCfgTrain,
+    G1MimicStuFutureDiffusion4xCfg,
+    G1MimicStuFutureDiffusion4xCfgTrain,
+)
 
 # MoE (Mixture of Experts) configuration
 from .g1.g1_mimic_moe_config import G1MimicStuFutureMoECfg, G1MimicStuFutureMoECfgDAgger
@@ -77,6 +85,24 @@ task_registry.register("g1_stu_rl", G1MimicDistill, G1MimicStuRLCfg(), G1MimicSt
 task_registry.register("g1_priv_mimic_limbw", G1MimicDistill, G1MimicPrivLimbWeightCfg(), G1MimicPrivLimbWeightCfgPPO())
 task_registry.register("g1_stu_mimic_limbw", G1MimicDistill, G1MimicStuLimbWeightCfg(), G1MimicStuLimbWeightCfgDAgger())
 task_registry.register("g1_stu_future", G1MimicFuture, G1MimicStuFutureCfg(), G1MimicStuFutureCfgDAgger())
+task_registry.register(
+    "g1_stu_future_diffusion",
+    G1MimicFuture,
+    G1MimicStuFutureDiffusionCfg(),
+    G1MimicStuFutureDiffusionCfgTrain(),
+)
+task_registry.register(
+    "g1_stu_future_diff2x",
+    G1MimicFuture,
+    G1MimicStuFutureDiffusion2xCfg(),
+    G1MimicStuFutureDiffusion2xCfgTrain(),
+)
+task_registry.register(
+    "g1_stu_future_diff4x",
+    G1MimicFuture,
+    G1MimicStuFutureDiffusion4xCfg(),
+    G1MimicStuFutureDiffusion4xCfgTrain(),
+)
 
 # MoE (Mixture of Experts) - Student policy with MoE backbone
 task_registry.register("g1_stu_future_moe", G1MimicFuture, G1MimicStuFutureMoECfg(), G1MimicStuFutureMoECfgDAgger())

@@ -152,7 +152,8 @@ class G1Mimic(HumanoidMimic):
             obs_buf += 0.
         
         dof_vel_start_dim = mimic_obs.shape[1] + 5 + self.dof_pos.shape[1]
-        obs_buf[:, [dof_vel_start_dim + 4, dof_vel_start_dim + 5, dof_vel_start_dim + 10, dof_vel_start_dim + 11]] = 0.
+        if not getattr(self.cfg.env, "sonic_pd", False):
+            obs_buf[:, [dof_vel_start_dim + 4, dof_vel_start_dim + 5, dof_vel_start_dim + 10, dof_vel_start_dim + 11]] = 0.
         if self.cfg.domain_rand.domain_rand_general:
             priv_latent = torch.cat((
                 self.mass_params_tensor,
